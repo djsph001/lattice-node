@@ -1,0 +1,149 @@
+use std::collections::HashMap;
+
+use chrono::{DateTime, Utc};
+use libp2p::{Multiaddr, PeerId};
+use tracing::debug;
+
+/// Tracked state for a single peer in the mesh.
+#[derive(Debug, Clone)]
+pub struct PeerInfo {
+    pub peer_id: PeerId,
+    pub addresses: Vec<Multiaddr>,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub heartbeats_received: u64,
+}
+
+/// In-memory peer table tracking all known nodes in the mesh.
+///
+/// Phase 2: purely in-memory, rebuilt on restart via mDNS.
+/// Future phases: persist to disk for faster reconnection,
+/// add reputation scoring for the economic protocol layer.
+#[derive(Debug)]
+pub struct PeerTable {
+    peers: HashMap<PeerId, PeerInfo>,
+}
+
+impl PeerTable {
+    pub fn new() -> Self {
+        Self {
+            peers: HashMap::new(),
+        }
+    }
+
+    /// Add or update a peer when discovered.
+    pub fn add_peer(&mut self, peer_id: PeerId, addr: Multiaddr) {
+        let now = Utc::now();
+        self.peers
+            .entry(peer_id)
+            .and_modify(|info| {
+                info.last_seen = now;
+                if !info.addresses.contains(&addr) {
+                    info.addresses.push(addr.clone());
+                }
+            })
+            .or_insert_with(|| {
+                debug!(peer = %peer_id, "New peer added to table");
+                PeerInfo {
+                    peer_id,
+                    addresses: vec![addr],
+                    first_seen: now,
+                    last_seen: now,
+                    heartbeats_received: 0,
+                }
+            });
+    }
+
+    /// Remove a peer when it expires or disconnects.
+    pub fn remove_peer(&mut self, peer_id: &PeerId) {
+        if self.peers.remove(peer_id).is_some() {
+            debug!(peer = %peer_id, "Peer removed from table");
+        }
+    }
+
+    /// Record receipt of a heartbeat from a peer.
+    pub fn record_heartbeat(&mut self, peer_id: &PeerId) {
+        if let Some(info) = self.peers.get_mut(peer_id) {
+            info.last_seen = Utc::now();
+            info.heartbeats_received += 1;
+        }
+    }
+
+    /// Number of currently tracked peers.
+    pub fn len(&self) -> usize {
+        self.peers.len()
+    }
+
+    /// Whether the peer table is empty.
+    pub fn is_empty(&self) -> bool {
+        self.peers.is_empty()
+    }
+
+    /// Iterate over all known peers.
+    pub fn iter(&self) -> impl Iterator<Item = &PeerInfo> {
+        self.peers.values()
+    }
+
+    /// Get info for a specific peer.
+    pub fn get(&self, peer_id: &PeerId) -> Option<&PeerInfo> {
+        self.peers.get(peer_id)
+    }
+
+    /// Return peers that haven't been seen within the given duration.
+    pub fn stale_peers(&self, timeout: chrono::Duration) -> Vec<PeerId> {
+        let cutoff = Utc::now() - timeout;
+        self.peers
+            .values()
+            .filter(|info| info.last_seen < cutoff)
+            .map(|info| info.peer_id)
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_peer_id() -> PeerId {
+        PeerId::random()
+    }
+
+    fn test_addr() -> Multiaddr {
+        "/ip4/192.168.1.100/tcp/4001".parse().unwrap()
+    }
+
+    #[test]
+    fn add_and_retrieve_peer() {
+        let mut table = PeerTable::new();
+        let pid = test_peer_id();
+        let addr = test_addr();
+
+        table.add_peer(pid, addr.clone());
+
+        assert_eq!(table.len(), 1);
+        let info = table.get(&pid).unwrap();
+        assert_eq!(info.addresses, vec![addr]);
+        assert_eq!(info.heartbeats_received, 0);
+    }
+
+    #[test]
+    fn remove_peer() {
+        let mut table = PeerTable::new();
+        let pid = test_peer_id();
+        table.add_peer(pid, test_addr());
+        table.remove_peer(&pid);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn record_heartbeat_increments() {
+        let mut table = PeerTable::new();
+        let pid = test_peer_id();
+        table.add_peer(pid, test_addr());
+        table.record_heartbeat(&pid);
+        table.record_heartbeat(&pid);
+
+        let info = table.get(&pid).unwrap();
+        assert_eq!(info.heartbeats_received, 2);
+    }
+}

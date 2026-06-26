@@ -1,0 +1,10 @@
+# Rust build artifacts
+/target
+
+# Node identity secrets — never commit private keys
+*.key
+.lattice/
+
+# Editor / OS cruft
+*.swp
+.DS_Store

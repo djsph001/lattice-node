@@ -76,7 +76,7 @@ src/
 
 - [x] **Phase 2a**: Persist node identity to disk (stable PeerId across restarts)
 - [x] **Phase 2b**: Add gossipsub for heartbeat propagation to all peers
-- [ ] **Phase 2c**: Request-response protocol for direct peer queries
+- [x] **Phase 2c**: Request-response protocol for direct peer queries
 - [ ] **Phase 3**: Kademlia DHT for discovery beyond LAN
 - [ ] **Phase 4**: Digital utility unit transaction types
 - [ ] **Phase 5**: Nash equilibrium / Georgist resource accounting

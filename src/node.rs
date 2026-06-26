@@ -1,21 +1,26 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use libp2p::{
     futures::StreamExt,
-    gossipsub, identity, mdns, noise,
-    swarm::{NetworkBehaviour, SwarmEvent},
+    gossipsub, identity, mdns, noise, request_response,
+    swarm::SwarmEvent,
     tcp, yamux, PeerId, SwarmBuilder,
 };
 use tokio::time;
 use tracing::{debug, info, warn};
 
-use crate::message::types::{LatticeMessage, Heartbeat};
+use crate::message::codec::rpc::LatticeProtocol;
+use crate::message::types::{Heartbeat, LatticeMessage, StatusRequest, StatusResponse};
 use crate::network::protocol::{
     LatticeBehaviour, LatticeBehaviourEvent, LATTICE_HEARTBEAT_TOPIC,
 };
 use crate::state::peers::PeerTable;
+
+/// Lattice protocol version advertised in status responses.
+const PROTOCOL_VERSION: u32 = 1;
 
 /// A sovereign node in the Lattice mesh.
 pub struct LatticeNode {
@@ -24,6 +29,15 @@ pub struct LatticeNode {
     local_peer_id: PeerId,
     node_name: String,
     heartbeat_interval: Duration,
+    /// When the node started — used to report uptime.
+    start_time: Instant,
+    /// Count of heartbeats this node has broadcast.
+    heartbeats_sent: u64,
+    /// Monotonic nonce for correlating outbound status queries.
+    query_nonce: u64,
+    /// Peers we've already sent an initial status query to, so the handshake
+    /// fires once per peer rather than once per mDNS interface re-discovery.
+    queried_peers: HashSet<PeerId>,
 }
 
 impl LatticeNode {
@@ -95,7 +109,13 @@ impl LatticeNode {
                     .subscribe(&topic)
                     .map_err(|e| anyhow::anyhow!("gossipsub subscribe: {e}"))?;
 
-                Ok(LatticeBehaviour::new(mdns, gossipsub))
+                // Request-response for direct peer queries (/lattice/rpc/v1).
+                let rpc = request_response::Behaviour::new(
+                    [(LatticeProtocol, request_response::ProtocolSupport::Full)],
+                    request_response::Config::default(),
+                );
+
+                Ok(LatticeBehaviour::new(mdns, gossipsub, rpc))
             })?
             .with_swarm_config(|c| {
                 c.with_idle_connection_timeout(Duration::from_secs(60))
@@ -108,6 +128,10 @@ impl LatticeNode {
             local_peer_id,
             node_name,
             heartbeat_interval: Duration::from_secs(heartbeat_secs),
+            start_time: Instant::now(),
+            heartbeats_sent: 0,
+            query_nonce: 0,
+            queried_peers: HashSet::new(),
         })
     }
 
@@ -186,6 +210,8 @@ impl LatticeNode {
                         .gossipsub
                         .remove_explicit_peer(&peer_id);
                     self.peer_table.remove_peer(&peer_id);
+                    // Allow a re-query if this peer is rediscovered later.
+                    self.queried_peers.remove(&peer_id);
                 }
             }
 
@@ -195,8 +221,28 @@ impl LatticeNode {
                 self.handle_gossip_message(&message.data);
             }
 
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::Rpc(
+                request_response::Event::Message { peer, message },
+            )) => {
+                self.handle_rpc_message(peer, message);
+            }
+
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::Rpc(
+                request_response::Event::OutboundFailure { peer, error, .. },
+            )) => {
+                warn!(peer = %peer, error = ?error, "Status request failed");
+            }
+
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 info!(peer = %peer_id, "Connection established");
+                // Handshake: once per peer, on the first confirmed connection,
+                // directly ask "who are you, what are you running" via
+                // request-response. Triggering here (not on mDNS discovery)
+                // means the RPC reuses the live connection instead of dialing
+                // — and the dedupe set avoids one query per network interface.
+                if self.queried_peers.insert(peer_id) {
+                    self.send_status_request(peer_id);
+                }
             }
 
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -235,6 +281,7 @@ impl LatticeNode {
             .publish(topic, bytes.clone())
         {
             Ok(_) => {
+                self.heartbeats_sent += 1;
                 debug!(
                     name = %self.node_name,
                     peers = self.peer_table.len(),
@@ -291,6 +338,90 @@ impl LatticeNode {
             }
             LatticeMessage::Status(status) => {
                 debug!(from = %status.node_name, "Status report received");
+            }
+        }
+    }
+
+    /// Send a direct status query to a specific peer over request-response.
+    ///
+    /// Each query carries a fresh nonce so the matching response can be
+    /// correlated — the habit the transaction layer will rely on.
+    fn send_status_request(&mut self, peer: PeerId) {
+        self.query_nonce += 1;
+        let req = StatusRequest {
+            from: self.local_peer_id.to_string(),
+            nonce: self.query_nonce,
+        };
+        let req_id = self
+            .swarm
+            .behaviour_mut()
+            .rpc
+            .send_request(&peer, req);
+        debug!(
+            peer = %peer,
+            nonce = self.query_nonce,
+            ?req_id,
+            "Sent status request"
+        );
+    }
+
+    /// Build a StatusResponse from this node's current local state.
+    fn build_status_response(&self, nonce: u64) -> StatusResponse {
+        StatusResponse {
+            nonce,
+            node_name: self.node_name.clone(),
+            peer_id: self.local_peer_id.to_string(),
+            timestamp: chrono::Utc::now(),
+            peer_count: self.peer_table.len(),
+            uptime_secs: self.start_time.elapsed().as_secs(),
+            heartbeats_sent: self.heartbeats_sent,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: PROTOCOL_VERSION,
+        }
+    }
+
+    /// Handle an inbound request-response message — either a peer asking us
+    /// for our status (respond), or a peer's reply to our query (log/record).
+    fn handle_rpc_message(
+        &mut self,
+        peer: PeerId,
+        message: request_response::Message<StatusRequest, StatusResponse>,
+    ) {
+        match message {
+            request_response::Message::Request {
+                request, channel, ..
+            } => {
+                info!(
+                    from = %peer,
+                    nonce = request.nonce,
+                    "Status request received — responding"
+                );
+                let response = self.build_status_response(request.nonce);
+                // send_response consumes the channel; failure means the
+                // requester already dropped the connection.
+                if self
+                    .swarm
+                    .behaviour_mut()
+                    .rpc
+                    .send_response(channel, response)
+                    .is_err()
+                {
+                    warn!(peer = %peer, "Failed to send status response (channel closed)");
+                }
+            }
+            request_response::Message::Response { response, .. } => {
+                // TODO Phase 3: a response from a peer not in the table is the
+                // first multi-hop signal — insert it here once Kademlia lands.
+                info!(
+                    from = %response.node_name,
+                    peer = %peer,
+                    nonce = response.nonce,
+                    uptime_secs = response.uptime_secs,
+                    heartbeats_sent = response.heartbeats_sent,
+                    peer_count = response.peer_count,
+                    protocol_version = response.protocol_version,
+                    "Status response received"
+                );
             }
         }
     }

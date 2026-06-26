@@ -19,6 +19,130 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     Ok(msg)
 }
 
+/// Request-response codec for the Lattice RPC protocol (`/lattice/rpc/v1`).
+///
+/// Wraps the CBOR `encode`/`decode` helpers with a 4-byte big-endian length
+/// prefix so the stream reader knows exactly where each framed message ends —
+/// without framing, consecutive messages on a Yamux stream would run together.
+pub mod rpc {
+    use std::io;
+
+    use async_trait::async_trait;
+    use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    use libp2p::request_response;
+
+    use crate::message::types::{StatusRequest, StatusResponse};
+
+    /// Maximum frame size (1 MiB) — guards against a malicious or buggy peer
+    /// announcing a huge length prefix and exhausting memory.
+    const MAX_FRAME_BYTES: u32 = 1024 * 1024;
+
+    /// Protocol identifier for the Lattice direct-query RPC channel.
+    #[derive(Debug, Clone)]
+    pub struct LatticeProtocol;
+
+    impl AsRef<str> for LatticeProtocol {
+        fn as_ref(&self) -> &str {
+            "/lattice/rpc/v1"
+        }
+    }
+
+    /// CBOR + length-prefix codec for StatusRequest/StatusResponse.
+    #[derive(Debug, Clone, Default)]
+    pub struct LatticeCodec;
+
+    /// Read a length-prefixed CBOR frame from the stream.
+    async fn read_frame<T>(io: &mut T) -> io::Result<Vec<u8>>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut len_buf = [0u8; 4];
+        io.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf);
+        if len > MAX_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("frame length {len} exceeds max {MAX_FRAME_BYTES}"),
+            ));
+        }
+        let mut data = vec![0u8; len as usize];
+        io.read_exact(&mut data).await?;
+        Ok(data)
+    }
+
+    /// Write a length-prefixed CBOR frame to the stream.
+    async fn write_frame<T>(io: &mut T, data: &[u8]) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        let len = data.len() as u32;
+        io.write_all(&len.to_be_bytes()).await?;
+        io.write_all(data).await?;
+        Ok(())
+    }
+
+    fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+    }
+
+    #[async_trait]
+    impl request_response::Codec for LatticeCodec {
+        type Protocol = LatticeProtocol;
+        type Request = StatusRequest;
+        type Response = StatusResponse;
+
+        async fn read_request<T>(
+            &mut self,
+            _: &Self::Protocol,
+            io: &mut T,
+        ) -> io::Result<Self::Request>
+        where
+            T: AsyncRead + Unpin + Send,
+        {
+            let data = read_frame(io).await?;
+            super::decode(&data).map_err(to_io)
+        }
+
+        async fn read_response<T>(
+            &mut self,
+            _: &Self::Protocol,
+            io: &mut T,
+        ) -> io::Result<Self::Response>
+        where
+            T: AsyncRead + Unpin + Send,
+        {
+            let data = read_frame(io).await?;
+            super::decode(&data).map_err(to_io)
+        }
+
+        async fn write_request<T>(
+            &mut self,
+            _: &Self::Protocol,
+            io: &mut T,
+            req: Self::Request,
+        ) -> io::Result<()>
+        where
+            T: AsyncWrite + Unpin + Send,
+        {
+            let data = super::encode(&req).map_err(to_io)?;
+            write_frame(io, &data).await
+        }
+
+        async fn write_response<T>(
+            &mut self,
+            _: &Self::Protocol,
+            io: &mut T,
+            res: Self::Response,
+        ) -> io::Result<()>
+        where
+            T: AsyncWrite + Unpin + Send,
+        {
+            let data = super::encode(&res).map_err(to_io)?;
+            write_frame(io, &data).await
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

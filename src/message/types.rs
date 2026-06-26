@@ -54,3 +54,41 @@ impl StatusReport {
         self.protocol_version == other.protocol_version
     }
 }
+
+/// Direct request for a peer's status, sent over the request-response
+/// protocol (`/lattice/rpc/v1`) rather than broadcast.
+///
+/// The `nonce` correlates a response with its request — the same habit
+/// the transaction layer will need to match "I asked X" with "you answered Y".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusRequest {
+    /// PeerId of the requesting node (string form).
+    pub from: String,
+    /// Correlation nonce, echoed back in the matching StatusResponse.
+    pub nonce: u64,
+}
+
+/// Direct reply to a `StatusRequest`, carrying the responder's self-reported
+/// state straight from its peer table and runtime.
+///
+/// Kept distinct from `StatusReport` (the broadcast variant) on purpose: the
+/// direct-reply form will diverge once the economic layer arrives — you don't
+/// broadcast a balance, but you might disclose it in a credentialed query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusResponse {
+    /// Echoed correlation nonce from the request.
+    pub nonce: u64,
+    pub node_name: String,
+    pub peer_id: String,
+    pub timestamp: DateTime<Utc>,
+    /// Number of peers the responder currently sees.
+    pub peer_count: usize,
+    /// Uptime in seconds since the responder started.
+    pub uptime_secs: u64,
+    /// Total heartbeats this node has broadcast.
+    pub heartbeats_sent: u64,
+    /// Software version.
+    pub version: String,
+    /// Lattice protocol version for compatibility checks.
+    pub protocol_version: u32,
+}

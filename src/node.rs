@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use libp2p::{
     futures::StreamExt,
-    identity, mdns, noise,
+    gossipsub, identity, mdns, noise,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, PeerId, SwarmBuilder,
 };
@@ -12,7 +12,9 @@ use tokio::time;
 use tracing::{debug, info, warn};
 
 use crate::message::types::{LatticeMessage, Heartbeat};
-use crate::network::protocol::{LatticeBehaviour, LatticeBehaviourEvent};
+use crate::network::protocol::{
+    LatticeBehaviour, LatticeBehaviourEvent, LATTICE_HEARTBEAT_TOPIC,
+};
 use crate::state::peers::PeerTable;
 
 /// A sovereign node in the Lattice mesh.
@@ -71,7 +73,29 @@ impl LatticeNode {
                     mdns::Config::default(),
                     key.public().to_peer_id(),
                 )?;
-                Ok(LatticeBehaviour::new(mdns))
+
+                // Gossipsub for heartbeat propagation across the mesh.
+                // Signed messages: each publish is authenticated by the
+                // sender's keypair, so peers can trust message origin.
+                let gossipsub_config = gossipsub::ConfigBuilder::default()
+                    .heartbeat_interval(Duration::from_secs(1))
+                    .validation_mode(gossipsub::ValidationMode::Strict)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("gossipsub config: {e}"))?;
+
+                let mut gossipsub = gossipsub::Behaviour::new(
+                    gossipsub::MessageAuthenticity::Signed(key.clone()),
+                    gossipsub_config,
+                )
+                .map_err(|e| anyhow::anyhow!("gossipsub init: {e}"))?;
+
+                // Subscribe to the shared heartbeat topic on startup.
+                let topic = gossipsub::IdentTopic::new(LATTICE_HEARTBEAT_TOPIC);
+                gossipsub
+                    .subscribe(&topic)
+                    .map_err(|e| anyhow::anyhow!("gossipsub subscribe: {e}"))?;
+
+                Ok(LatticeBehaviour::new(mdns, gossipsub))
             })?
             .with_swarm_config(|c| {
                 c.with_idle_connection_timeout(Duration::from_secs(60))
@@ -140,6 +164,11 @@ impl LatticeNode {
                         "Peer discovered"
                     );
                     self.peer_table.add_peer(peer_id, addr.clone());
+                    // Register with gossipsub so heartbeats propagate to it.
+                    self.swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .add_explicit_peer(&peer_id);
                     self.swarm.dial(addr.clone()).ok();
                 }
             }
@@ -152,8 +181,18 @@ impl LatticeNode {
                         peer = %peer_id,
                         "Peer expired"
                     );
+                    self.swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .remove_explicit_peer(&peer_id);
                     self.peer_table.remove_peer(&peer_id);
                 }
+            }
+
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::Gossipsub(
+                gossipsub::Event::Message { message, .. },
+            )) => {
+                self.handle_gossip_message(&message.data);
             }
 
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
@@ -170,8 +209,8 @@ impl LatticeNode {
         }
     }
 
-    /// Send a heartbeat to all connected peers.
-    async fn broadcast_heartbeat(&self) {
+    /// Send a heartbeat to all connected peers via gossipsub.
+    async fn broadcast_heartbeat(&mut self) {
         let heartbeat = LatticeMessage::Heartbeat(Heartbeat {
             node_name: self.node_name.clone(),
             peer_id: self.local_peer_id.to_string(),
@@ -180,19 +219,78 @@ impl LatticeNode {
         });
 
         let encoded = crate::message::codec::encode(&heartbeat);
-        match encoded {
-            Ok(bytes) => {
+        let bytes = match encoded {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, "Failed to encode heartbeat");
+                return;
+            }
+        };
+
+        let topic = gossipsub::IdentTopic::new(LATTICE_HEARTBEAT_TOPIC);
+        match self
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(topic, bytes.clone())
+        {
+            Ok(_) => {
                 debug!(
                     name = %self.node_name,
                     peers = self.peer_table.len(),
                     bytes = bytes.len(),
-                    "Heartbeat broadcast"
+                    "Heartbeat published"
                 );
-                // TODO: actually send bytes to connected peers via
-                // a custom request-response protocol or gossipsub
+            }
+            Err(gossipsub::PublishError::InsufficientPeers) => {
+                // No subscribed peers yet — normal at startup or when alone.
+                debug!("Heartbeat skipped: no gossipsub peers yet");
             }
             Err(e) => {
-                warn!(error = %e, "Failed to encode heartbeat");
+                warn!(error = %e, "Failed to publish heartbeat");
+            }
+        }
+    }
+
+    /// Decode an inbound gossip message and update peer state.
+    fn handle_gossip_message(&mut self, data: &[u8]) {
+        let msg: LatticeMessage = match crate::message::codec::decode(data) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "Failed to decode gossip message");
+                return;
+            }
+        };
+
+        match msg {
+            LatticeMessage::Heartbeat(hb) => {
+                // Parse the originating peer ID from the message body.
+                match hb.peer_id.parse::<PeerId>() {
+                    Ok(peer_id) => {
+                        // TODO Phase 3: insert unknown senders into peer_table on first
+                        // gossip contact — required once Kademlia brings in peers not
+                        // discovered via mDNS. Until then, mDNS always populates the
+                        // table before gossip arrives.
+                        self.peer_table.record_heartbeat(&peer_id);
+                        let count = self
+                            .peer_table
+                            .get(&peer_id)
+                            .map(|i| i.heartbeats_received)
+                            .unwrap_or(0);
+                        info!(
+                            from = %hb.node_name,
+                            peer = %peer_id,
+                            total_heartbeats = count,
+                            "Heartbeat received"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(error = %e, peer = %hb.peer_id, "Bad peer_id in heartbeat");
+                    }
+                }
+            }
+            LatticeMessage::Status(status) => {
+                debug!(from = %status.node_name, "Status report received");
             }
         }
     }

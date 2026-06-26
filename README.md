@@ -75,7 +75,7 @@ src/
 ## Roadmap
 
 - [x] **Phase 2a**: Persist node identity to disk (stable PeerId across restarts)
-- [ ] **Phase 2b**: Add gossipsub for heartbeat propagation to all peers
+- [x] **Phase 2b**: Add gossipsub for heartbeat propagation to all peers
 - [ ] **Phase 2c**: Request-response protocol for direct peer queries
 - [ ] **Phase 3**: Kademlia DHT for discovery beyond LAN
 - [ ] **Phase 4**: Digital utility unit transaction types

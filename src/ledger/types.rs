@@ -41,6 +41,63 @@ impl std::ops::Sub for DigitalUtilityUnit {
     }
 }
 
+// ── Phase 6: resource claims ──────────────────────────────
+
+/// A resource claim tracked in the local ledger.
+///
+/// When a peer asserts it stores a resource, the ledger creates a
+/// claim.  Periodic storage challenges verify the claim.  Successful
+/// verifications increase `tenure_health` toward 1.0; failures
+/// degrade it.  If `tenure_health` drops below `EVICTION_HEALTH`,
+/// the claim is dissolved.
+#[derive(Debug, Clone)]
+pub struct ResourceClaim {
+    /// Blake3 hash of the full resource (the Merkle root).
+    pub resource_id: [u8; 32],
+    /// The peer claiming to store this resource.
+    pub owner: String,
+    /// Total size of the resource in bytes.
+    pub size_bytes: u64,
+    /// Number of 1 MiB chunks the resource spans.
+    pub total_chunks: u64,
+    /// The last epoch in which a storage challenge succeeded.
+    pub last_successful_challenge: Option<u64>,
+    /// How many consecutive challenges this claim has failed.
+    /// Resets to 0 on any success.
+    pub consecutive_failures: u32,
+    /// Tenure health multiplier, bounded [0.0, 1.0].
+    /// 1.0 = perfectly validated, 0.0 = dissolved.
+    pub tenure_health: f64,
+}
+
+impl ResourceClaim {
+    /// The floor below which a claim is automatically evicted.
+    pub const EVICTION_HEALTH: f64 = 0.30;
+
+    /// Create a new claim with perfect health.
+    pub fn new(
+        resource_id: [u8; 32],
+        owner: String,
+        size_bytes: u64,
+        total_chunks: u64,
+    ) -> Self {
+        Self {
+            resource_id,
+            owner,
+            size_bytes,
+            total_chunks,
+            last_successful_challenge: None,
+            consecutive_failures: 0,
+            tenure_health: 1.0,
+        }
+    }
+
+    /// Whether this claim should be evicted.
+    pub fn should_evict(&self) -> bool {
+        self.tenure_health < Self::EVICTION_HEALTH
+    }
+}
+
 /// An economic transaction on the Lattice.
 ///
 /// Two initial variants:

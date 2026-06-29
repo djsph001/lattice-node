@@ -73,6 +73,45 @@ impl MerkleTree {
         self.root
     }
 
+    /// Verify a Merkle inclusion proof without needing the full tree.
+    ///
+    /// Given a claimed leaf hash, a leaf index, a sibling path, and
+    /// an expected root, this walks the path upward — applying the
+    /// correct left/right ordering at each level — and checks that
+    /// the result matches `expected_root`.
+    ///
+    /// This is a static method — the verifier doesn't need the full
+    /// tree, just the root and the proof.
+    pub fn verify_inclusion_proof(
+        expected_root: &[u8; 32],
+        claimed_leaf: &[u8; 32],
+        leaf_index: u64,
+        merkle_proof: &[Vec<u8>],
+    ) -> bool {
+        let mut current = *claimed_leaf;
+        let mut idx = leaf_index as usize;
+
+        for sibling in merkle_proof {
+            let (left, right): (&[u8], &[u8]) = if idx % 2 == 0 {
+                // Current is left child, sibling is right child.
+                (current.as_slice(), sibling.as_slice())
+            } else {
+                // Current is right child, sibling is left child.
+                (sibling.as_slice(), current.as_slice())
+            };
+
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(left);
+            hasher.update(right);
+            current = *hasher.finalize().as_bytes();
+
+            idx /= 2;
+        }
+
+        // After processing all siblings, `current` should be the root.
+        &current == expected_root
+    }
+
     /// Extract the Merkle inclusion proof for a given leaf index.
     ///
     /// Returns the sibling hashes from leaf to root, in order.
@@ -223,5 +262,59 @@ mod tests {
         let tree1 = MerkleTree::build(&chunks);
         let tree2 = MerkleTree::build(&chunks);
         assert_eq!(tree1.root(), tree2.root());
+    }
+
+    #[test]
+    fn verify_inclusion_proof_matches_extract() {
+        let chunks: Vec<Vec<u8>> = (0..8).map(|i| vec![i as u8; 64]).collect();
+        let tree = MerkleTree::build(&chunks);
+        let root = tree.root();
+
+        // Extract path and verify it for each leaf.
+        for leaf_idx in 0..8u64 {
+            let leaf_hash = *blake3::hash(&chunks[leaf_idx as usize]).as_bytes();
+            let path = tree.extract_merkle_path(leaf_idx);
+
+            assert!(
+                MerkleTree::verify_inclusion_proof(
+                    &root,
+                    &leaf_hash,
+                    leaf_idx,
+                    &path,
+                ),
+                "leaf {leaf_idx} should verify"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_inclusion_proof_rejects_wrong_leaf() {
+        let chunks: Vec<Vec<u8>> = (0..4).map(|i| vec![i as u8; 64]).collect();
+        let tree = MerkleTree::build(&chunks);
+        let root = tree.root();
+        let path = tree.extract_merkle_path(0);
+
+        // Use a wrong leaf hash.
+        let wrong_leaf = [0xFFu8; 32];
+        assert!(
+            !MerkleTree::verify_inclusion_proof(&root, &wrong_leaf, 0, &path),
+            "wrong leaf should not verify"
+        );
+    }
+
+    #[test]
+    fn verify_inclusion_proof_rejects_wrong_index() {
+        let chunks: Vec<Vec<u8>> = (0..4).map(|i| vec![i as u8; 64]).collect();
+        let tree = MerkleTree::build(&chunks);
+        let root = tree.root();
+
+        // Path for leaf 0, but claim it's leaf 2.
+        let path = tree.extract_merkle_path(0);
+        let leaf_hash = *blake3::hash(&chunks[0]).as_bytes();
+
+        assert!(
+            !MerkleTree::verify_inclusion_proof(&root, &leaf_hash, 2, &path),
+            "wrong leaf index should not verify"
+        );
     }
 }

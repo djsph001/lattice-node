@@ -27,7 +27,11 @@ pub enum ProofError {
 /// The result of a successful proof generation.
 #[derive(Debug)]
 pub struct StorageProofResult {
-    /// blake3(chunk_bytes || salt)
+    /// blake3(chunk_bytes) — the Merkle leaf hash, verifiable
+    /// against the resource_id root via the inclusion proof.
+    pub chunk_hash: [u8; 32],
+    /// blake3(chunk_bytes || salt) — proves the responder
+    /// computed a hash over the actual data, not a cached digest.
     pub salted_hash: [u8; 32],
     /// Merkle inclusion proof — sibling hashes from leaf to root.
     pub merkle_proof: Vec<Vec<u8>>,
@@ -89,6 +93,9 @@ impl ProofEngine {
         let end = std::cmp::min(start + chunk_size, file_data.len());
         let chunk_bytes = &file_data[start..end];
 
+        // 3. Compute the unsalted chunk hash (the Merkle leaf).
+        let chunk_hash = *blake3::hash(chunk_bytes).as_bytes();
+
         // 4. Compute salted hash: blake3(chunk_bytes || salt).
         let mut hasher = blake3::Hasher::new();
         hasher.update(chunk_bytes);
@@ -104,6 +111,7 @@ impl ProofEngine {
         let merkle_proof = tree.extract_merkle_path(chunk_index);
 
         Ok(StorageProofResult {
+            chunk_hash,
             salted_hash,
             merkle_proof,
         })
@@ -126,6 +134,34 @@ impl ProofEngine {
         std::fs::write(&file_path, data)?;
 
         Ok(resource_id)
+    }
+
+    /// Verify a storage proof received from a challenged peer.
+    ///
+    /// The verifier doesn't have the chunk bytes.  Instead it uses
+    /// `chunk_hash` (the Merkle leaf) + `merkle_proof` to verify
+    /// the chunk is part of the resource identified by `resource_id`.
+    ///
+    /// The `salted_hash` is an additional commitment — the target
+    /// proves it computed `blake3(chunk || salt)` without revealing
+    /// the chunk.  Full salt verification requires the chunk data
+    /// and is deferred to Phase 6b.
+    pub fn verify_storage_proof(
+        resource_id: &[u8; 32],
+        chunk_hash: &[u8; 32],
+        chunk_index: u64,
+        _salt: &[u8; 32],
+        _salted_hash: &[u8; 32],
+        merkle_proof: &[Vec<u8>],
+    ) -> bool {
+        // Verify the Merkle inclusion proof: chunk_hash is a leaf
+        // in the tree rooted at resource_id.
+        super::merkle::MerkleTree::verify_inclusion_proof(
+            resource_id,
+            chunk_hash,
+            chunk_index,
+            merkle_proof,
+        )
     }
 }
 

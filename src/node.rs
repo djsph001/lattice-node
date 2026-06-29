@@ -35,6 +35,38 @@ const PROTOCOL_VERSION: u32 = 1;
 /// Gossipsub topic for economic transaction propagation.
 pub const LATTICE_TX_TOPIC: &str = "lattice/tx/v1";
 
+// ── Phase 6: storage verification types ────────────────────
+
+/// Tracks the context of an outbound storage challenge so the
+/// response can be verified when it arrives asynchronously.
+#[derive(Debug, Clone)]
+struct PendingChallenge {
+    resource_id: [u8; 32],
+    chunk_index: u64,
+    salt: [u8; 32],
+    /// The epoch in which the challenge was issued.
+    epoch: u64,
+    /// The peer being challenged.
+    peer: PeerId,
+}
+
+// ── Phase 6: async bridge for storage verification ──────────
+
+/// Bridges the `!Send` Swarm from a background `spawn_blocking` task
+/// back to the main event loop.  The background thread produces a
+/// proof, bundles it with the `ResponseChannel`, and drops it into
+/// this channel.  The main loop picks it up and sends the response
+/// — safely, on the thread that owns the `Swarm`.
+#[derive(Debug)]
+enum InternalBridgeEvent {
+    VerificationReady {
+        channel: libp2p::request_response::ResponseChannel<VerifyResponse>,
+        chunk_hash: [u8; 32],
+        salted_hash: [u8; 32],
+        merkle_proof: Vec<Vec<u8>>,
+    },
+}
+
 /// A sovereign node in the Lattice mesh.
 pub struct LatticeNode {
     swarm: libp2p::Swarm<LatticeBehaviour>,
@@ -86,6 +118,16 @@ pub struct LatticeNode {
     // ── Phase 6: storage verification ──────────────────────────
     /// Directory where verified resources are stored on disk.
     storage_dir: PathBuf,
+    /// Sender half of the async bridge channel — background proof
+    /// tasks drop results here, main loop picks them up.
+    bridge_tx: Option<tokio::sync::mpsc::Sender<InternalBridgeEvent>>,
+    /// Pending outbound storage challenges, keyed by libp2p request ID.
+    /// When a VerifyResponse arrives, we look up the challenge context
+    /// to verify the proof against the original (resource_id, chunk_index, salt).
+    pending_challenges: HashMap<
+        libp2p::request_response::OutboundRequestId,
+        PendingChallenge,
+    >,
 }
 
 impl LatticeNode {
@@ -226,6 +268,8 @@ impl LatticeNode {
             storage_dir: storage_dir.unwrap_or_else(|| {
                 PathBuf::from("./lattice-storage")
             }),
+            bridge_tx: None,
+            pending_challenges: HashMap::new(),
         })
     }
 
@@ -261,6 +305,13 @@ impl LatticeNode {
         let mut heartbeat_timer = time::interval(self.heartbeat_interval);
         let mut epoch_timer = time::interval(self.epoch_interval);
 
+        // Phase 6: async bridge for storage verification.
+        // Background tasks drop proof results here; the main loop
+        // picks them up and sends responses through the Swarm.
+        let (bridge_tx, mut bridge_rx) =
+            tokio::sync::mpsc::channel::<InternalBridgeEvent>(100);
+        self.bridge_tx = Some(bridge_tx.clone());
+
         info!(
             name = %self.node_name,
             heartbeat_interval = ?self.heartbeat_interval,
@@ -281,6 +332,9 @@ impl LatticeNode {
                 }
                 _ = epoch_timer.tick() => {
                     self.run_economic_epoch().await;
+                }
+                Some(bridge_event) = bridge_rx.recv() => {
+                    self.handle_bridge_event(bridge_event);
                 }
             }
         }
@@ -363,6 +417,9 @@ impl LatticeNode {
             ratio = %format!("{:.2}", ratio),
             "Epoch complete"
         );
+
+        // Phase 6b: schedule storage challenges for aging claims.
+        self.schedule_storage_challenges(epoch);
     }
 
     /// Mint units to the local node (test bootstrapping only).
@@ -597,10 +654,8 @@ impl LatticeNode {
                     request_response::Message::Request { request, channel, .. } => {
                         self.handle_verify_request(peer, request, channel);
                     }
-                    request_response::Message::Response { response: _, .. } => {
-                        info!(peer = %peer, "Storage proof received");
-                        // TODO Phase 6: validate proof and update trust score.
-                        debug!(peer = %peer, "Storage proof validation not yet implemented");
+                    request_response::Message::Response { response, request_id } => {
+                        self.handle_verify_response(request_id, response);
                     }
                 }
             }
@@ -903,17 +958,21 @@ impl LatticeNode {
 
     /// Handle an incoming `StorageChallenge` request.
     ///
-    /// Offloads disk I/O to a blocking thread so the main event loop
-    /// stays responsive.  On the Pi 5's lean quad-core, blocking the
-    /// event loop on a file seek would drop gossipsub heartbeats.
+    /// Spawns a `spawn_blocking` task for disk I/O, then bridges the
+    /// result back to the main event loop through the mpsc channel.
+    /// The `Swarm` never leaves Thread 0 — only the `ResponseChannel`
+    /// is moved out.
     fn handle_verify_request(
-        &self,
+        &mut self,
         peer: PeerId,
         request: VerifyRequest,
-        _channel: libp2p::request_response::ResponseChannel<VerifyResponse>,
+        channel: libp2p::request_response::ResponseChannel<VerifyResponse>,
     ) {
         let storage_dir = self.storage_dir.clone();
-        let _challenger = peer;
+        let bridge_tx = self
+            .bridge_tx
+            .clone()
+            .expect("bridge_tx not initialized");
 
         match request {
             VerifyRequest::StorageChallenge {
@@ -924,48 +983,302 @@ impl LatticeNode {
                 info!(
                     peer = %peer,
                     chunk = chunk_index,
-                    "Storage challenge received — generating proof"
+                    "Storage challenge received — delegating to blocking thread"
                 );
 
-                tokio::task::spawn_blocking(move || {
-                    match ProofEngine::generate_storage_proof(
-                        &storage_dir,
-                        &resource_id,
-                        chunk_index,
-                        Self::STORAGE_CHUNK_SIZE,
-                        &salt,
-                    ) {
+                // Fire-and-forget: spawn an async task that awaits
+                // the blocking I/O, then ships the result (including
+                // the ResponseChannel) back to the main loop.
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        ProofEngine::generate_storage_proof(
+                            &storage_dir,
+                            &resource_id,
+                            chunk_index,
+                            Self::STORAGE_CHUNK_SIZE,
+                            &salt,
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|join_err| {
+                        Err(
+                            crate::storage::proof::ProofError::Io(
+                                std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    format!("proof task panicked: {join_err}"),
+                                ),
+                            ),
+                        )
+                    });
+
+                    match result {
                         Ok(proof_result) => {
-                            VerifyResponse::StorageProof {
-                                salted_hash: proof_result.salted_hash,
-                                merkle_proof: proof_result.merkle_proof,
-                            }
+                            let _ = bridge_tx
+                                .send(InternalBridgeEvent::VerificationReady {
+                                    channel,
+                                    chunk_hash: proof_result.chunk_hash,
+                                    salted_hash: proof_result.salted_hash,
+                                    merkle_proof: proof_result.merkle_proof,
+                                })
+                                .await;
                         }
                         Err(e) => {
                             tracing::warn!(
                                 error = %e,
-                                "Failed to generate storage proof"
+                                "Storage proof generation failed"
                             );
-                            // Return an empty-proof response so the
-                            // challenger knows the claim failed.
-                            // TODO Phase 6: a dedicated VerifyError variant
-                            // would be cleaner than an empty merkle_proof.
-                            VerifyResponse::StorageProof {
-                                salted_hash: [0u8; 32],
-                                merkle_proof: vec![],
-                            }
+                            // Send an empty proof — the challenger
+                            // will reject it.
+                            let _ = bridge_tx
+                                .send(InternalBridgeEvent::VerificationReady {
+                                    channel,
+                                    chunk_hash: [0u8; 32],
+                                    salted_hash: [0u8; 32],
+                                    merkle_proof: vec![],
+                                })
+                                .await;
                         }
                     }
                 });
-                // Note: spawn_blocking returns a JoinHandle, but the
-                // response is NOT sent back yet — the result of the
-                // spawned task needs to be wired to the response channel.
-                // TODO Phase 6: collect the JoinHandle, await it, and
-                // call self.swarm.behaviour_mut().verify_rpc.send_response().
-                warn!(
-                    "Storage proof response not yet wired (TODO Phase 6)"
-                );
             }
+        }
+    }
+
+    /// Handle a bridged verification result on the main event loop.
+    ///
+    /// This is called from `select!` on Thread 0 — we hold `&mut self`
+    /// and can safely call `swarm.behaviour_mut().verify_rpc.send_response()`.
+    fn handle_bridge_event(&mut self, event: InternalBridgeEvent) {
+        match event {
+            InternalBridgeEvent::VerificationReady {
+                channel,
+                chunk_hash,
+                salted_hash,
+                merkle_proof,
+            } => {
+                let response = VerifyResponse::StorageProof {
+                    chunk_hash,
+                    salted_hash,
+                    merkle_proof,
+                };
+                if self
+                    .swarm
+                    .behaviour_mut()
+                    .verify_rpc
+                    .send_response(channel, response)
+                    .is_err()
+                {
+                    warn!("Failed to send storage proof response — channel closed");
+                } else {
+                    info!("Storage proof response dispatched to challenger");
+                }
+            }
+        }
+    }
+
+    /// Handle a VerifyResponse received from a challenged peer.
+    ///
+    /// Looks up the pending challenge context, verifies the Merkle
+    /// proof against the known resource_id, and records the outcome
+    /// in the ledger.
+    fn handle_verify_response(
+        &mut self,
+        request_id: libp2p::request_response::OutboundRequestId,
+        response: VerifyResponse,
+    ) {
+        let challenge = match self.pending_challenges.remove(&request_id) {
+            Some(c) => c,
+            None => {
+                warn!(
+                    ?request_id,
+                    "VerifyResponse for unknown request — dropped"
+                );
+                return;
+            }
+        };
+
+        match response {
+            VerifyResponse::StorageProof {
+                chunk_hash,
+                salted_hash,
+                merkle_proof,
+            } => {
+                let is_valid = ProofEngine::verify_storage_proof(
+                    &challenge.resource_id,
+                    &chunk_hash,
+                    challenge.chunk_index,
+                    &challenge.salt,
+                    &salted_hash,
+                    &merkle_proof,
+                );
+
+                if is_valid {
+                    info!(
+                        resource = %hex::encode(challenge.resource_id),
+                        chunk = challenge.chunk_index,
+                        peer = %challenge.peer,
+                        epoch = challenge.epoch,
+                        "Storage proof VERIFIED — peer holds the data"
+                    );
+                    let reward = self.ledger.record_verification_success(
+                        &challenge.resource_id,
+                        &challenge.peer,
+                        challenge.epoch,
+                    );
+                    // Mint the contribution reward.
+                    if reward > 0 {
+                        self.mint_verification_reward(
+                            &challenge.peer,
+                            reward,
+                            challenge.epoch,
+                        );
+                    }
+                } else {
+                    warn!(
+                        resource = %hex::encode(challenge.resource_id),
+                        chunk = challenge.chunk_index,
+                        peer = %challenge.peer,
+                        epoch = challenge.epoch,
+                        "Storage proof FAILED — peer cannot prove possession"
+                    );
+                    self.ledger.record_verification_failure(
+                        &challenge.resource_id,
+                        &challenge.peer,
+                        challenge.epoch,
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ── Phase 6b: scheduled challenges ────────────────────────
+
+impl LatticeNode {
+    /// Fire storage challenges for all claims due for re-verification.
+    ///
+    /// Called at each epoch tick after the economic cycle.  Uses the
+    /// deterministic `ChallengeGenerator` so every validator challenges
+    /// the same chunk for a given (resource_id, epoch) pair.
+    fn schedule_storage_challenges(&mut self, epoch: u64) {
+        let claims_due: Vec<_> = self
+            .ledger
+            .get_claims_due_for_verification(epoch)
+            .into_iter()
+            .cloned()
+            .collect();
+
+        if claims_due.is_empty() {
+            return;
+        }
+
+        info!(
+            epoch,
+            count = claims_due.len(),
+            "Scheduling storage challenges for due claims"
+        );
+
+        for claim in &claims_due {
+            let owner: PeerId = match claim.owner.parse() {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(owner = %claim.owner, error = %e, "Invalid owner PeerId in claim");
+                    continue;
+                }
+            };
+
+            // Don't challenge ourselves.
+            if owner == self.local_peer_id {
+                continue;
+            }
+
+            let (chunk_index, salt) =
+                crate::storage::challenge::ChallengeGenerator::derive_challenge(
+                    &claim.resource_id,
+                    claim.total_chunks,
+                    epoch,
+                );
+
+            let request = VerifyRequest::StorageChallenge {
+                resource_id: claim.resource_id,
+                chunk_index,
+                salt,
+            };
+
+            let request_id = self
+                .swarm
+                .behaviour_mut()
+                .verify_rpc
+                .send_request(&owner, request);
+
+            self.pending_challenges.insert(
+                request_id,
+                PendingChallenge {
+                    resource_id: claim.resource_id,
+                    chunk_index,
+                    salt,
+                    epoch,
+                    peer: owner,
+                },
+            );
+
+            debug!(
+                peer = %owner,
+                resource = %hex::encode(claim.resource_id),
+                chunk = chunk_index,
+                "Storage challenge sent"
+            );
+        }
+    }
+
+    /// Mint a contribution reward for a successfully verified
+    /// storage claim.
+    ///
+    /// The reward flows through the normal transaction path: sign,
+    /// apply locally, broadcast via gossipsub.  Other nodes update
+    /// their ledgers when they receive the gossipsub message.
+    fn mint_verification_reward(
+        &mut self,
+        peer: &PeerId,
+        amount: u64,
+        _epoch: u64,
+    ) {
+        self.tx_nonce += 1;
+        let tx = Transaction::Mint {
+            to: peer.to_string(),
+            amount: DigitalUtilityUnit(amount),
+            authority: self.local_peer_id.to_string(),
+            nonce: self.tx_nonce,
+            timestamp: chrono::Utc::now(),
+        };
+
+        let signed = match self.sign_transaction(&tx) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "Failed to sign verification reward mint");
+                return;
+            }
+        };
+
+        // Apply locally.
+        let mut seen = HashMap::new();
+        if let Err(e) =
+            validation::validate_and_apply(&signed, &mut self.ledger, &mut seen)
+        {
+            warn!(error = %e, "Failed to apply verification reward");
+        } else {
+            for (p, nonce) in seen {
+                self.seen_nonces.insert(p, nonce);
+            }
+            self.economic_engine
+                .metrics
+                .record_transaction_submitted();
+            self.broadcast_transaction(&signed).ok();
+            info!(
+                peer = %peer,
+                amount,
+                "Verification contribution reward minted"
+            );
         }
     }
 }

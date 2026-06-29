@@ -145,8 +145,13 @@ pub enum VerifyRequest {
 pub enum VerifyResponse {
     /// The proof bundle for a `StorageChallenge`.
     StorageProof {
+        /// `blake3(chunk_bytes)` — the Merkle leaf hash.  The
+        /// verifier uses this with `merkle_proof` to reconstruct
+        /// the `resource_id` root.
+        chunk_hash: [u8; 32],
         /// `blake3(chunk_bytes || salt)` — proves the responder
-        /// computed a hash over the actual data, not a cached digest.
+        /// computed a hash over the actual data with the epoch
+        /// salt, not a cached digest.
         salted_hash: [u8; 32],
         /// Merkle inclusion proofs mapping the chunk back to the
         /// `resource_id` root.  Each element is a 32-byte sibling

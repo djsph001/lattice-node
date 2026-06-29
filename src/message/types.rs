@@ -118,3 +118,39 @@ pub struct BalanceResponse {
     /// Echoed correlation nonce.
     pub nonce: u64,
 }
+
+// ── Phase 6: storage verification ──────────────────────────
+
+/// Challenge a peer to prove possession of a specific chunk within a
+/// resource.  Deterministic per (resource_id, epoch) so that every
+/// validator arrives at the same challenge for a given target — proofs
+/// are reusable and instantly cross-verifiable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VerifyRequest {
+    /// Prove you hold `chunk_index` of the resource identified by
+    /// `resource_id`, salted with `salt` to prevent pre-computation.
+    StorageChallenge {
+        /// Blake3 hash of the full resource — the Merkle root.
+        resource_id: [u8; 32],
+        /// Which 1 MiB chunk to prove.
+        chunk_index: u64,
+        /// Epoch-derived salt so the same chunk can't be replayed
+        /// across epochs without actually holding the data.
+        salt: [u8; 32],
+    },
+}
+
+/// Cryptographic receipt proving possession of a specific chunk.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VerifyResponse {
+    /// The proof bundle for a `StorageChallenge`.
+    StorageProof {
+        /// `blake3(chunk_bytes || salt)` — proves the responder
+        /// computed a hash over the actual data, not a cached digest.
+        salted_hash: [u8; 32],
+        /// Merkle inclusion proofs mapping the chunk back to the
+        /// `resource_id` root.  Each element is a 32-byte sibling
+        /// hash on the path from leaf to root.
+        merkle_proof: Vec<Vec<u8>>,
+    },
+}

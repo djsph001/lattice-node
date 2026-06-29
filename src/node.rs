@@ -17,14 +17,17 @@ use crate::ledger::state::LedgerState;
 use crate::ledger::types::{DigitalUtilityUnit, SignedTransaction, Transaction};
 use crate::ledger::validation;
 use crate::message::codec::rpc::{BalanceCodec, BalanceProtocol, LatticeCodec, LatticeProtocol};
+use crate::message::codec::rpc::VerifyProtocol;
 use crate::message::types::{
     BalanceRequest, BalanceResponse, Heartbeat, LatticeMessage, StatusRequest, StatusResponse,
 };
+use crate::message::types::{VerifyRequest, VerifyResponse};
 use crate::network::protocol::{
     LatticeBehaviour, LatticeBehaviourEvent, LATTICE_HEARTBEAT_TOPIC, LATTICE_KAD_PROTOCOL,
 };
 use crate::state::peers::PeerTable;
 use crate::economics::EconomicEngine;
+use crate::storage::ProofEngine;
 
 /// Lattice protocol version advertised in status responses.
 const PROTOCOL_VERSION: u32 = 1;
@@ -79,6 +82,10 @@ pub struct LatticeNode {
     base_mint_rate: u64,
     /// Base tax rate in percent (at contribution ratio 1.0).
     base_tax_rate: u64,
+
+    // ── Phase 6: storage verification ──────────────────────────
+    /// Directory where verified resources are stored on disk.
+    storage_dir: PathBuf,
 }
 
 impl LatticeNode {
@@ -96,6 +103,7 @@ impl LatticeNode {
         epoch_interval_secs: u64,
         base_mint_rate: u64,
         base_tax_rate: u64,
+        storage_dir: Option<PathBuf>,
     ) -> Result<Self> {
         let key_path = resolve_identity_path(identity_dir)?;
         let local_key = load_or_generate_identity(&key_path, fresh_identity)?;
@@ -159,6 +167,12 @@ impl LatticeNode {
                     request_response::Config::default(),
                 );
 
+                // Storage verification RPC channel (Phase 6).
+                let verify_rpc = request_response::Behaviour::new(
+                    [(VerifyProtocol, request_response::ProtocolSupport::Full)],
+                    request_response::Config::default(),
+                );
+
                 let mut kademlia = {
                     let store = kad::store::MemoryStore::new(key.public().to_peer_id());
                     let kconfig =
@@ -176,6 +190,7 @@ impl LatticeNode {
                     gossipsub,
                     rpc,
                     balance_rpc,
+                    verify_rpc,
                     kademlia,
                 ))
             })?
@@ -208,6 +223,9 @@ impl LatticeNode {
             epoch_interval: Duration::from_secs(epoch_interval_secs),
             base_mint_rate,
             base_tax_rate,
+            storage_dir: storage_dir.unwrap_or_else(|| {
+                PathBuf::from("./lattice-storage")
+            }),
         })
     }
 
@@ -571,6 +589,28 @@ impl LatticeNode {
                 warn!(peer = %peer, error = ?error, "Balance query failed");
             }
 
+            // ── Phase 6: storage verification ──────────────
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::VerifyRpc(
+                request_response::Event::Message { peer, message },
+            )) => {
+                match message {
+                    request_response::Message::Request { request, channel, .. } => {
+                        self.handle_verify_request(peer, request, channel);
+                    }
+                    request_response::Message::Response { response: _, .. } => {
+                        info!(peer = %peer, "Storage proof received");
+                        // TODO Phase 6: validate proof and update trust score.
+                        debug!(peer = %peer, "Storage proof validation not yet implemented");
+                    }
+                }
+            }
+
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::VerifyRpc(
+                request_response::Event::OutboundFailure { peer, error, .. },
+            )) => {
+                debug!(peer = %peer, error = ?error, "Storage verification challenge failed");
+            }
+
             // ── Kademlia events ──────────────────────────────
             SwarmEvent::Behaviour(LatticeBehaviourEvent::Kad(
                 kad::Event::OutboundQueryProgressed { result, .. },
@@ -854,6 +894,78 @@ impl LatticeNode {
             heartbeats_sent: self.heartbeats_sent,
             version: env!("CARGO_PKG_VERSION").to_string(),
             protocol_version: PROTOCOL_VERSION,
+        }
+    }
+
+    // ── Phase 6: storage verification ──────────────────────
+    /// Default chunk size for storage verification (1 MiB).
+    const STORAGE_CHUNK_SIZE: usize = 1024 * 1024;
+
+    /// Handle an incoming `StorageChallenge` request.
+    ///
+    /// Offloads disk I/O to a blocking thread so the main event loop
+    /// stays responsive.  On the Pi 5's lean quad-core, blocking the
+    /// event loop on a file seek would drop gossipsub heartbeats.
+    fn handle_verify_request(
+        &self,
+        peer: PeerId,
+        request: VerifyRequest,
+        _channel: libp2p::request_response::ResponseChannel<VerifyResponse>,
+    ) {
+        let storage_dir = self.storage_dir.clone();
+        let _challenger = peer;
+
+        match request {
+            VerifyRequest::StorageChallenge {
+                resource_id,
+                chunk_index,
+                salt,
+            } => {
+                info!(
+                    peer = %peer,
+                    chunk = chunk_index,
+                    "Storage challenge received — generating proof"
+                );
+
+                tokio::task::spawn_blocking(move || {
+                    match ProofEngine::generate_storage_proof(
+                        &storage_dir,
+                        &resource_id,
+                        chunk_index,
+                        Self::STORAGE_CHUNK_SIZE,
+                        &salt,
+                    ) {
+                        Ok(proof_result) => {
+                            VerifyResponse::StorageProof {
+                                salted_hash: proof_result.salted_hash,
+                                merkle_proof: proof_result.merkle_proof,
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "Failed to generate storage proof"
+                            );
+                            // Return an empty-proof response so the
+                            // challenger knows the claim failed.
+                            // TODO Phase 6: a dedicated VerifyError variant
+                            // would be cleaner than an empty merkle_proof.
+                            VerifyResponse::StorageProof {
+                                salted_hash: [0u8; 32],
+                                merkle_proof: vec![],
+                            }
+                        }
+                    }
+                });
+                // Note: spawn_blocking returns a JoinHandle, but the
+                // response is NOT sent back yet — the result of the
+                // spawned task needs to be wired to the response channel.
+                // TODO Phase 6: collect the JoinHandle, await it, and
+                // call self.swarm.behaviour_mut().verify_rpc.send_response().
+                warn!(
+                    "Storage proof response not yet wired (TODO Phase 6)"
+                );
+            }
         }
     }
 }

@@ -11,6 +11,7 @@ mod message;
 mod network;
 mod node;
 mod state;
+mod storage;
 
 use node::LatticeNode;
 
@@ -81,6 +82,12 @@ struct Cli {
     /// rate; a node taking twice what it gives pays double.
     #[arg(long, default_value_t = 5)]
     base_tax_rate: u64,
+
+    // ── Phase 6: storage verification ──────────────────────
+    /// Directory for verified resource storage (blake3-addressed
+    /// chunk files).  Defaults to ./lattice-storage.
+    #[arg(long)]
+    storage_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -140,6 +147,7 @@ async fn main() -> Result<()> {
         cli.epoch_interval,
         cli.base_mint_rate,
         cli.base_tax_rate,
+        cli.storage_dir,
     )?;
 
     info!(

@@ -1,7 +1,9 @@
 use libp2p::{gossipsub, kad, mdns, request_response, swarm::NetworkBehaviour};
 
 use crate::message::codec::rpc::{BalanceCodec, LatticeCodec};
+use crate::message::codec::rpc::VerifyCodec;
 use crate::message::types::{BalanceRequest, BalanceResponse, StatusRequest, StatusResponse};
+use crate::message::types::{VerifyRequest, VerifyResponse};
 
 /// The gossipsub topic all Lattice nodes subscribe to for heartbeat
 /// propagation. Versioned so the wire protocol can evolve without
@@ -21,6 +23,8 @@ pub const LATTICE_KAD_PROTOCOL: &str = "/lattice/kad/v1";
 /// Phase 3 adds Kademlia DHT for broader discovery beyond LAN.
 /// Phase 4 adds a second request-response channel for balance queries
 /// and the economic primitives layer.
+/// Phase 6 adds a third request-response channel for storage
+/// verification — the peer-verified contribution claims layer.
 #[derive(NetworkBehaviour)]
 #[behaviour(out_event = "LatticeBehaviourEvent")]
 pub struct LatticeBehaviour {
@@ -28,6 +32,7 @@ pub struct LatticeBehaviour {
     pub gossipsub: gossipsub::Behaviour,
     pub rpc: request_response::Behaviour<LatticeCodec>,
     pub balance_rpc: request_response::Behaviour<BalanceCodec>,
+    pub verify_rpc: request_response::Behaviour<VerifyCodec>,
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
 }
 
@@ -37,6 +42,7 @@ impl LatticeBehaviour {
         gossipsub: gossipsub::Behaviour,
         rpc: request_response::Behaviour<LatticeCodec>,
         balance_rpc: request_response::Behaviour<BalanceCodec>,
+        verify_rpc: request_response::Behaviour<VerifyCodec>,
         kademlia: kad::Behaviour<kad::store::MemoryStore>,
     ) -> Self {
         Self {
@@ -44,6 +50,7 @@ impl LatticeBehaviour {
             gossipsub,
             rpc,
             balance_rpc,
+            verify_rpc,
             kademlia,
         }
     }
@@ -54,12 +61,9 @@ impl LatticeBehaviour {
 pub enum LatticeBehaviourEvent {
     Mdns(mdns::Event),
     Gossipsub(gossipsub::Event),
-    Rpc(
-        request_response::Event<StatusRequest, StatusResponse>,
-    ),
-    BalanceRpc(
-        request_response::Event<BalanceRequest, BalanceResponse>,
-    ),
+    Rpc(request_response::Event<StatusRequest, StatusResponse>),
+    BalanceRpc(request_response::Event<BalanceRequest, BalanceResponse>),
+    VerifyRpc(request_response::Event<VerifyRequest, VerifyResponse>),
     Kad(kad::Event),
 }
 
@@ -98,5 +102,15 @@ impl From<request_response::Event<BalanceRequest, BalanceResponse>>
 impl From<kad::Event> for LatticeBehaviourEvent {
     fn from(event: kad::Event) -> Self {
         LatticeBehaviourEvent::Kad(event)
+    }
+}
+
+impl From<request_response::Event<VerifyRequest, VerifyResponse>>
+    for LatticeBehaviourEvent
+{
+    fn from(
+        event: request_response::Event<VerifyRequest, VerifyResponse>,
+    ) -> Self {
+        LatticeBehaviourEvent::VerifyRpc(event)
     }
 }

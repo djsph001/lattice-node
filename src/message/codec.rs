@@ -32,6 +32,7 @@ pub mod rpc {
     use libp2p::request_response;
 
     use crate::message::types::{BalanceRequest, BalanceResponse, StatusRequest, StatusResponse};
+    use crate::message::types::{VerifyRequest, VerifyResponse};
 
     /// Maximum frame size (1 MiB) — guards against a malicious or buggy peer
     /// announcing a huge length prefix and exhausting memory.
@@ -161,6 +162,77 @@ pub mod rpc {
         type Protocol = BalanceProtocol;
         type Request = BalanceRequest;
         type Response = BalanceResponse;
+
+        async fn read_request<T>(
+            &mut self,
+            _: &Self::Protocol,
+            io: &mut T,
+        ) -> io::Result<Self::Request>
+        where
+            T: AsyncRead + Unpin + Send,
+        {
+            let data = read_frame(io).await?;
+            super::decode(&data).map_err(to_io)
+        }
+
+        async fn read_response<T>(
+            &mut self,
+            _: &Self::Protocol,
+            io: &mut T,
+        ) -> io::Result<Self::Response>
+        where
+            T: AsyncRead + Unpin + Send,
+        {
+            let data = read_frame(io).await?;
+            super::decode(&data).map_err(to_io)
+        }
+
+        async fn write_request<T>(
+            &mut self,
+            _: &Self::Protocol,
+            io: &mut T,
+            req: Self::Request,
+        ) -> io::Result<()>
+        where
+            T: AsyncWrite + Unpin + Send,
+        {
+            let data = super::encode(&req).map_err(to_io)?;
+            write_frame(io, &data).await
+        }
+
+        async fn write_response<T>(
+            &mut self,
+            _: &Self::Protocol,
+            io: &mut T,
+            res: Self::Response,
+        ) -> io::Result<()>
+        where
+            T: AsyncWrite + Unpin + Send,
+        {
+            let data = super::encode(&res).map_err(to_io)?;
+            write_frame(io, &data).await
+        }
+    }
+
+    /// Protocol identifier for the Lattice storage verification RPC channel.
+    #[derive(Debug, Clone)]
+    pub struct VerifyProtocol;
+
+    impl AsRef<str> for VerifyProtocol {
+        fn as_ref(&self) -> &str {
+            "/lattice/verify/v1"
+        }
+    }
+
+    /// CBOR + length-prefix codec for VerifyRequest/VerifyResponse.
+    #[derive(Debug, Clone, Default)]
+    pub struct VerifyCodec;
+
+    #[async_trait]
+    impl request_response::Codec for VerifyCodec {
+        type Protocol = VerifyProtocol;
+        type Request = VerifyRequest;
+        type Response = VerifyResponse;
 
         async fn read_request<T>(
             &mut self,

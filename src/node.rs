@@ -24,6 +24,7 @@ use crate::network::protocol::{
     LatticeBehaviour, LatticeBehaviourEvent, LATTICE_HEARTBEAT_TOPIC, LATTICE_KAD_PROTOCOL,
 };
 use crate::state::peers::PeerTable;
+use crate::economics::EconomicEngine;
 
 /// Lattice protocol version advertised in status responses.
 const PROTOCOL_VERSION: u32 = 1;
@@ -68,6 +69,16 @@ pub struct LatticeNode {
     mint_on_start: Option<u64>,
     /// One-shot transfer on startup: (to_peer_id, amount).
     transfer_on_start: Option<(String, u64)>,
+
+    // ── Phase 5: economic engine ──────────────────────────────
+    /// The Georgist economic engine — metrics, minting, taxation.
+    economic_engine: EconomicEngine,
+    /// How often the economic cycle runs (epoch interval).
+    epoch_interval: Duration,
+    /// Base units minted per epoch at contribution score 1.0.
+    base_mint_rate: u64,
+    /// Base tax rate in percent (at contribution ratio 1.0).
+    base_tax_rate: u64,
 }
 
 impl LatticeNode {
@@ -82,6 +93,9 @@ impl LatticeNode {
         bootstrap_peers: Vec<Multiaddr>,
         mint_on_start: Option<u64>,
         transfer_on_start: Option<(String, u64)>,
+        epoch_interval_secs: u64,
+        base_mint_rate: u64,
+        base_tax_rate: u64,
     ) -> Result<Self> {
         let key_path = resolve_identity_path(identity_dir)?;
         let local_key = load_or_generate_identity(&key_path, fresh_identity)?;
@@ -190,6 +204,10 @@ impl LatticeNode {
             tx_nonce: 0,
             mint_on_start,
             transfer_on_start,
+            economic_engine: EconomicEngine::new(),
+            epoch_interval: Duration::from_secs(epoch_interval_secs),
+            base_mint_rate,
+            base_tax_rate,
         })
     }
 
@@ -223,10 +241,14 @@ impl LatticeNode {
         }
 
         let mut heartbeat_timer = time::interval(self.heartbeat_interval);
+        let mut epoch_timer = time::interval(self.epoch_interval);
 
         info!(
             name = %self.node_name,
-            interval = ?self.heartbeat_interval,
+            heartbeat_interval = ?self.heartbeat_interval,
+            epoch_interval = ?self.epoch_interval,
+            base_mint_rate = self.base_mint_rate,
+            base_tax_rate = self.base_tax_rate,
             no_mdns = self.no_mdns,
             "Entering event loop"
         );
@@ -239,8 +261,90 @@ impl LatticeNode {
                 _ = heartbeat_timer.tick() => {
                     self.broadcast_heartbeat().await;
                 }
+                _ = epoch_timer.tick() => {
+                    self.run_economic_epoch().await;
+                }
             }
         }
+    }
+
+    /// Run one economic epoch: measure contribution, mint reward, tax & redistribute.
+    async fn run_economic_epoch(&mut self) {
+        let self_balance = self.ledger.balance_of(&self.local_peer_id);
+        let epoch = self.economic_engine.epoch_count() + 1;
+
+        let epoch_txns = self.economic_engine.run_epoch(
+            &self.local_peer_id,
+            self_balance,
+            &self.peer_table,
+            self.base_mint_rate,
+            self.base_tax_rate,
+        );
+
+        // Sign and broadcast the mint transaction.
+        if let Some(mut mint) = epoch_txns.mint {
+            self.tx_nonce += 1;
+            set_transaction_nonce(&mut mint, self.tx_nonce);
+            let signed = match self.sign_transaction(&mint) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "Failed to sign epoch mint transaction");
+                    return;
+                }
+            };
+            // Apply locally.
+            let mut seen = HashMap::new();
+            if let Err(e) = validation::validate_and_apply(
+                &signed, &mut self.ledger, &mut seen,
+            ) {
+                warn!(error = %e, "Failed to apply epoch mint locally");
+            } else {
+                for (peer, nonce) in seen {
+                    self.seen_nonces.insert(peer, nonce);
+                }
+                self.economic_engine.metrics.record_transaction_submitted();
+                self.broadcast_transaction(&signed).ok();
+            }
+        }
+
+        // Sign and broadcast redistribution transfers.
+        for mut transfer in epoch_txns.redistributions {
+            self.tx_nonce += 1;
+            set_transaction_nonce(&mut transfer, self.tx_nonce);
+            let signed = match self.sign_transaction(&transfer) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "Failed to sign redistribution transfer");
+                    continue;
+                }
+            };
+            // Apply locally.
+            let mut seen = HashMap::new();
+            if let Err(e) = validation::validate_and_apply(
+                &signed, &mut self.ledger, &mut seen,
+            ) {
+                warn!(error = %e, "Failed to apply redistribution locally");
+            } else {
+                for (peer, nonce) in seen {
+                    self.seen_nonces.insert(peer, nonce);
+                }
+                self.economic_engine.metrics.record_transaction_submitted();
+                self.broadcast_transaction(&signed).ok();
+            }
+        }
+
+        // Sync heartbeats_sent from node into metrics.
+        self.economic_engine.metrics.heartbeats_sent = self.heartbeats_sent;
+
+        let new_balance = self.ledger.balance_of(&self.local_peer_id);
+        let ratio = self.economic_engine.metrics.contribution_ratio();
+        info!(
+            epoch,
+            balance_before = %self_balance,
+            balance_after = %new_balance,
+            ratio = %format!("{:.2}", ratio),
+            "Epoch complete"
+        );
     }
 
     /// Mint units to the local node (test bootstrapping only).
@@ -361,6 +465,7 @@ impl LatticeNode {
     /// Send a balance query to a specific peer.
     fn send_balance_query(&mut self, query_peer: PeerId, target: PeerId) {
         self.query_nonce += 1;
+        self.economic_engine.metrics.record_query_issued();
         let req = BalanceRequest {
             peer_id: target.to_string(),
             nonce: self.query_nonce,
@@ -504,6 +609,7 @@ impl LatticeNode {
             )) => {
                 if is_new_peer {
                     info!(peer = %peer, addresses = ?addresses, "Kademlia routing table: peer added");
+                    self.economic_engine.metrics.record_dht_record_stored();
                 } else {
                     debug!(peer = %peer, "Kademlia routing table: peer evicted");
                 }
@@ -556,6 +662,8 @@ impl LatticeNode {
         {
             Ok(_) => {
                 self.heartbeats_sent += 1;
+                self.economic_engine.metrics.heartbeats_sent = self.heartbeats_sent;
+                self.economic_engine.metrics.record_consumption(bytes.len() as u64);
                 debug!(name = %self.node_name, peers = self.peer_table.len(), "Heartbeat published");
             }
             Err(gossipsub::PublishError::InsufficientPeers) => {
@@ -569,6 +677,11 @@ impl LatticeNode {
 
     /// Handle an inbound gossip message.
     fn handle_gossip_message(&mut self, data: &[u8]) {
+        // Every inbound gossip message we process is one we're
+        // participating in propagating.  The gossipsub layer handles
+        // the actual forwarding; we track the contribution.
+        self.economic_engine.metrics.record_relay(data.len() as u64);
+
         let msg: LatticeMessage = match crate::message::codec::decode(data) {
             Ok(m) => m,
             Err(e) => {
@@ -608,6 +721,8 @@ impl LatticeNode {
                     signer = %signed.transaction.signer(),
                     "Transaction received via gossipsub"
                 );
+                // We're relaying this economic traffic for the sender.
+                self.economic_engine.metrics.record_transaction_relayed();
                 match validation::validate_and_apply(
                     &signed,
                     &mut self.ledger,
@@ -719,6 +834,7 @@ impl LatticeNode {
 
     fn send_status_request(&mut self, peer: PeerId) {
         self.query_nonce += 1;
+        self.economic_engine.metrics.record_query_issued();
         let req = StatusRequest {
             from: self.local_peer_id.to_string(),
             nonce: self.query_nonce,
@@ -743,6 +859,15 @@ impl LatticeNode {
 }
 
 // ── Identity helpers ──────────────────────────────────────────
+
+/// Set the nonce field on a Transaction (used after TaxEngine produces
+/// transactions with placeholder nonce 0).
+fn set_transaction_nonce(tx: &mut Transaction, nonce: u64) {
+    match tx {
+        Transaction::Transfer { nonce: ref mut n, .. } => *n = nonce,
+        Transaction::Mint { nonce: ref mut n, .. } => *n = nonce,
+    }
+}
 
 fn resolve_identity_path(identity_dir: Option<PathBuf>) -> Result<PathBuf> {
     let dir = match identity_dir {

@@ -5,6 +5,7 @@ use clap::Parser;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod economics;
 mod ledger;
 mod message;
 mod network;
@@ -62,6 +63,24 @@ struct Cli {
     /// Test-only — in production, transfers come from the application layer.
     #[arg(long, num_args = 2, value_names = ["PEER_ID", "AMOUNT"])]
     transfer: Option<Vec<String>>,
+
+    // ── Phase 5: economic engine ────────────────────────────
+    /// Epoch interval in seconds — how often the economic cycle runs.
+    /// At each epoch boundary the node evaluates contribution, mints
+    /// new units, and executes the Georgist tax/redistribution cycle.
+    #[arg(long, default_value_t = 30)]
+    epoch_interval: u64,
+
+    /// Base mint rate — units minted per epoch at a contribution
+    /// score of 1.0.  Higher values make contribution more rewarding.
+    #[arg(long, default_value_t = 10)]
+    base_mint_rate: u64,
+
+    /// Base tax rate in percent of balance per epoch (at contribution
+    /// ratio 1.0).  A node giving twice what it takes pays half this
+    /// rate; a node taking twice what it gives pays double.
+    #[arg(long, default_value_t = 5)]
+    base_tax_rate: u64,
 }
 
 #[tokio::main]
@@ -118,6 +137,9 @@ async fn main() -> Result<()> {
         bootstrap_peers,
         cli.mint,
         transfer,
+        cli.epoch_interval,
+        cli.base_mint_rate,
+        cli.base_tax_rate,
     )?;
 
     info!(

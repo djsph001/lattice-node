@@ -37,6 +37,18 @@ struct Cli {
     /// Useful when running multiple simulated nodes on one machine.
     #[arg(long)]
     fresh_identity: bool,
+
+    /// Disable mDNS peer discovery. Used when joining a mesh via explicit
+    /// bootstrap peers — the node participates in Kademlia DHT routing
+    /// but does not scan the local network.
+    #[arg(long)]
+    no_mdns: bool,
+
+    /// Explicit bootstrap peer address for Kademlia DHT join.
+    /// Format: /ip4/<addr>/tcp/<port>/p2p/<peer-id>
+    /// Repeat for multiple bootstrap peers.
+    #[arg(long)]
+    bootstrap_peer: Vec<String>,
 }
 
 #[tokio::main]
@@ -53,6 +65,19 @@ async fn main() -> Result<()> {
 
     info!("Lattice node starting...");
 
+    // Parse bootstrap peer addresses from CLI strings
+    let bootstrap_peers: Vec<libp2p::Multiaddr> = cli
+        .bootstrap_peer
+        .iter()
+        .filter_map(|s| match s.parse() {
+            Ok(addr) => Some(addr),
+            Err(e) => {
+                warn!(addr = %s, error = %e, "Invalid bootstrap peer address, skipping");
+                None
+            }
+        })
+        .collect();
+
     // Bootstrap the node
     let mut node = LatticeNode::new(
         cli.port,
@@ -60,6 +85,8 @@ async fn main() -> Result<()> {
         cli.heartbeat_interval,
         cli.identity_dir,
         cli.fresh_identity,
+        cli.no_mdns,
+        bootstrap_peers,
     )?;
 
     info!(

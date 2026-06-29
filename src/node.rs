@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use libp2p::{
     futures::StreamExt,
-    gossipsub, identity, mdns, noise, request_response,
+    gossipsub, identity, kad, mdns, noise, request_response,
     swarm::SwarmEvent,
-    tcp, yamux, PeerId, SwarmBuilder,
+    tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
 };
 use tokio::time;
 use tracing::{debug, info, warn};
@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 use crate::message::codec::rpc::LatticeProtocol;
 use crate::message::types::{Heartbeat, LatticeMessage, StatusRequest, StatusResponse};
 use crate::network::protocol::{
-    LatticeBehaviour, LatticeBehaviourEvent, LATTICE_HEARTBEAT_TOPIC,
+    LatticeBehaviour, LatticeBehaviourEvent, LATTICE_HEARTBEAT_TOPIC, LATTICE_KAD_PROTOCOL,
 };
 use crate::state::peers::PeerTable;
 
@@ -38,6 +38,15 @@ pub struct LatticeNode {
     /// Peers we've already sent an initial status query to, so the handshake
     /// fires once per peer rather than once per mDNS interface re-discovery.
     queried_peers: HashSet<PeerId>,
+    /// Whether mDNS discovery is disabled (for Kademlia-only test nodes).
+    no_mdns: bool,
+    /// Peers discovered via mDNS — used to detect when the mesh grows
+    /// beyond local discovery (Phase 3 visibility signal).
+    mdns_peers: HashSet<PeerId>,
+    /// Whether a Kademlia bootstrap has been triggered (at least once).
+    kad_bootstrapped: bool,
+    /// Explicit bootstrap peer addresses for joining without mDNS.
+    bootstrap_peers: Vec<Multiaddr>,
 }
 
 impl LatticeNode {
@@ -49,6 +58,8 @@ impl LatticeNode {
         heartbeat_secs: u64,
         identity_dir: Option<PathBuf>,
         fresh_identity: bool,
+        no_mdns: bool,
+        bootstrap_peers: Vec<Multiaddr>,
     ) -> Result<Self> {
         // Resolve the identity file path: <identity_dir>/identity.key,
         // defaulting to ~/.lattice/identity.key
@@ -75,6 +86,7 @@ impl LatticeNode {
         //   - Noise encryption (XX handshake)
         //   - Yamux multiplexing
         //   - mDNS for local peer discovery
+        //   - Kademlia DHT for broader discovery beyond LAN
         let swarm = SwarmBuilder::with_existing_identity(local_key)
             .with_tokio()
             .with_tcp(
@@ -115,7 +127,22 @@ impl LatticeNode {
                     request_response::Config::default(),
                 );
 
-                Ok(LatticeBehaviour::new(mdns, gossipsub, rpc))
+                // Kademlia DHT for peer discovery beyond the LAN.
+                // MemoryStore for now — persistent storage is a future optimization.
+                let mut kademlia = {
+                    let store = kad::store::MemoryStore::new(key.public().to_peer_id());
+                    let kconfig =
+                        kad::Config::new(StreamProtocol::new(LATTICE_KAD_PROTOCOL));
+                    kad::Behaviour::with_config(
+                        key.public().to_peer_id(),
+                        store,
+                        kconfig,
+                    )
+                };
+                // Lattice nodes are infrastructure, not ephemeral clients.
+                kademlia.set_mode(Some(kad::Mode::Server));
+
+                Ok(LatticeBehaviour::new(mdns, gossipsub, rpc, kademlia))
             })?
             .with_swarm_config(|c| {
                 c.with_idle_connection_timeout(Duration::from_secs(60))
@@ -132,6 +159,10 @@ impl LatticeNode {
             heartbeats_sent: 0,
             query_nonce: 0,
             queried_peers: HashSet::new(),
+            no_mdns,
+            mdns_peers: HashSet::new(),
+            kad_bootstrapped: false,
+            bootstrap_peers,
         })
     }
 
@@ -148,11 +179,23 @@ impl LatticeNode {
             .expect("valid multiaddr");
         self.swarm.listen_on(listen_addr)?;
 
+        // Dial explicit bootstrap peers and seed Kademlia with them.
+        // This is how nodes outside the LAN join the mesh: they're given
+        // the address of at least one existing node and discover the rest
+        // through the DHT.
+        for addr in &self.bootstrap_peers {
+            info!(addr = %addr, "Dialling bootstrap peer");
+            if let Err(e) = self.swarm.dial(addr.clone()) {
+                warn!(addr = %addr, error = %e, "Failed to dial bootstrap peer");
+            }
+        }
+
         let mut heartbeat_timer = time::interval(self.heartbeat_interval);
 
         info!(
             name = %self.node_name,
             interval = ?self.heartbeat_interval,
+            no_mdns = self.no_mdns,
             "Entering event loop"
         );
 
@@ -181,6 +224,13 @@ impl LatticeNode {
             SwarmEvent::Behaviour(LatticeBehaviourEvent::Mdns(
                 mdns::Event::Discovered(peers),
             )) => {
+                // When mDNS is disabled, silently ignore discovery events.
+                // The behaviour still fires them — we just don't act on them.
+                if self.no_mdns {
+                    return;
+                }
+
+                let mut new_peers = false;
                 for (peer_id, addr) in peers {
                     info!(
                         peer = %peer_id,
@@ -188,19 +238,41 @@ impl LatticeNode {
                         "Peer discovered"
                     );
                     self.peer_table.add_peer(peer_id, addr.clone());
+                    self.mdns_peers.insert(peer_id);
                     // Register with gossipsub so heartbeats propagate to it.
                     self.swarm
                         .behaviour_mut()
                         .gossipsub
                         .add_explicit_peer(&peer_id);
+                    // Seed the peer into the Kademlia routing table.
+                    self.swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .add_address(&peer_id, addr.clone());
                     self.swarm.dial(addr.clone()).ok();
+                    new_peers = true;
+                }
+
+                // Bootstrap Kademlia once we have at least one peer in the routing table.
+                // This populates the DHT from the neighbours' routing tables.
+                if new_peers && !self.kad_bootstrapped {
+                    if let Err(e) = self.swarm.behaviour_mut().kademlia.bootstrap() {
+                        warn!(error = %e, "Kademlia bootstrap failed");
+                    } else {
+                        self.kad_bootstrapped = true;
+                        info!("Kademlia bootstrap initiated");
+                    }
                 }
             }
 
             SwarmEvent::Behaviour(LatticeBehaviourEvent::Mdns(
                 mdns::Event::Expired(peers),
             )) => {
-                for (peer_id, addr) in peers {
+                if self.no_mdns {
+                    return;
+                }
+
+                for (peer_id, _addr) in peers {
                     info!(
                         peer = %peer_id,
                         "Peer expired"
@@ -210,6 +282,7 @@ impl LatticeNode {
                         .gossipsub
                         .remove_explicit_peer(&peer_id);
                     self.peer_table.remove_peer(&peer_id);
+                    self.mdns_peers.remove(&peer_id);
                     // Allow a re-query if this peer is rediscovered later.
                     self.queried_peers.remove(&peer_id);
                 }
@@ -233,8 +306,90 @@ impl LatticeNode {
                 warn!(peer = %peer, error = ?error, "Status request failed");
             }
 
+            // ── Phase 3: Kademlia events ──────────────────────────────
+
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::Kad(
+                kad::Event::OutboundQueryProgressed { result, .. },
+            )) => {
+                match result {
+                    kad::QueryResult::Bootstrap(result) => {
+                        match result {
+                            Ok(kad::BootstrapOk { peer, num_remaining }) => {
+                                debug!(
+                                    peer = %peer,
+                                    remaining = num_remaining,
+                                    "Kademlia bootstrap progressing"
+                                );
+                                if num_remaining == 0 {
+                                    info!(
+                                        peer = %peer,
+                                        "Kademlia bootstrap complete — DHT routing table populated"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = ?e, "Kademlia bootstrap query failed");
+                            }
+                        }
+                    }
+                    kad::QueryResult::GetClosestPeers(result) => {
+                        match result {
+                            Ok(kad::GetClosestPeersOk { key: _, peers }) => {
+                                // Peers discovered through Kademlia that we've
+                                // never directly seen — insert them into the peer table.
+                                for info in peers {
+                                    if self.peer_table.get(&info.peer_id).is_none() {
+                                        info!(
+                                            peer = %info.peer_id,
+                                            "Discovered peer via Kademlia DHT (multi-hop)"
+                                        );
+                                        // Insert with minimal info — addresses may come
+                                        // later via Identify or direct connection.
+                                        self.peer_table.insert_peer(info.peer_id);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = ?e, "Kademlia GetClosestPeers query failed");
+                            }
+                        }
+                    }
+                    _ => {
+                        debug!(?result, "Kademlia query result");
+                    }
+                }
+            }
+
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::Kad(
+                kad::Event::RoutingUpdated { peer, is_new_peer, addresses, .. },
+            )) => {
+                if is_new_peer {
+                    info!(
+                        peer = %peer,
+                        addresses = ?addresses,
+                        "Kademlia routing table: peer added"
+                    );
+                } else {
+                    debug!(
+                        peer = %peer,
+                        "Kademlia routing table: peer evicted"
+                    );
+                }
+            }
+
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 info!(peer = %peer_id, "Connection established");
+
+                // Phase 3 visibility: log a warning when a connection comes
+                // from a peer not previously seen via mDNS. This is the signal
+                // that the mesh is growing beyond local discovery.
+                if !self.mdns_peers.contains(&peer_id) {
+                    warn!(
+                        peer = %peer_id,
+                        "Connection from non-mDNS peer — mesh growing beyond LAN discovery"
+                    );
+                }
+
                 // Handshake: once per peer, on the first confirmed connection,
                 // directly ask "who are you, what are you running" via
                 // request-response. Triggering here (not on mDNS discovery)
@@ -314,10 +469,18 @@ impl LatticeNode {
                 // Parse the originating peer ID from the message body.
                 match hb.peer_id.parse::<PeerId>() {
                     Ok(peer_id) => {
-                        // TODO Phase 3: insert unknown senders into peer_table on first
-                        // gossip contact — required once Kademlia brings in peers not
-                        // discovered via mDNS. Until then, mDNS always populates the
-                        // table before gossip arrives.
+                        // Phase 3: insert unknown senders into the peer table on
+                        // first gossip contact. Kademlia brings in peers not
+                        // discovered via mDNS — the old get_mut-only approach
+                        // would silently drop their heartbeats.
+                        if self.peer_table.get(&peer_id).is_none() {
+                            info!(
+                                peer = %peer_id,
+                                from = %hb.node_name,
+                                "Inserting peer from gossip (first contact, not seen via mDNS)"
+                            );
+                            self.peer_table.insert_peer(peer_id);
+                        }
                         self.peer_table.record_heartbeat(&peer_id);
                         let count = self
                             .peer_table
@@ -410,8 +573,16 @@ impl LatticeNode {
                 }
             }
             request_response::Message::Response { response, .. } => {
-                // TODO Phase 3: a response from a peer not in the table is the
-                // first multi-hop signal — insert it here once Kademlia lands.
+                // Phase 3: a response from a peer not in the table is the
+                // first multi-hop signal — insert it.
+                if self.peer_table.get(&peer).is_none() {
+                    info!(
+                        peer = %peer,
+                        from = %response.node_name,
+                        "Inserting peer from RPC response (multi-hop contact)"
+                    );
+                    self.peer_table.insert_peer(peer);
+                }
                 info!(
                     from = %response.node_name,
                     peer = %peer,

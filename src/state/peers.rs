@@ -54,6 +54,27 @@ impl PeerTable {
             });
     }
 
+    /// Insert a peer with no known address — used when a peer is discovered
+    /// via Kademlia or gossip before a direct connection. Addresses populate
+    /// later via Identify or on connection.
+    pub fn insert_peer(&mut self, peer_id: PeerId) {
+        if self.peers.contains_key(&peer_id) {
+            return;
+        }
+        let now = Utc::now();
+        debug!(peer = %peer_id, "New peer inserted into table (no address yet)");
+        self.peers.insert(
+            peer_id,
+            PeerInfo {
+                peer_id,
+                addresses: vec![],
+                first_seen: now,
+                last_seen: now,
+                heartbeats_received: 0,
+            },
+        );
+    }
+
     /// Remove a peer when it expires or disconnects.
     pub fn remove_peer(&mut self, peer_id: &PeerId) {
         if self.peers.remove(peer_id).is_some() {

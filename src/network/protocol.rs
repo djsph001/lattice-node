@@ -1,4 +1,4 @@
-use libp2p::{gossipsub, mdns, request_response, swarm::NetworkBehaviour};
+use libp2p::{gossipsub, kad, mdns, request_response, swarm::NetworkBehaviour};
 
 use crate::message::codec::rpc::LatticeCodec;
 
@@ -7,21 +7,24 @@ use crate::message::codec::rpc::LatticeCodec;
 /// silently mixing incompatible nodes on the same topic.
 pub const LATTICE_HEARTBEAT_TOPIC: &str = "lattice/heartbeat/v1";
 
+/// Kademlia protocol name — versioned for the same reason as the
+/// heartbeat topic: wire-level evolution without silent breakage.
+pub const LATTICE_KAD_PROTOCOL: &str = "/lattice/kad/v1";
+
 /// Composed network behaviour for a Lattice node.
 ///
 /// Phase 2 starts with mDNS for local peer discovery.
 /// Phase 2b adds gossipsub for heartbeat propagation across the mesh.
 /// Phase 2c adds request-response for direct peer queries (the handshake
 /// channel, complementing gossipsub's fire-and-forget broadcast).
-/// Future phases add:
-///   - Kademlia DHT for broader discovery beyond LAN
+/// Phase 3 adds Kademlia DHT for broader discovery beyond LAN.
 #[derive(NetworkBehaviour)]
 #[behaviour(out_event = "LatticeBehaviourEvent")]
 pub struct LatticeBehaviour {
     pub mdns: mdns::tokio::Behaviour,
     pub gossipsub: gossipsub::Behaviour,
     pub rpc: request_response::Behaviour<LatticeCodec>,
-    // TODO Phase 3: pub kademlia: kad::Behaviour<MemoryStore>,
+    pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
 }
 
 impl LatticeBehaviour {
@@ -29,11 +32,13 @@ impl LatticeBehaviour {
         mdns: mdns::tokio::Behaviour,
         gossipsub: gossipsub::Behaviour,
         rpc: request_response::Behaviour<LatticeCodec>,
+        kademlia: kad::Behaviour<kad::store::MemoryStore>,
     ) -> Self {
         Self {
             mdns,
             gossipsub,
             rpc,
+            kademlia,
         }
     }
 }
@@ -43,7 +48,13 @@ impl LatticeBehaviour {
 pub enum LatticeBehaviourEvent {
     Mdns(mdns::Event),
     Gossipsub(gossipsub::Event),
-    Rpc(request_response::Event<crate::message::types::StatusRequest, crate::message::types::StatusResponse>),
+    Rpc(
+        request_response::Event<
+            crate::message::types::StatusRequest,
+            crate::message::types::StatusResponse,
+        >,
+    ),
+    Kad(kad::Event),
 }
 
 impl From<mdns::Event> for LatticeBehaviourEvent {
@@ -73,5 +84,11 @@ impl
         >,
     ) -> Self {
         LatticeBehaviourEvent::Rpc(event)
+    }
+}
+
+impl From<kad::Event> for LatticeBehaviourEvent {
+    fn from(event: kad::Event) -> Self {
+        LatticeBehaviourEvent::Kad(event)
     }
 }

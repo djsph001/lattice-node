@@ -1,0 +1,292 @@
+use std::collections::HashMap;
+
+use anyhow::{bail, Result};
+use libp2p::{identity, PeerId};
+use tracing::warn;
+
+use super::state::LedgerState;
+use super::types::{DigitalUtilityUnit, SignedTransaction, Transaction};
+
+/// Maximum age for a transaction before it's considered stale.
+/// Prevents replay of old transactions from before a node's memory.
+const MAX_TX_AGE_SECS: i64 = 300; // 5 minutes
+
+/// Validate and apply a signed transaction to the local ledger state.
+///
+/// Returns `Ok(())` if the transaction is valid and was applied,
+/// or an error describing why it was rejected.
+pub fn validate_and_apply(
+    tx: &SignedTransaction,
+    state: &mut LedgerState,
+    seen_nonces: &mut HashMap<PeerId, u64>,
+) -> Result<()> {
+    // 1. Verify the signature
+    verify_signature(tx)?;
+
+    // 2. Check timestamp freshness
+    check_timestamp(tx)?;
+
+    let signer: PeerId = tx
+        .transaction
+        .signer()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid signer PeerId: {e}"))?;
+
+    // 3. Replay protection: nonce must be strictly greater than last seen
+    check_nonce(&signer, tx.transaction.nonce(), seen_nonces)?;
+
+    // 4. For transfers, check sufficient balance
+    if let Transaction::Transfer { from, amount, .. } = &tx.transaction {
+        let from_peer: PeerId = from
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid from PeerId: {e}"))?;
+        let balance = state.balance_of(&from_peer);
+        if balance < *amount {
+            bail!(
+                "insufficient balance: {} has {}, needs {}",
+                from,
+                balance,
+                amount
+            );
+        }
+    }
+
+    // 5. Apply to local state
+    state.apply_transaction(&tx.transaction)?;
+
+    // 6. Record the nonce so we reject replays
+    seen_nonces.insert(signer, tx.transaction.nonce());
+
+    Ok(())
+}
+
+/// Verify the Ed25519 signature on a signed transaction.
+fn verify_signature(tx: &SignedTransaction) -> Result<()> {
+    // Reconstruct the public key from the protobuf-encoded bytes.
+    let public_key = identity::PublicKey::try_decode_protobuf(&tx.signer_public_key)
+        .map_err(|e| anyhow::anyhow!("invalid public key: {e}"))?;
+
+    // The signature covers the CBOR-encoded transaction body.
+    let tx_bytes = serde_cbor::to_vec(&tx.transaction)
+        .map_err(|e| anyhow::anyhow!("failed to encode transaction for verification: {e}"))?;
+
+    if !public_key.verify(&tx_bytes, &tx.signature) {
+        bail!("invalid signature");
+    }
+
+    // Verify that the signer's public key matches the transaction's claimed signer.
+    let key_peer_id = PeerId::from(public_key);
+    let claimed_signer: PeerId = tx
+        .transaction
+        .signer()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid signer PeerId: {e}"))?;
+    if key_peer_id != claimed_signer {
+        bail!(
+            "signer key mismatch: key resolves to {} but transaction claims {}",
+            key_peer_id,
+            claimed_signer
+        );
+    }
+
+    Ok(())
+}
+
+/// Reject transactions older than MAX_TX_AGE_SECS.
+fn check_timestamp(tx: &SignedTransaction) -> Result<()> {
+    let tx_time = match &tx.transaction {
+        Transaction::Transfer { timestamp, .. } => timestamp,
+        Transaction::Mint { timestamp, .. } => timestamp,
+    };
+
+    let now = chrono::Utc::now();
+    let age = (now - *tx_time).num_seconds();
+    if age > MAX_TX_AGE_SECS || age < -MAX_TX_AGE_SECS {
+        bail!(
+            "transaction timestamp is {}s from now (max ±{}s)",
+            age,
+            MAX_TX_AGE_SECS
+        );
+    }
+
+    Ok(())
+}
+
+/// Replay protection: the nonce must be strictly greater than any
+/// previously-seen nonce from this signer.
+fn check_nonce(
+    signer: &PeerId,
+    nonce: u64,
+    seen_nonces: &HashMap<PeerId, u64>,
+) -> Result<()> {
+    if let Some(&last_nonce) = seen_nonces.get(signer) {
+        if nonce <= last_nonce {
+            bail!(
+                "replayed or out-of-order nonce {} from {} (last seen: {})",
+                nonce,
+                signer,
+                last_nonce
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ledger::types::DigitalUtilityUnit;
+    use chrono::Utc;
+    use libp2p::identity;
+
+    fn make_keypair() -> identity::Keypair {
+        identity::Keypair::generate_ed25519()
+    }
+
+    fn sign_transaction(tx: &Transaction, keypair: &identity::Keypair) -> SignedTransaction {
+        let tx_bytes = serde_cbor::to_vec(tx).unwrap();
+        let signature = keypair.sign(&tx_bytes).unwrap();
+        let signer_public_key = keypair.public().encode_protobuf();
+
+        SignedTransaction {
+            transaction: tx.clone(),
+            signer_public_key,
+            signature,
+        }
+    }
+
+    #[test]
+    fn valid_transfer_succeeds() {
+        let alice = make_keypair();
+        let bob = make_keypair();
+        let alice_id = PeerId::from(alice.public());
+        let bob_id = PeerId::from(bob.public());
+
+        let mut state = LedgerState::new();
+        let mut nonces = HashMap::new();
+
+        // Give alice some starting balance
+        state.set_balance(&alice_id, DigitalUtilityUnit(1000));
+
+        let tx = Transaction::Transfer {
+            from: alice_id.to_string(),
+            to: bob_id.to_string(),
+            amount: DigitalUtilityUnit(100),
+            nonce: 1,
+            timestamp: Utc::now(),
+        };
+        let signed = sign_transaction(&tx, &alice);
+
+        assert!(validate_and_apply(&signed, &mut state, &mut nonces).is_ok());
+        assert_eq!(state.balance_of(&alice_id), DigitalUtilityUnit(900));
+        assert_eq!(state.balance_of(&bob_id), DigitalUtilityUnit(100));
+    }
+
+    #[test]
+    fn insufficient_balance_rejected() {
+        let alice = make_keypair();
+        let bob = make_keypair();
+        let alice_id = PeerId::from(alice.public());
+        let bob_id = PeerId::from(bob.public());
+
+        let mut state = LedgerState::new();
+        let mut nonces = HashMap::new();
+
+        state.set_balance(&alice_id, DigitalUtilityUnit(50));
+
+        let tx = Transaction::Transfer {
+            from: alice_id.to_string(),
+            to: bob_id.to_string(),
+            amount: DigitalUtilityUnit(100),
+            nonce: 1,
+            timestamp: Utc::now(),
+        };
+        let signed = sign_transaction(&tx, &alice);
+
+        let result = validate_and_apply(&signed, &mut state, &mut nonces);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("insufficient balance"));
+    }
+
+    #[test]
+    fn replayed_nonce_rejected() {
+        let alice = make_keypair();
+        let bob = make_keypair();
+        let alice_id = PeerId::from(alice.public());
+        let bob_id = PeerId::from(bob.public());
+
+        let mut state = LedgerState::new();
+        let mut nonces = HashMap::new();
+
+        state.set_balance(&alice_id, DigitalUtilityUnit(1000));
+
+        let tx = Transaction::Transfer {
+            from: alice_id.to_string(),
+            to: bob_id.to_string(),
+            amount: DigitalUtilityUnit(100),
+            nonce: 1,
+            timestamp: Utc::now(),
+        };
+        let signed = sign_transaction(&tx, &alice);
+
+        // First time: OK
+        assert!(validate_and_apply(&signed, &mut state, &mut nonces).is_ok());
+
+        // Second time: replay rejected
+        let signed2 = sign_transaction(&tx, &alice);
+        let result = validate_and_apply(&signed2, &mut state, &mut nonces);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("replayed"));
+    }
+
+    #[test]
+    fn bad_signature_rejected() {
+        let alice = make_keypair();
+        let bob = make_keypair();
+        let mallory = make_keypair(); // not the signer
+        let alice_id = PeerId::from(alice.public());
+        let bob_id = PeerId::from(bob.public());
+
+        let mut state = LedgerState::new();
+        let mut nonces = HashMap::new();
+
+        state.set_balance(&alice_id, DigitalUtilityUnit(1000));
+
+        let tx = Transaction::Transfer {
+            from: alice_id.to_string(),
+            to: bob_id.to_string(),
+            amount: DigitalUtilityUnit(100),
+            nonce: 1,
+            timestamp: Utc::now(),
+        };
+        // Sign with mallory's key but claim to be from alice
+        let signed = sign_transaction(&tx, &mallory);
+
+        let result = validate_and_apply(&signed, &mut state, &mut nonces);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("signer key mismatch"));
+    }
+
+    #[test]
+    fn valid_mint_succeeds() {
+        let minter = make_keypair();
+        let recipient = make_keypair();
+        let minter_id = PeerId::from(minter.public());
+        let recipient_id = PeerId::from(recipient.public());
+
+        let mut state = LedgerState::new();
+        let mut nonces = HashMap::new();
+
+        let tx = Transaction::Mint {
+            to: recipient_id.to_string(),
+            amount: DigitalUtilityUnit(500),
+            authority: minter_id.to_string(),
+            nonce: 1,
+            timestamp: Utc::now(),
+        };
+        let signed = sign_transaction(&tx, &minter);
+
+        assert!(validate_and_apply(&signed, &mut state, &mut nonces).is_ok());
+        assert_eq!(state.balance_of(&recipient_id), DigitalUtilityUnit(500));
+    }
+}

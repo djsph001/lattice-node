@@ -1,6 +1,7 @@
 use libp2p::{gossipsub, kad, mdns, request_response, swarm::NetworkBehaviour};
 
-use crate::message::codec::rpc::LatticeCodec;
+use crate::message::codec::rpc::{BalanceCodec, LatticeCodec};
+use crate::message::types::{BalanceRequest, BalanceResponse, StatusRequest, StatusResponse};
 
 /// The gossipsub topic all Lattice nodes subscribe to for heartbeat
 /// propagation. Versioned so the wire protocol can evolve without
@@ -18,12 +19,15 @@ pub const LATTICE_KAD_PROTOCOL: &str = "/lattice/kad/v1";
 /// Phase 2c adds request-response for direct peer queries (the handshake
 /// channel, complementing gossipsub's fire-and-forget broadcast).
 /// Phase 3 adds Kademlia DHT for broader discovery beyond LAN.
+/// Phase 4 adds a second request-response channel for balance queries
+/// and the economic primitives layer.
 #[derive(NetworkBehaviour)]
 #[behaviour(out_event = "LatticeBehaviourEvent")]
 pub struct LatticeBehaviour {
     pub mdns: mdns::tokio::Behaviour,
     pub gossipsub: gossipsub::Behaviour,
     pub rpc: request_response::Behaviour<LatticeCodec>,
+    pub balance_rpc: request_response::Behaviour<BalanceCodec>,
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
 }
 
@@ -32,12 +36,14 @@ impl LatticeBehaviour {
         mdns: mdns::tokio::Behaviour,
         gossipsub: gossipsub::Behaviour,
         rpc: request_response::Behaviour<LatticeCodec>,
+        balance_rpc: request_response::Behaviour<BalanceCodec>,
         kademlia: kad::Behaviour<kad::store::MemoryStore>,
     ) -> Self {
         Self {
             mdns,
             gossipsub,
             rpc,
+            balance_rpc,
             kademlia,
         }
     }
@@ -49,10 +55,10 @@ pub enum LatticeBehaviourEvent {
     Mdns(mdns::Event),
     Gossipsub(gossipsub::Event),
     Rpc(
-        request_response::Event<
-            crate::message::types::StatusRequest,
-            crate::message::types::StatusResponse,
-        >,
+        request_response::Event<StatusRequest, StatusResponse>,
+    ),
+    BalanceRpc(
+        request_response::Event<BalanceRequest, BalanceResponse>,
     ),
     Kad(kad::Event),
 }
@@ -69,21 +75,23 @@ impl From<gossipsub::Event> for LatticeBehaviourEvent {
     }
 }
 
-impl
-    From<
-        request_response::Event<
-            crate::message::types::StatusRequest,
-            crate::message::types::StatusResponse,
-        >,
-    > for LatticeBehaviourEvent
+impl From<request_response::Event<StatusRequest, StatusResponse>>
+    for LatticeBehaviourEvent
 {
     fn from(
-        event: request_response::Event<
-            crate::message::types::StatusRequest,
-            crate::message::types::StatusResponse,
-        >,
+        event: request_response::Event<StatusRequest, StatusResponse>,
     ) -> Self {
         LatticeBehaviourEvent::Rpc(event)
+    }
+}
+
+impl From<request_response::Event<BalanceRequest, BalanceResponse>>
+    for LatticeBehaviourEvent
+{
+    fn from(
+        event: request_response::Event<BalanceRequest, BalanceResponse>,
+    ) -> Self {
+        LatticeBehaviourEvent::BalanceRpc(event)
     }
 }
 

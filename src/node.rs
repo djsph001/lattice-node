@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -12,8 +13,13 @@ use libp2p::{
 use tokio::time;
 use tracing::{debug, info, warn};
 
-use crate::message::codec::rpc::LatticeProtocol;
-use crate::message::types::{Heartbeat, LatticeMessage, StatusRequest, StatusResponse};
+use crate::ledger::state::LedgerState;
+use crate::ledger::types::{DigitalUtilityUnit, SignedTransaction, Transaction};
+use crate::ledger::validation;
+use crate::message::codec::rpc::{BalanceCodec, BalanceProtocol, LatticeCodec, LatticeProtocol};
+use crate::message::types::{
+    BalanceRequest, BalanceResponse, Heartbeat, LatticeMessage, StatusRequest, StatusResponse,
+};
 use crate::network::protocol::{
     LatticeBehaviour, LatticeBehaviourEvent, LATTICE_HEARTBEAT_TOPIC, LATTICE_KAD_PROTOCOL,
 };
@@ -22,11 +28,16 @@ use crate::state::peers::PeerTable;
 /// Lattice protocol version advertised in status responses.
 const PROTOCOL_VERSION: u32 = 1;
 
+/// Gossipsub topic for economic transaction propagation.
+pub const LATTICE_TX_TOPIC: &str = "lattice/tx/v1";
+
 /// A sovereign node in the Lattice mesh.
 pub struct LatticeNode {
     swarm: libp2p::Swarm<LatticeBehaviour>,
     peer_table: PeerTable,
     local_peer_id: PeerId,
+    /// The node's persistent keypair — used to sign economic transactions.
+    local_key: identity::Keypair,
     node_name: String,
     heartbeat_interval: Duration,
     /// When the node started — used to report uptime.
@@ -35,42 +46,48 @@ pub struct LatticeNode {
     heartbeats_sent: u64,
     /// Monotonic nonce for correlating outbound status queries.
     query_nonce: u64,
-    /// Peers we've already sent an initial status query to, so the handshake
-    /// fires once per peer rather than once per mDNS interface re-discovery.
+    /// Peers we've already sent an initial status query to.
     queried_peers: HashSet<PeerId>,
-    /// Whether mDNS discovery is disabled (for Kademlia-only test nodes).
+    /// Whether mDNS discovery is disabled.
     no_mdns: bool,
-    /// Peers discovered via mDNS — used to detect when the mesh grows
-    /// beyond local discovery (Phase 3 visibility signal).
+    /// Peers discovered via mDNS.
     mdns_peers: HashSet<PeerId>,
-    /// Whether a Kademlia bootstrap has been triggered (at least once).
+    /// Whether a Kademlia bootstrap has been triggered.
     kad_bootstrapped: bool,
-    /// Explicit bootstrap peer addresses for joining without mDNS.
+    /// Explicit bootstrap peer addresses.
     bootstrap_peers: Vec<Multiaddr>,
+
+    // ── Phase 4: economic layer ──────────────────────────────
+    /// Local ledger — this node's view of balances.
+    ledger: LedgerState,
+    /// Highest nonce seen per peer for replay protection.
+    seen_nonces: HashMap<PeerId, u64>,
+    /// Monotonically increasing nonce for our own outbound transactions.
+    tx_nonce: u64,
+    /// Amount to mint at startup (test bootstrapping).
+    mint_on_start: Option<u64>,
+    /// One-shot transfer on startup: (to_peer_id, amount).
+    transfer_on_start: Option<(String, u64)>,
 }
 
 impl LatticeNode {
-    /// Create a new Lattice node, loading a persistent Ed25519 identity
-    /// from disk if one exists (or generating and saving a fresh one).
+    /// Create a new Lattice node.
     pub fn new(
-        port: u16,
+        _port: u16,
         name: Option<String>,
         heartbeat_secs: u64,
         identity_dir: Option<PathBuf>,
         fresh_identity: bool,
         no_mdns: bool,
         bootstrap_peers: Vec<Multiaddr>,
+        mint_on_start: Option<u64>,
+        transfer_on_start: Option<(String, u64)>,
     ) -> Result<Self> {
-        // Resolve the identity file path: <identity_dir>/identity.key,
-        // defaulting to ~/.lattice/identity.key
         let key_path = resolve_identity_path(identity_dir)?;
-
-        // Load an existing identity, or generate + persist a new one.
         let local_key = load_or_generate_identity(&key_path, fresh_identity)?;
         let local_peer_id = PeerId::from(local_key.public());
 
         let node_name = name.unwrap_or_else(|| {
-            // Use last 8 chars of peer ID as default name
             let id_str = local_peer_id.to_string();
             format!("node-{}", &id_str[id_str.len() - 8..])
         });
@@ -81,13 +98,7 @@ impl LatticeNode {
             "Generating node identity"
         );
 
-        // Build the libp2p swarm with:
-        //   - TCP transport
-        //   - Noise encryption (XX handshake)
-        //   - Yamux multiplexing
-        //   - mDNS for local peer discovery
-        //   - Kademlia DHT for broader discovery beyond LAN
-        let swarm = SwarmBuilder::with_existing_identity(local_key)
+        let swarm = SwarmBuilder::with_existing_identity(local_key.clone())
             .with_tokio()
             .with_tcp(
                 tcp::Config::default(),
@@ -100,9 +111,6 @@ impl LatticeNode {
                     key.public().to_peer_id(),
                 )?;
 
-                // Gossipsub for heartbeat propagation across the mesh.
-                // Signed messages: each publish is authenticated by the
-                // sender's keypair, so peers can trust message origin.
                 let gossipsub_config = gossipsub::ConfigBuilder::default()
                     .heartbeat_interval(Duration::from_secs(1))
                     .validation_mode(gossipsub::ValidationMode::Strict)
@@ -115,20 +123,28 @@ impl LatticeNode {
                 )
                 .map_err(|e| anyhow::anyhow!("gossipsub init: {e}"))?;
 
-                // Subscribe to the shared heartbeat topic on startup.
                 let topic = gossipsub::IdentTopic::new(LATTICE_HEARTBEAT_TOPIC);
                 gossipsub
                     .subscribe(&topic)
                     .map_err(|e| anyhow::anyhow!("gossipsub subscribe: {e}"))?;
 
-                // Request-response for direct peer queries (/lattice/rpc/v1).
+                // Subscribe to transaction topic as well.
+                let tx_topic = gossipsub::IdentTopic::new(LATTICE_TX_TOPIC);
+                gossipsub
+                    .subscribe(&tx_topic)
+                    .map_err(|e| anyhow::anyhow!("gossipsub tx subscribe: {e}"))?;
+
                 let rpc = request_response::Behaviour::new(
                     [(LatticeProtocol, request_response::ProtocolSupport::Full)],
                     request_response::Config::default(),
                 );
 
-                // Kademlia DHT for peer discovery beyond the LAN.
-                // MemoryStore for now — persistent storage is a future optimization.
+                // Balance query RPC channel.
+                let balance_rpc = request_response::Behaviour::new(
+                    [(BalanceProtocol, request_response::ProtocolSupport::Full)],
+                    request_response::Config::default(),
+                );
+
                 let mut kademlia = {
                     let store = kad::store::MemoryStore::new(key.public().to_peer_id());
                     let kconfig =
@@ -139,10 +155,15 @@ impl LatticeNode {
                         kconfig,
                     )
                 };
-                // Lattice nodes are infrastructure, not ephemeral clients.
                 kademlia.set_mode(Some(kad::Mode::Server));
 
-                Ok(LatticeBehaviour::new(mdns, gossipsub, rpc, kademlia))
+                Ok(LatticeBehaviour::new(
+                    mdns,
+                    gossipsub,
+                    rpc,
+                    balance_rpc,
+                    kademlia,
+                ))
             })?
             .with_swarm_config(|c| {
                 c.with_idle_connection_timeout(Duration::from_secs(60))
@@ -153,6 +174,7 @@ impl LatticeNode {
             swarm,
             peer_table: PeerTable::new(),
             local_peer_id,
+            local_key,
             node_name,
             heartbeat_interval: Duration::from_secs(heartbeat_secs),
             start_time: Instant::now(),
@@ -163,6 +185,11 @@ impl LatticeNode {
             mdns_peers: HashSet::new(),
             kad_bootstrapped: false,
             bootstrap_peers,
+            ledger: LedgerState::new(),
+            seen_nonces: HashMap::new(),
+            tx_nonce: 0,
+            mint_on_start,
+            transfer_on_start,
         })
     }
 
@@ -171,23 +198,28 @@ impl LatticeNode {
         &self.local_peer_id
     }
 
-    /// Main event loop — listens, discovers, heartbeats.
+    /// Main event loop.
     pub async fn run(&mut self) -> Result<()> {
-        // Listen on all interfaces
         let listen_addr = format!("/ip4/0.0.0.0/tcp/{}", 0)
             .parse()
             .expect("valid multiaddr");
         self.swarm.listen_on(listen_addr)?;
 
-        // Dial explicit bootstrap peers and seed Kademlia with them.
-        // This is how nodes outside the LAN join the mesh: they're given
-        // the address of at least one existing node and discover the rest
-        // through the DHT.
         for addr in &self.bootstrap_peers {
             info!(addr = %addr, "Dialling bootstrap peer");
             if let Err(e) = self.swarm.dial(addr.clone()) {
                 warn!(addr = %addr, error = %e, "Failed to dial bootstrap peer");
             }
+        }
+
+        // Phase 4: mint starting balance if requested.
+        if let Some(amount) = self.mint_on_start {
+            self.mint_local(amount)?;
+        }
+
+        // Phase 4: one-shot transfer on startup.
+        if let Some((ref to, amount)) = self.transfer_on_start.clone() {
+            self.send_transfer(&to, amount)?;
         }
 
         let mut heartbeat_timer = time::interval(self.heartbeat_interval);
@@ -201,17 +233,150 @@ impl LatticeNode {
 
         loop {
             tokio::select! {
-                // Handle swarm events (peer discovery, messages, etc.)
                 event = self.swarm.select_next_some() => {
                     self.handle_swarm_event(event).await;
                 }
-
-                // Periodic heartbeat broadcast
                 _ = heartbeat_timer.tick() => {
                     self.broadcast_heartbeat().await;
                 }
             }
         }
+    }
+
+    /// Mint units to the local node (test bootstrapping only).
+    fn mint_local(&mut self, amount: u64) -> Result<()> {
+        self.tx_nonce += 1;
+        let tx = Transaction::Mint {
+            to: self.local_peer_id.to_string(),
+            amount: DigitalUtilityUnit(amount),
+            authority: self.local_peer_id.to_string(),
+            nonce: self.tx_nonce,
+            timestamp: chrono::Utc::now(),
+        };
+        let signed = self.sign_transaction(&tx)?;
+
+        info!(
+            amount = amount,
+            "Minting starting balance to local node"
+        );
+
+        // Apply locally first.
+        let mut seen = HashMap::new();
+        if let Err(e) = validation::validate_and_apply(&signed, &mut self.ledger, &mut seen) {
+            warn!(error = %e, "Failed to apply local mint");
+            return Err(e.into());
+        }
+        // Merge seen nonces.
+        for (peer, nonce) in seen {
+            self.seen_nonces.insert(peer, nonce);
+        }
+
+        // Broadcast so other nodes learn about it.
+        self.broadcast_transaction(&signed)?;
+
+        Ok(())
+    }
+
+    /// Create, sign, apply, and broadcast a transfer.
+    fn send_transfer(&mut self, to: &str, amount: u64) -> Result<()> {
+        self.tx_nonce += 1;
+        let tx = Transaction::Transfer {
+            from: self.local_peer_id.to_string(),
+            to: to.to_string(),
+            amount: DigitalUtilityUnit(amount),
+            nonce: self.tx_nonce,
+            timestamp: chrono::Utc::now(),
+        };
+        let signed = self.sign_transaction(&tx)?;
+
+        info!(
+            to = %to,
+            amount = amount,
+            nonce = self.tx_nonce,
+            "Sending transfer"
+        );
+
+        // Validate and apply locally.
+        let mut seen = HashMap::new();
+        if let Err(e) = validation::validate_and_apply(&signed, &mut self.ledger, &mut seen) {
+            warn!(error = %e, "Failed to apply local transfer");
+            return Err(e.into());
+        }
+        for (peer, nonce) in seen {
+            self.seen_nonces.insert(peer, nonce);
+        }
+
+        // Broadcast.
+        self.broadcast_transaction(&signed)?;
+
+        Ok(())
+    }
+
+    /// Sign a transaction with the node's keypair.
+    fn sign_transaction(&self, tx: &Transaction) -> Result<SignedTransaction> {
+        let tx_bytes = serde_cbor::to_vec(tx)
+            .map_err(|e| anyhow::anyhow!("failed to encode transaction: {e}"))?;
+        let signature = self
+            .local_key
+            .sign(&tx_bytes)
+            .map_err(|e| anyhow::anyhow!("failed to sign transaction: {e}"))?;
+        let signer_public_key = self
+            .local_key
+            .public()
+            .encode_protobuf();
+
+        Ok(SignedTransaction {
+            transaction: tx.clone(),
+            signer_public_key,
+            signature,
+        })
+    }
+
+    /// Broadcast a signed transaction on the transaction gossipsub topic.
+    fn broadcast_transaction(&mut self, signed: &SignedTransaction) -> Result<()> {
+        let msg = LatticeMessage::Transaction(signed.clone());
+        let encoded = crate::message::codec::encode(&msg)
+            .map_err(|e| anyhow::anyhow!("failed to encode transaction message: {e}"))?;
+
+        let topic = gossipsub::IdentTopic::new(LATTICE_TX_TOPIC);
+        match self
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(topic, encoded)
+        {
+            Ok(_) => {
+                debug!(nonce = signed.transaction.nonce(), "Transaction broadcast");
+            }
+            Err(gossipsub::PublishError::InsufficientPeers) => {
+                debug!("Transaction broadcast skipped: no peers yet");
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("failed to broadcast transaction: {e}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Send a balance query to a specific peer.
+    fn send_balance_query(&mut self, query_peer: PeerId, target: PeerId) {
+        self.query_nonce += 1;
+        let req = BalanceRequest {
+            peer_id: target.to_string(),
+            nonce: self.query_nonce,
+        };
+        let req_id = self
+            .swarm
+            .behaviour_mut()
+            .balance_rpc
+            .send_request(&query_peer, req);
+        debug!(
+            peer = %query_peer,
+            target = %target,
+            nonce = self.query_nonce,
+            ?req_id,
+            "Sent balance query"
+        );
     }
 
     /// Dispatch on swarm events.
@@ -224,27 +389,18 @@ impl LatticeNode {
             SwarmEvent::Behaviour(LatticeBehaviourEvent::Mdns(
                 mdns::Event::Discovered(peers),
             )) => {
-                // When mDNS is disabled, silently ignore discovery events.
-                // The behaviour still fires them — we just don't act on them.
                 if self.no_mdns {
                     return;
                 }
-
                 let mut new_peers = false;
                 for (peer_id, addr) in peers {
-                    info!(
-                        peer = %peer_id,
-                        addr = %addr,
-                        "Peer discovered"
-                    );
+                    info!(peer = %peer_id, addr = %addr, "Peer discovered");
                     self.peer_table.add_peer(peer_id, addr.clone());
                     self.mdns_peers.insert(peer_id);
-                    // Register with gossipsub so heartbeats propagate to it.
                     self.swarm
                         .behaviour_mut()
                         .gossipsub
                         .add_explicit_peer(&peer_id);
-                    // Seed the peer into the Kademlia routing table.
                     self.swarm
                         .behaviour_mut()
                         .kademlia
@@ -252,9 +408,6 @@ impl LatticeNode {
                     self.swarm.dial(addr.clone()).ok();
                     new_peers = true;
                 }
-
-                // Bootstrap Kademlia once we have at least one peer in the routing table.
-                // This populates the DHT from the neighbours' routing tables.
                 if new_peers && !self.kad_bootstrapped {
                     if let Err(e) = self.swarm.behaviour_mut().kademlia.bootstrap() {
                         warn!(error = %e, "Kademlia bootstrap failed");
@@ -271,19 +424,14 @@ impl LatticeNode {
                 if self.no_mdns {
                     return;
                 }
-
                 for (peer_id, _addr) in peers {
-                    info!(
-                        peer = %peer_id,
-                        "Peer expired"
-                    );
+                    info!(peer = %peer_id, "Peer expired");
                     self.swarm
                         .behaviour_mut()
                         .gossipsub
                         .remove_explicit_peer(&peer_id);
                     self.peer_table.remove_peer(&peer_id);
                     self.mdns_peers.remove(&peer_id);
-                    // Allow a re-query if this peer is rediscovered later.
                     self.queried_peers.remove(&peer_id);
                 }
             }
@@ -306,8 +454,19 @@ impl LatticeNode {
                 warn!(peer = %peer, error = ?error, "Status request failed");
             }
 
-            // ── Phase 3: Kademlia events ──────────────────────────────
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::BalanceRpc(
+                request_response::Event::Message { peer, message },
+            )) => {
+                self.handle_balance_rpc(peer, message);
+            }
 
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::BalanceRpc(
+                request_response::Event::OutboundFailure { peer, error, .. },
+            )) => {
+                warn!(peer = %peer, error = ?error, "Balance query failed");
+            }
+
+            // ── Kademlia events ──────────────────────────────
             SwarmEvent::Behaviour(LatticeBehaviourEvent::Kad(
                 kad::Event::OutboundQueryProgressed { result, .. },
             )) => {
@@ -315,48 +474,28 @@ impl LatticeNode {
                     kad::QueryResult::Bootstrap(result) => {
                         match result {
                             Ok(kad::BootstrapOk { peer, num_remaining }) => {
-                                debug!(
-                                    peer = %peer,
-                                    remaining = num_remaining,
-                                    "Kademlia bootstrap progressing"
-                                );
+                                debug!(peer = %peer, remaining = num_remaining, "Kademlia bootstrap progressing");
                                 if num_remaining == 0 {
-                                    info!(
-                                        peer = %peer,
-                                        "Kademlia bootstrap complete — DHT routing table populated"
-                                    );
+                                    info!(peer = %peer, "Kademlia bootstrap complete");
                                 }
                             }
-                            Err(e) => {
-                                warn!(error = ?e, "Kademlia bootstrap query failed");
-                            }
+                            Err(e) => warn!(error = ?e, "Kademlia bootstrap query failed"),
                         }
                     }
                     kad::QueryResult::GetClosestPeers(result) => {
                         match result {
                             Ok(kad::GetClosestPeersOk { key: _, peers }) => {
-                                // Peers discovered through Kademlia that we've
-                                // never directly seen — insert them into the peer table.
                                 for info in peers {
                                     if self.peer_table.get(&info.peer_id).is_none() {
-                                        info!(
-                                            peer = %info.peer_id,
-                                            "Discovered peer via Kademlia DHT (multi-hop)"
-                                        );
-                                        // Insert with minimal info — addresses may come
-                                        // later via Identify or direct connection.
+                                        info!(peer = %info.peer_id, "Discovered peer via Kademlia DHT");
                                         self.peer_table.insert_peer(info.peer_id);
                                     }
                                 }
                             }
-                            Err(e) => {
-                                warn!(error = ?e, "Kademlia GetClosestPeers query failed");
-                            }
+                            Err(e) => warn!(error = ?e, "Kademlia GetClosestPeers failed"),
                         }
                     }
-                    _ => {
-                        debug!(?result, "Kademlia query result");
-                    }
+                    _ => debug!(?result, "Kademlia query result"),
                 }
             }
 
@@ -364,37 +503,17 @@ impl LatticeNode {
                 kad::Event::RoutingUpdated { peer, is_new_peer, addresses, .. },
             )) => {
                 if is_new_peer {
-                    info!(
-                        peer = %peer,
-                        addresses = ?addresses,
-                        "Kademlia routing table: peer added"
-                    );
+                    info!(peer = %peer, addresses = ?addresses, "Kademlia routing table: peer added");
                 } else {
-                    debug!(
-                        peer = %peer,
-                        "Kademlia routing table: peer evicted"
-                    );
+                    debug!(peer = %peer, "Kademlia routing table: peer evicted");
                 }
             }
 
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 info!(peer = %peer_id, "Connection established");
-
-                // Phase 3 visibility: log a warning when a connection comes
-                // from a peer not previously seen via mDNS. This is the signal
-                // that the mesh is growing beyond local discovery.
                 if !self.mdns_peers.contains(&peer_id) {
-                    warn!(
-                        peer = %peer_id,
-                        "Connection from non-mDNS peer — mesh growing beyond LAN discovery"
-                    );
+                    warn!(peer = %peer_id, "Connection from non-mDNS peer");
                 }
-
-                // Handshake: once per peer, on the first confirmed connection,
-                // directly ask "who are you, what are you running" via
-                // request-response. Triggering here (not on mDNS discovery)
-                // means the RPC reuses the live connection instead of dialing
-                // — and the dedupe set avoids one query per network interface.
                 if self.queried_peers.insert(peer_id) {
                     self.send_status_request(peer_id);
                 }
@@ -410,7 +529,7 @@ impl LatticeNode {
         }
     }
 
-    /// Send a heartbeat to all connected peers via gossipsub.
+    /// Broadcast a heartbeat.
     async fn broadcast_heartbeat(&mut self) {
         let heartbeat = LatticeMessage::Heartbeat(Heartbeat {
             node_name: self.node_name.clone(),
@@ -437,15 +556,9 @@ impl LatticeNode {
         {
             Ok(_) => {
                 self.heartbeats_sent += 1;
-                debug!(
-                    name = %self.node_name,
-                    peers = self.peer_table.len(),
-                    bytes = bytes.len(),
-                    "Heartbeat published"
-                );
+                debug!(name = %self.node_name, peers = self.peer_table.len(), "Heartbeat published");
             }
             Err(gossipsub::PublishError::InsufficientPeers) => {
-                // No subscribed peers yet — normal at startup or when alone.
                 debug!("Heartbeat skipped: no gossipsub peers yet");
             }
             Err(e) => {
@@ -454,7 +567,7 @@ impl LatticeNode {
         }
     }
 
-    /// Decode an inbound gossip message and update peer state.
+    /// Handle an inbound gossip message.
     fn handle_gossip_message(&mut self, data: &[u8]) {
         let msg: LatticeMessage = match crate::message::codec::decode(data) {
             Ok(m) => m,
@@ -466,19 +579,10 @@ impl LatticeNode {
 
         match msg {
             LatticeMessage::Heartbeat(hb) => {
-                // Parse the originating peer ID from the message body.
                 match hb.peer_id.parse::<PeerId>() {
                     Ok(peer_id) => {
-                        // Phase 3: insert unknown senders into the peer table on
-                        // first gossip contact. Kademlia brings in peers not
-                        // discovered via mDNS — the old get_mut-only approach
-                        // would silently drop their heartbeats.
                         if self.peer_table.get(&peer_id).is_none() {
-                            info!(
-                                peer = %peer_id,
-                                from = %hb.node_name,
-                                "Inserting peer from gossip (first contact, not seen via mDNS)"
-                            );
+                            info!(peer = %peer_id, from = %hb.node_name, "Inserting peer from gossip");
                             self.peer_table.insert_peer(peer_id);
                         }
                         self.peer_table.record_heartbeat(&peer_id);
@@ -487,12 +591,7 @@ impl LatticeNode {
                             .get(&peer_id)
                             .map(|i| i.heartbeats_received)
                             .unwrap_or(0);
-                        info!(
-                            from = %hb.node_name,
-                            peer = %peer_id,
-                            total_heartbeats = count,
-                            "Heartbeat received"
-                        );
+                        info!(from = %hb.node_name, peer = %peer_id, total_heartbeats = count, "Heartbeat received");
                     }
                     Err(e) => {
                         warn!(error = %e, peer = %hb.peer_id, "Bad peer_id in heartbeat");
@@ -502,33 +601,132 @@ impl LatticeNode {
             LatticeMessage::Status(status) => {
                 debug!(from = %status.node_name, "Status report received");
             }
+            // ── Phase 4: transaction handling ─────────────
+            LatticeMessage::Transaction(signed) => {
+                info!(
+                    nonce = signed.transaction.nonce(),
+                    signer = %signed.transaction.signer(),
+                    "Transaction received via gossipsub"
+                );
+                match validation::validate_and_apply(
+                    &signed,
+                    &mut self.ledger,
+                    &mut self.seen_nonces,
+                ) {
+                    Ok(()) => {
+                        let signer: PeerId = signed.transaction.signer().parse().unwrap();
+                        let balance = self.ledger.balance_of(&signer);
+                        info!(
+                            signer = %signer,
+                            balance = %balance,
+                            "Transaction applied to local ledger"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Invalid transaction rejected");
+                    }
+                }
+            }
         }
     }
 
-    /// Send a direct status query to a specific peer over request-response.
-    ///
-    /// Each query carries a fresh nonce so the matching response can be
-    /// correlated — the habit the transaction layer will rely on.
+    /// Handle an inbound status request-response message.
+    fn handle_rpc_message(
+        &mut self,
+        peer: PeerId,
+        message: request_response::Message<StatusRequest, StatusResponse>,
+    ) {
+        match message {
+            request_response::Message::Request {
+                request, channel, ..
+            } => {
+                info!(from = %peer, nonce = request.nonce, "Status request received");
+                let response = self.build_status_response(request.nonce);
+                if self
+                    .swarm
+                    .behaviour_mut()
+                    .rpc
+                    .send_response(channel, response)
+                    .is_err()
+                {
+                    warn!(peer = %peer, "Failed to send status response");
+                }
+            }
+            request_response::Message::Response { response, .. } => {
+                if self.peer_table.get(&peer).is_none() {
+                    info!(peer = %peer, from = %response.node_name, "Inserting peer from RPC");
+                    self.peer_table.insert_peer(peer);
+                }
+                info!(
+                    from = %response.node_name,
+                    peer = %peer,
+                    nonce = response.nonce,
+                    "Status response received"
+                );
+            }
+        }
+    }
+
+    /// Handle an inbound balance request-response message.
+    fn handle_balance_rpc(
+        &mut self,
+        peer: PeerId,
+        message: request_response::Message<BalanceRequest, BalanceResponse>,
+    ) {
+        match message {
+            request_response::Message::Request {
+                request, channel, ..
+            } => {
+                let target: PeerId = match request.peer_id.parse() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        warn!(error = %e, "Invalid peer_id in balance request");
+                        return;
+                    }
+                };
+                let balance = self.ledger.balance_of(&target);
+                info!(
+                    from = %peer,
+                    target = %target,
+                    balance = %balance,
+                    "Balance request received — responding"
+                );
+                let response = BalanceResponse {
+                    peer_id: target.to_string(),
+                    balance: balance.0,
+                    nonce: request.nonce,
+                };
+                if self
+                    .swarm
+                    .behaviour_mut()
+                    .balance_rpc
+                    .send_response(channel, response)
+                    .is_err()
+                {
+                    warn!(peer = %peer, "Failed to send balance response");
+                }
+            }
+            request_response::Message::Response { response, .. } => {
+                info!(
+                    peer = %response.peer_id,
+                    balance = response.balance,
+                    nonce = response.nonce,
+                    "Balance response received"
+                );
+            }
+        }
+    }
+
     fn send_status_request(&mut self, peer: PeerId) {
         self.query_nonce += 1;
         let req = StatusRequest {
             from: self.local_peer_id.to_string(),
             nonce: self.query_nonce,
         };
-        let req_id = self
-            .swarm
-            .behaviour_mut()
-            .rpc
-            .send_request(&peer, req);
-        debug!(
-            peer = %peer,
-            nonce = self.query_nonce,
-            ?req_id,
-            "Sent status request"
-        );
+        let req_id = self.swarm.behaviour_mut().rpc.send_request(&peer, req);
+        debug!(peer = %peer, nonce = self.query_nonce, ?req_id, "Sent status request");
     }
 
-    /// Build a StatusResponse from this node's current local state.
     fn build_status_response(&self, nonce: u64) -> StatusResponse {
         StatusResponse {
             nonce,
@@ -542,66 +740,10 @@ impl LatticeNode {
             protocol_version: PROTOCOL_VERSION,
         }
     }
-
-    /// Handle an inbound request-response message — either a peer asking us
-    /// for our status (respond), or a peer's reply to our query (log/record).
-    fn handle_rpc_message(
-        &mut self,
-        peer: PeerId,
-        message: request_response::Message<StatusRequest, StatusResponse>,
-    ) {
-        match message {
-            request_response::Message::Request {
-                request, channel, ..
-            } => {
-                info!(
-                    from = %peer,
-                    nonce = request.nonce,
-                    "Status request received — responding"
-                );
-                let response = self.build_status_response(request.nonce);
-                // send_response consumes the channel; failure means the
-                // requester already dropped the connection.
-                if self
-                    .swarm
-                    .behaviour_mut()
-                    .rpc
-                    .send_response(channel, response)
-                    .is_err()
-                {
-                    warn!(peer = %peer, "Failed to send status response (channel closed)");
-                }
-            }
-            request_response::Message::Response { response, .. } => {
-                // Phase 3: a response from a peer not in the table is the
-                // first multi-hop signal — insert it.
-                if self.peer_table.get(&peer).is_none() {
-                    info!(
-                        peer = %peer,
-                        from = %response.node_name,
-                        "Inserting peer from RPC response (multi-hop contact)"
-                    );
-                    self.peer_table.insert_peer(peer);
-                }
-                info!(
-                    from = %response.node_name,
-                    peer = %peer,
-                    nonce = response.nonce,
-                    uptime_secs = response.uptime_secs,
-                    heartbeats_sent = response.heartbeats_sent,
-                    peer_count = response.peer_count,
-                    protocol_version = response.protocol_version,
-                    "Status response received"
-                );
-            }
-        }
-    }
 }
 
-/// Resolve the path to the identity key file.
-///
-/// Uses `<identity_dir>/identity.key` when a directory is given, otherwise
-/// defaults to `~/.lattice/identity.key`.
+// ── Identity helpers ──────────────────────────────────────────
+
 fn resolve_identity_path(identity_dir: Option<PathBuf>) -> Result<PathBuf> {
     let dir = match identity_dir {
         Some(d) => d,
@@ -615,11 +757,6 @@ fn resolve_identity_path(identity_dir: Option<PathBuf>) -> Result<PathBuf> {
     Ok(dir.join("identity.key"))
 }
 
-/// Load an Ed25519 identity from `path`, or generate a new one and persist it.
-///
-/// When `fresh` is true, any existing key is ignored and a new identity is
-/// generated and written (overwriting the old file). The key is stored in
-/// libp2p's protobuf encoding with `0600` permissions (owner read/write only).
 fn load_or_generate_identity(path: &Path, fresh: bool) -> Result<identity::Keypair> {
     if path.exists() && !fresh {
         let bytes = std::fs::read(path)
@@ -630,7 +767,6 @@ fn load_or_generate_identity(path: &Path, fresh: bool) -> Result<identity::Keypa
         return Ok(key);
     }
 
-    // Generate a fresh identity and persist it.
     let key = identity::Keypair::generate_ed25519();
     let bytes = key
         .to_protobuf_encoding()
@@ -644,17 +780,13 @@ fn load_or_generate_identity(path: &Path, fresh: bool) -> Result<identity::Keypa
         .with_context(|| format!("writing identity key to {}", path.display()))?;
 
     if fresh && path.exists() {
-        info!(path = %path.display(), "Generated fresh identity (--fresh-identity)");
+        info!(path = %path.display(), "Generated fresh identity");
     } else {
         info!(path = %path.display(), "Generated and saved new identity");
     }
     Ok(key)
 }
 
-/// Write the key file with `0600` permissions on Unix.
-///
-/// Permissions are applied before the bytes are written so the secret is never
-/// momentarily readable by other users.
 fn write_key_file(path: &Path, bytes: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {
@@ -668,7 +800,6 @@ fn write_key_file(path: &Path, bytes: &[u8]) -> Result<()> {
             .mode(0o600)
             .open(path)?;
         file.write_all(bytes)?;
-        // Re-assert mode in case the file pre-existed with looser perms.
         std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     }
 

@@ -5,6 +5,7 @@ use clap::Parser;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod ledger;
 mod message;
 mod network;
 mod node;
@@ -49,6 +50,18 @@ struct Cli {
     /// Repeat for multiple bootstrap peers.
     #[arg(long)]
     bootstrap_peer: Vec<String>,
+
+    /// Amount of digital utility units to mint to this node on startup.
+    /// Test bootstrapping only — in production, issuance comes from the
+    /// Georgist resource accounting model (Phase 5).
+    #[arg(long)]
+    mint: Option<u64>,
+
+    /// One-shot transfer on startup: <peer_id> <amount>.
+    /// Format: --transfer 12D3KooW... 100
+    /// Test-only — in production, transfers come from the application layer.
+    #[arg(long, num_args = 2, value_names = ["PEER_ID", "AMOUNT"])]
+    transfer: Option<Vec<String>>,
 }
 
 #[tokio::main]
@@ -78,6 +91,22 @@ async fn main() -> Result<()> {
         })
         .collect();
 
+    // Parse transfer: [peer_id, amount]
+    let transfer = cli.transfer.and_then(|v| {
+        if v.len() == 2 {
+            let amount: u64 = match v[1].parse() {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!(error = %e, "Invalid transfer amount");
+                    return None;
+                }
+            };
+            Some((v[0].clone(), amount))
+        } else {
+            None
+        }
+    });
+
     // Bootstrap the node
     let mut node = LatticeNode::new(
         cli.port,
@@ -87,6 +116,8 @@ async fn main() -> Result<()> {
         cli.fresh_identity,
         cli.no_mdns,
         bootstrap_peers,
+        cli.mint,
+        transfer,
     )?;
 
     info!(

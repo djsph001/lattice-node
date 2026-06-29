@@ -31,7 +31,7 @@ pub mod rpc {
     use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use libp2p::request_response;
 
-    use crate::message::types::{StatusRequest, StatusResponse};
+    use crate::message::types::{BalanceRequest, BalanceResponse, StatusRequest, StatusResponse};
 
     /// Maximum frame size (1 MiB) — guards against a malicious or buggy peer
     /// announcing a huge length prefix and exhausting memory.
@@ -47,9 +47,23 @@ pub mod rpc {
         }
     }
 
+    /// Protocol identifier for the Lattice balance query RPC channel.
+    #[derive(Debug, Clone)]
+    pub struct BalanceProtocol;
+
+    impl AsRef<str> for BalanceProtocol {
+        fn as_ref(&self) -> &str {
+            "/lattice/balance/v1"
+        }
+    }
+
     /// CBOR + length-prefix codec for StatusRequest/StatusResponse.
     #[derive(Debug, Clone, Default)]
     pub struct LatticeCodec;
+
+    /// CBOR + length-prefix codec for BalanceRequest/BalanceResponse.
+    #[derive(Debug, Clone, Default)]
+    pub struct BalanceCodec;
 
     /// Read a length-prefixed CBOR frame from the stream.
     async fn read_frame<T>(io: &mut T) -> io::Result<Vec<u8>>
@@ -90,6 +104,63 @@ pub mod rpc {
         type Protocol = LatticeProtocol;
         type Request = StatusRequest;
         type Response = StatusResponse;
+
+        async fn read_request<T>(
+            &mut self,
+            _: &Self::Protocol,
+            io: &mut T,
+        ) -> io::Result<Self::Request>
+        where
+            T: AsyncRead + Unpin + Send,
+        {
+            let data = read_frame(io).await?;
+            super::decode(&data).map_err(to_io)
+        }
+
+        async fn read_response<T>(
+            &mut self,
+            _: &Self::Protocol,
+            io: &mut T,
+        ) -> io::Result<Self::Response>
+        where
+            T: AsyncRead + Unpin + Send,
+        {
+            let data = read_frame(io).await?;
+            super::decode(&data).map_err(to_io)
+        }
+
+        async fn write_request<T>(
+            &mut self,
+            _: &Self::Protocol,
+            io: &mut T,
+            req: Self::Request,
+        ) -> io::Result<()>
+        where
+            T: AsyncWrite + Unpin + Send,
+        {
+            let data = super::encode(&req).map_err(to_io)?;
+            write_frame(io, &data).await
+        }
+
+        async fn write_response<T>(
+            &mut self,
+            _: &Self::Protocol,
+            io: &mut T,
+            res: Self::Response,
+        ) -> io::Result<()>
+        where
+            T: AsyncWrite + Unpin + Send,
+        {
+            let data = super::encode(&res).map_err(to_io)?;
+            write_frame(io, &data).await
+        }
+    }
+
+    #[async_trait]
+    impl request_response::Codec for BalanceCodec {
+        type Protocol = BalanceProtocol;
+        type Request = BalanceRequest;
+        type Response = BalanceResponse;
 
         async fn read_request<T>(
             &mut self,

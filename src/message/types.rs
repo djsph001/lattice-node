@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::ledger::types::SignedTransaction;
+
 /// Top-level message envelope for all Lattice protocol messages.
 ///
 /// Every message between nodes is wrapped in this enum.
@@ -13,10 +15,10 @@ pub enum LatticeMessage {
     /// Node status report (richer than heartbeat)
     Status(StatusReport),
 
+    /// A signed economic transaction
+    Transaction(SignedTransaction),
+
     // === Future phases ===
-    // /// Digital utility unit transaction
-    // Transaction(Transaction),
-    //
     // /// Governance proposal or vote
     // Governance(GovernanceAction),
 }
@@ -91,4 +93,28 @@ pub struct StatusResponse {
     pub version: String,
     /// Lattice protocol version for compatibility checks.
     pub protocol_version: u32,
+}
+
+/// Direct request for a specific peer's balance.
+///
+/// Phase 4: a node can interrogate another node's view of an account's
+/// balance via request-response. This is the economic-layer equivalent
+/// of the Phase 2c status handshake.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BalanceRequest {
+    /// PeerId whose balance is being queried.
+    pub peer_id: String,
+    /// Correlation nonce.
+    pub nonce: u64,
+}
+
+/// Direct reply to a `BalanceRequest`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BalanceResponse {
+    /// PeerId of the account.
+    pub peer_id: String,
+    /// Balance as seen by the responding node's local ledger.
+    pub balance: u64,
+    /// Echoed correlation nonce.
+    pub nonce: u64,
 }

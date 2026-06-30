@@ -287,8 +287,37 @@ impl LatticeNode {
 
         for addr in &self.bootstrap_peers {
             info!(addr = %addr, "Dialling bootstrap peer");
+
+            // Extract the PeerId from the trailing /p2p/ segment and inject
+            // the transport address into Kademlia's routing table so the DHT
+            // can resolve the peer. Without this, Kademlia has no way to
+            // locate peers contacted through explicit bootstrap addresses.
+            if let Some(libp2p::multiaddr::Protocol::P2p(peer_id)) = addr.iter().last() {
+                let mut transport_addr = addr.clone();
+                transport_addr.pop(); // strip /p2p/<peer-id>, leaving /ip4/x.x.x.x/tcp/<port>
+                self.swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&peer_id, transport_addr);
+                debug!(peer = %peer_id, "Added bootstrap peer to Kademlia routing table");
+            } else {
+                warn!(addr = %addr, "Bootstrap peer address missing /p2p/<PeerId> segment");
+            }
+
             if let Err(e) = self.swarm.dial(addr.clone()) {
                 warn!(addr = %addr, error = %e, "Failed to dial bootstrap peer");
+            }
+        }
+
+        // When mDNS is disabled, the normal Kademlia bootstrap trigger
+        // (inside the mDNS::Discovered handler) never fires.  Bootstrap
+        // explicitly from the provided addresses instead.
+        if self.no_mdns && !self.bootstrap_peers.is_empty() && !self.kad_bootstrapped {
+            if let Err(e) = self.swarm.behaviour_mut().kademlia.bootstrap() {
+                warn!(error = %e, "Kademlia bootstrap from explicit peers failed");
+            } else {
+                self.kad_bootstrapped = true;
+                info!("Kademlia bootstrap initiated from explicit bootstrap peers");
             }
         }
 

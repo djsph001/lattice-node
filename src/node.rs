@@ -29,6 +29,7 @@ use crate::network::protocol::{
 };
 use crate::state::peers::PeerTable;
 use crate::economics::EconomicEngine;
+use crate::economics::receipts::{RelayReceipt, SignedReceipt, validate_receipt};
 use crate::storage::ProofEngine;
 
 /// Lattice protocol version advertised in status responses.
@@ -139,6 +140,16 @@ pub struct LatticeNode {
     /// How many epochs a challenge can remain pending before
     /// the Safe Gate evaluates it as timed out.
     challenge_timeout_epochs: u64,
+
+    // ── Phase 6: peer-verified contribution receipts ──────────
+    /// Signed receipts from peers confirming this node's relay
+    /// contributions.  Collected during the epoch, consumed by
+    /// the mint cycle, then cleared.
+    receipt_store: Vec<SignedReceipt>,
+    /// Recently observed gossipsub message hashes (bounded LRU,
+    /// last ~1000).  Used to validate incoming receipts —
+    /// a receipt for an unknown message hash is rejected.
+    recent_message_hashes: HashSet<[u8; 32]>,
 
     // ── Deployment ──────────────────────────────────────────
     /// IP address the listener is bound to.
@@ -306,6 +317,8 @@ impl LatticeNode {
             pending_challenges: HashMap::new(),
             receipt_registry: HashMap::new(),
             challenge_timeout_epochs: 3,
+            receipt_store: Vec::new(),
+            recent_message_hashes: HashSet::new(),
             listen_addr,
             external_addr,
         })
@@ -314,6 +327,20 @@ impl LatticeNode {
     /// The node's public peer ID.
     pub fn peer_id(&self) -> &PeerId {
         &self.local_peer_id
+    }
+
+    /// DEBUG ONLY: inflate self-reported relay metrics for testing
+    /// receipt-based verification.  The inflated bytes appear in the
+    /// self-reported `bytes_relayed` field but do NOT produce signed
+    /// receipts — so the verified mint amount stays grounded in
+    /// actual peer attestations.
+    pub fn inflate_self_reported_relay(&mut self, bytes: u64) {
+        self.economic_engine.metrics.bytes_relayed += bytes;
+        warn!(
+            fake_bytes = bytes,
+            total_self_reported = self.economic_engine.metrics.bytes_relayed,
+            "Self-reported relay metrics inflated (debug only)"
+        );
     }
 
     /// Main event loop.
@@ -435,6 +462,27 @@ impl LatticeNode {
         let self_balance = self.ledger.balance_of(&self.local_peer_id);
         let epoch = self.economic_engine.epoch_count() + 1;
 
+        // Phase 6: tally peer-verified receipts before the economic
+        // cycle.  Each receipt proves a specific relay contribution.
+        // Feed verified totals into the metrics so the mint calculation
+        // uses trustless data.
+        let verified_bytes: u64 = self.receipt_store.iter()
+            .map(|r| r.receipt.bytes)
+            .sum();
+        let verified_msgs = self.receipt_store.len() as u64;
+        self.economic_engine.metrics.verified_bytes_relayed = verified_bytes;
+        self.economic_engine.metrics.verified_messages_relayed = verified_msgs;
+
+        if verified_msgs > 0 {
+            info!(
+                epoch,
+                verified_bytes,
+                verified_msgs,
+                "Consuming peer-verified relay receipts for mint cycle"
+            );
+        }
+
+        // Run the economic cycle (mint uses verified metrics when available).
         let epoch_txns = self.economic_engine.run_epoch(
             &self.local_peer_id,
             self_balance,
@@ -442,6 +490,10 @@ impl LatticeNode {
             self.base_mint_rate,
             self.base_tax_rate,
         );
+
+        // Phase 6: clear consumed receipts — they can't be replayed
+        // in subsequent epochs.
+        self.receipt_store.clear();
 
         // Sign and broadcast the mint transaction.
         if let Some(mut mint) = epoch_txns.mint {
@@ -713,9 +765,9 @@ impl LatticeNode {
             }
 
             SwarmEvent::Behaviour(LatticeBehaviourEvent::Gossipsub(
-                gossipsub::Event::Message { message, .. },
+                gossipsub::Event::Message { message, propagation_source, .. },
             )) => {
-                self.handle_gossip_message(&message.data);
+                self.handle_gossip_message(&message.data, propagation_source);
             }
 
             SwarmEvent::Behaviour(LatticeBehaviourEvent::Rpc(
@@ -929,7 +981,19 @@ impl LatticeNode {
     }
 
     /// Handle an inbound gossip message.
-    fn handle_gossip_message(&mut self, data: &[u8]) {
+    fn handle_gossip_message(&mut self, data: &[u8], propagation_source: PeerId) {
+        // Track the message hash for receipt validation.
+        let message_hash = blake3::hash(data);
+        self.recent_message_hashes.insert(*message_hash.as_bytes());
+        // Bound the set to ~1000 entries to prevent memory growth.
+        // Simple eviction: if over capacity, clear and rebuild from
+        // the last 500 (cheap heuristic).
+        if self.recent_message_hashes.len() > 1000 {
+            let drained: Vec<_> = self.recent_message_hashes.drain().collect();
+            self.recent_message_hashes
+                .extend(drained.into_iter().take(500));
+        }
+
         // Every inbound gossip message we process is one we're
         // participating in propagating.  The gossipsub layer handles
         // the actual forwarding; we track the contribution.
@@ -996,6 +1060,50 @@ impl LatticeNode {
                 }
             }
         }
+
+        // Phase 6: issue a relay receipt to the delivering peer.
+        if propagation_source != self.local_peer_id {
+            let msg_hash = *message_hash.as_bytes();
+            let receipt = RelayReceipt::new(
+                propagation_source,
+                self.local_peer_id,
+                data.len() as u64,
+                msg_hash,
+            );
+
+            let receipt_bytes = match serde_cbor::to_vec(&receipt) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(error = %e, "Failed to serialize relay receipt");
+                    return;
+                }
+            };
+
+            let signature = match self.local_key.sign(&receipt_bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "Failed to sign relay receipt");
+                    return;
+                }
+            };
+
+            let signed = SignedReceipt {
+                receipt,
+                signer_public_key: self.local_key.public().encode_protobuf(),
+                signature,
+            };
+
+            let req = StatusRequest::ReceiptAck { receipt: signed };
+            self.swarm
+                .behaviour_mut()
+                .rpc
+                .send_request(&propagation_source, req);
+            debug!(
+                peer = %propagation_source,
+                bytes = data.len(),
+                "Relay receipt issued to delivering peer"
+            );
+        }
     }
 
     /// Handle an inbound status request-response message.
@@ -1007,19 +1115,48 @@ impl LatticeNode {
         match message {
             request_response::Message::Request {
                 request, channel, ..
-            } => {
-                info!(from = %peer, nonce = request.nonce, "Status request received");
-                let response = self.build_status_response(request.nonce);
-                if self
-                    .swarm
-                    .behaviour_mut()
-                    .rpc
-                    .send_response(channel, response)
-                    .is_err()
-                {
-                    warn!(peer = %peer, "Failed to send status response");
+            } => match request {
+                StatusRequest::Status { from: _, nonce } => {
+                    info!(from = %peer, nonce, "Status request received");
+                    let response = self.build_status_response(nonce);
+                    if self
+                        .swarm
+                        .behaviour_mut()
+                        .rpc
+                        .send_response(channel, response)
+                        .is_err()
+                    {
+                        warn!(peer = %peer, "Failed to send status response");
+                    }
                 }
-            }
+                StatusRequest::ReceiptAck { receipt } => {
+                    info!(
+                        from = %peer,
+                        relayer = %receipt.receipt.relayer,
+                        bytes = receipt.receipt.bytes,
+                        "Relay receipt received"
+                    );
+                    // Validate the receipt before storing.
+                    if self.validate_and_store_receipt(receipt) {
+                        info!(
+                            from = %peer,
+                            "Receipt validated and stored for next epoch"
+                        );
+                    }
+                    // Always respond, even for receipts (keeps the
+                    // request-response channel from stalling).
+                    let response = self.build_status_response(0);
+                    if self
+                        .swarm
+                        .behaviour_mut()
+                        .rpc
+                        .send_response(channel, response)
+                        .is_err()
+                    {
+                        warn!(peer = %peer, "Failed to send receipt ack response");
+                    }
+                }
+            },
             request_response::Message::Response { response, .. } => {
                 if self.peer_table.get(&peer).is_none() {
                     info!(peer = %peer, from = %response.node_name, "Inserting peer from RPC");
@@ -1031,6 +1168,22 @@ impl LatticeNode {
                     nonce = response.nonce,
                     "Status response received"
                 );
+            }
+        }
+    }
+
+    /// Validate a SignedReceipt and store it for the next epoch.
+    ///
+    /// Returns true if the receipt was valid and stored.
+    fn validate_and_store_receipt(&mut self, signed: SignedReceipt) -> bool {
+        match validate_receipt(&signed, &self.recent_message_hashes) {
+            Ok(()) => {
+                self.receipt_store.push(signed);
+                true
+            }
+            Err(e) => {
+                warn!(error = %e, "Relay receipt validation failed — discarded");
+                false
             }
         }
     }
@@ -1088,7 +1241,7 @@ impl LatticeNode {
     fn send_status_request(&mut self, peer: PeerId) {
         self.query_nonce += 1;
         self.economic_engine.metrics.record_query_issued();
-        let req = StatusRequest {
+        let req = StatusRequest::Status {
             from: self.local_peer_id.to_string(),
             nonce: self.query_nonce,
         };

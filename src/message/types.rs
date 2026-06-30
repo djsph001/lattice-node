@@ -63,11 +63,22 @@ impl StatusReport {
 /// The `nonce` correlates a response with its request — the same habit
 /// the transaction layer will need to match "I asked X" with "you answered Y".
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StatusRequest {
-    /// PeerId of the requesting node (string form).
-    pub from: String,
-    /// Correlation nonce, echoed back in the matching StatusResponse.
-    pub nonce: u64,
+pub enum StatusRequest {
+    /// Standard status query.
+    Status {
+        /// PeerId of the requesting node (string form).
+        from: String,
+        /// Correlation nonce, echoed back in the matching StatusResponse.
+        nonce: u64,
+    },
+    /// Phase 6: relay receipt acknowledgment.
+    /// Sent by the receiver of a gossipsub message to the delivering
+    /// peer, confirming "I witnessed you relay this message."
+    ReceiptAck {
+        /// The signed receipt — proof that the delivering peer
+        /// relayed a specific message.
+        receipt: crate::economics::receipts::SignedReceipt,
+    },
 }
 
 /// Direct reply to a `StatusRequest`, carrying the responder's self-reported

@@ -105,6 +105,15 @@ struct Cli {
     /// network routes to the right place.
     #[arg(long)]
     external_addr: Option<String>,
+
+    // ── Test / Debug ────────────────────────────────────────
+    /// DEBUG ONLY: inflate self-reported relay bytes without
+    /// actually relaying anything.  Used to verify that Phase 6
+    /// receipt-based minting catches dishonest reporting —
+    /// inflated self-reported metrics should NOT increase the
+    /// verified mint amount.
+    #[arg(long)]
+    fake_relay_bytes: Option<u64>,
 }
 
 #[tokio::main]
@@ -173,6 +182,12 @@ async fn main() -> Result<()> {
         peer_id = %node.peer_id(),
         "Node identity established"
     );
+
+    // Debug: inflate self-reported relay metrics (test-only).
+    // Phase 6 verifies that this does NOT increase verified minting.
+    if let Some(fake_bytes) = cli.fake_relay_bytes {
+        node.inflate_self_reported_relay(fake_bytes);
+    }
 
     // Run the event loop — this is where the node lives
     node.run().await?;

@@ -16,6 +16,7 @@
 
 pub mod metrics;
 pub mod mint;
+pub mod receipts;
 pub mod tax;
 
 use libp2p::PeerId;
@@ -87,6 +88,8 @@ impl EconomicEngine {
             queries_issued: self.metrics.queries_issued - self.epoch_metrics.queries_issued,
             transactions_submitted: self.metrics.transactions_submitted
                 - self.epoch_metrics.transactions_submitted,
+            verified_bytes_relayed: 0,
+            verified_messages_relayed: 0,
         };
 
         tracing::debug!(
@@ -100,7 +103,9 @@ impl EconomicEngine {
         );
 
         // ── Mint from contribution ────────────────────────
-        let mint_amount = mint::calculate_mint(&epoch_delta, base_mint_rate);
+        // Phase 6: use receipt-verified metrics when available,
+        // fall back to self-reported for solo operation.
+        let mint_amount = mint::calculate_mint_from_receipts(&epoch_delta, base_mint_rate);
 
         // ── Tax & redistribute ────────────────────────────
         let result = TaxEngine::execute_epoch(

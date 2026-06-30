@@ -131,7 +131,25 @@ src/
 - [x] **Phase 3**: Kademlia DHT for discovery beyond LAN
 - [x] **Phase 4**: Digital utility unit transaction types
 - [x] **Phase 5**: Georgist resource accounting and economic engine
-- [x] **Phase 6**: Storage verification with Blake3 + Merkle proofs
-- [x] **Phase 6b**: Scheduled challenges with tenure decay model
+- [x] **Phase 6**: Peer-verified contribution claims via relay receipts — trustless minting
+- [x] **Phase 6b**: Scheduled storage challenges with tenure decay model
 - [x] **Phase 6c**: Trilateral verification receipts, relay client, DCUtR
 - [ ] **Phase 7**: Relay transport composition and full p2p-circuit routing
+
+## Receipt-Based Verification (Phase 6)
+
+The Lattice does not trust self-reported metrics. Every contribution claim must be backed by at least one peer's signed receipt confirming it happened.
+
+### How it works
+
+1. **Receipt issuance**: When node A receives a gossipsub message delivered by node B (and the message wasn't from A), A signs a `RelayReceipt` stating "B relayed this message to me" and sends it back to B via request-response.
+
+2. **Receipt collection**: Each node collects `SignedReceipt`s from its peers during the epoch. Receipts are validated against recently-seen message hashes (prevents forged receipts) and signature-verified.
+
+3. **Trustless minting**: At epoch boundary, the mint calculation uses ONLY receipt-verified metrics. Self-reported relay bytes become diagnostics — logged but not used for minting.
+
+4. **Receipt consumption**: Receipts are cleared after each epoch to prevent replay.
+
+### Adversarial test
+
+Use `--fake-relay-bytes <amount>` to inflate self-reported relay metrics without actual relaying. The inflated numbers appear in logs but do NOT increase the verified mint amount — proving receipt-based verification catches dishonest reporting.

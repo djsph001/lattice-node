@@ -55,6 +55,15 @@ pub struct NodeMetrics {
     /// Economic transactions this node authored (mints and transfers).
     /// Each one consumes network propagation capacity.
     pub transactions_submitted: u64,
+
+    // ── Phase 6: verified contribution (receipt-backed) ─────
+    /// Bytes relayed as proven by signed peer receipts.
+    /// This is the trustless metric — only incremented when a
+    /// receipt from another peer confirms the relay.
+    pub verified_bytes_relayed: u64,
+
+    /// Messages relayed as proven by signed peer receipts.
+    pub verified_messages_relayed: u64,
 }
 
 impl NodeMetrics {
@@ -69,6 +78,8 @@ impl NodeMetrics {
             bytes_consumed: 0,
             queries_issued: 0,
             transactions_submitted: 0,
+            verified_bytes_relayed: 0,
+            verified_messages_relayed: 0,
         }
     }
 

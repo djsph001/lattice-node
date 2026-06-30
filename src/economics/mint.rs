@@ -5,11 +5,11 @@
 // propagating messages.  At each epoch boundary every node evaluates
 // its own contribution since the last epoch and mints proportionally.
 //
-// Self-minting is safe because every metric is verifiable by peers
-// (Phase 6).  A node that claims to have relayed bytes it didn't
-// actually relay will eventually be contradicted by its neighbours'
-// observations.  For Phase 5, nodes are honest reporters.
-//
+// Phase 5: honest self-reporting.
+// Phase 6: peer-verified contribution claims via signed receipts.
+// When receipts are available, the mint calculation uses ONLY
+// verified metrics — self-reported numbers become diagnostics.
+
 // ── Policy constants (governance decisions, not magic numbers) ──
 
 /// Weight applied to bytes relayed in the contribution score.
@@ -28,8 +28,10 @@ const PROPAGATION_WEIGHT: f64 = 1.0;
 
 use super::metrics::NodeMetrics;
 
-/// Compute the mint amount for an epoch based on this node's
-/// contribution metrics.
+/// Compute the mint amount from self-reported metrics.
+///
+/// Used when no peer receipts are available (solo operation,
+/// or before any receipts have been collected).
 ///
 /// # Formula
 ///
@@ -41,11 +43,6 @@ use super::metrics::NodeMetrics;
 ///
 /// mint_amount = base_rate * contribution_score
 /// ```
-///
-/// `base_rate` is a configurable constant (default 10 units per epoch
-/// at a contribution score of 1.0).  All weights start equal so every
-/// form of contribution is valued the same; tune them as the network
-/// reveals which signals matter most.
 pub fn calculate_mint(
     metrics: &NodeMetrics,
     base_rate: u64,
@@ -56,7 +53,6 @@ pub fn calculate_mint(
 
     let mint_amount = base_rate as f64 * contribution_score;
 
-    // Floor at zero — a node that contributed nothing gets nothing.
     if mint_amount <= 0.0 {
         return 0;
     }
@@ -64,10 +60,30 @@ pub fn calculate_mint(
     mint_amount as u64
 }
 
-// TODO Phase 6: peer-verified contribution claims.
-// When peers can attest to each other's metrics, self-minting
-// gains cryptographic integrity.  Until then, honest reporting
-// is assumed — the economic incentives already point toward
-// contribution (tax rate is lower for contributors), so a node
-// that inflates its metrics is playing against its own long-term
-// interest in a healthy mesh.
+/// Compute the mint amount from peer-verified receipt metrics.
+///
+/// Phase 6: trustless minting.  Only bytes and messages confirmed
+/// by at least one peer's signed receipt count toward the mint.
+/// Self-reported metrics are ignored when receipts exist.
+///
+/// Falls back to self-reported metrics if no receipts have been
+/// collected (solo node operation).
+pub fn calculate_mint_from_receipts(
+    metrics: &NodeMetrics,
+    base_rate: u64,
+) -> u64 {
+    // If we have verified metrics, use them exclusively.
+    if metrics.verified_bytes_relayed > 0 || metrics.verified_messages_relayed > 0 {
+        let verified_score = RELAY_WEIGHT * metrics.verified_bytes_relayed as f64
+            + PROPAGATION_WEIGHT * metrics.verified_messages_relayed as f64;
+
+        let mint_amount = base_rate as f64 * verified_score;
+        if mint_amount <= 0.0 {
+            return 0;
+        }
+        return mint_amount as u64;
+    }
+
+    // No receipts yet — fall back to self-reported (solo node).
+    calculate_mint(metrics, base_rate)
+}

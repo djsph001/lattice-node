@@ -88,6 +88,23 @@ struct Cli {
     /// chunk files).  Defaults to ./lattice-storage.
     #[arg(long)]
     storage_dir: Option<PathBuf>,
+
+    // ── Deployment ──────────────────────────────────────────
+    /// IP address to bind the listener to.  Defaults to 0.0.0.0
+    /// (all interfaces).  On multi-homed machines with Docker
+    /// bridges or multiple NICs, pin this to the actual interface
+    /// IP to control what gets advertised.
+    #[arg(long, default_value = "0.0.0.0")]
+    listen_addr: String,
+
+    /// Optional publicly reachable address for this node, for
+    /// cases where the node is behind NAT and the bind address
+    /// isn't what remote peers should dial.  Format as a full
+    /// multiaddr: /ip4/<public-ip>/tcp/<port>[/p2p/<peer-id>].
+    /// When set, libp2p advertises this through Kademlia so the
+    /// network routes to the right place.
+    #[arg(long)]
+    external_addr: Option<String>,
 }
 
 #[tokio::main]
@@ -148,6 +165,8 @@ async fn main() -> Result<()> {
         cli.base_mint_rate,
         cli.base_tax_rate,
         cli.storage_dir,
+        cli.listen_addr,
+        cli.external_addr,
     )?;
 
     info!(

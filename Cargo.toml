@@ -23,6 +23,7 @@ libp2p = { version = "0.54", features = [
     "macros",
     "relay",
     "dcutr",
+    "dns",
 ] }
 
 # Serialization

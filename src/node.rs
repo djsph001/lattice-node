@@ -139,6 +139,13 @@ pub struct LatticeNode {
     /// How many epochs a challenge can remain pending before
     /// the Safe Gate evaluates it as timed out.
     challenge_timeout_epochs: u64,
+
+    // ── Deployment ──────────────────────────────────────────
+    /// IP address the listener is bound to.
+    listen_addr: String,
+    /// Optional publicly reachable address advertised via
+    /// Kademlia for NAT traversal / port-forwarding setups.
+    external_addr: Option<String>,
 }
 
 impl LatticeNode {
@@ -157,6 +164,8 @@ impl LatticeNode {
         base_mint_rate: u64,
         base_tax_rate: u64,
         storage_dir: Option<PathBuf>,
+        listen_addr: String,
+        external_addr: Option<String>,
     ) -> Result<Self> {
         let key_path = resolve_identity_path(identity_dir)?;
         let local_key = load_or_generate_identity(&key_path, fresh_identity)?;
@@ -297,6 +306,8 @@ impl LatticeNode {
             pending_challenges: HashMap::new(),
             receipt_registry: HashMap::new(),
             challenge_timeout_epochs: 3,
+            listen_addr,
+            external_addr,
         })
     }
 
@@ -307,10 +318,33 @@ impl LatticeNode {
 
     /// Main event loop.
     pub async fn run(&mut self) -> Result<()> {
-        let listen_addr = format!("/ip4/0.0.0.0/tcp/{}", 0)
-            .parse()
-            .expect("valid multiaddr");
+        let listen_addr: Multiaddr =
+            format!("/ip4/{}/tcp/{}", self.listen_addr, 0)
+                .parse()
+                .expect("valid multiaddr");
         self.swarm.listen_on(listen_addr)?;
+
+        // If an external address was provided, register it with the
+        // swarm so libp2p advertises the reachable address through
+        // Kademlia and Identify, rather than the local bind address.
+        if let Some(ref addr_str) = self.external_addr {
+            match addr_str.parse::<Multiaddr>() {
+                Ok(ext_addr) => {
+                    self.swarm.add_external_address(ext_addr.clone());
+                    info!(
+                        external = %ext_addr,
+                        "External address registered for NAT traversal"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        addr = %addr_str,
+                        error = %e,
+                        "Invalid external address — ignoring"
+                    );
+                }
+            }
+        }
 
         for addr in &self.bootstrap_peers {
             info!(addr = %addr, "Dialling bootstrap peer");

@@ -138,6 +138,21 @@ pub enum VerifyRequest {
         /// across epochs without actually holding the data.
         salt: [u8; 32],
     },
+    // ── Phase 6c: trilateral verification receipts ──────────
+    /// Sent by Validator to Relay: forward this challenge to the
+    /// firewalled Target behind the Relay's p2p-circuit.
+    ChallengeForward {
+        challenge_id: [u8; 32],
+        /// The firewalled node the challenge is actually for.
+        target_peer: String,
+        /// The inner challenge, boxed to keep the enum small.
+        challenge: Box<VerifyRequest>,
+    },
+    /// Audit request from Validator to Relay: produce a
+    /// signed IngressReceipt for a previously forwarded challenge.
+    RelayAudit {
+        challenge_id: [u8; 32],
+    },
 }
 
 /// Cryptographic receipt proving possession of a specific chunk.
@@ -158,4 +173,64 @@ pub enum VerifyResponse {
         /// hash on the path from leaf to root.
         merkle_proof: Vec<Vec<u8>>,
     },
+    // ── Phase 6c: trilateral verification receipts ──────────
+    /// Signed by the Relay: "I accepted custody of Challenge X
+    /// at Timestamp_A for delivery to Target T."
+    IngressReceipt(IngressReceipt),
+    /// Signed by the Target: "I received Challenge X via Relay R
+    /// at Timestamp_B, and here is my cryptographic proof."
+    EgressReceipt(EgressReceipt),
+}
+
+// ── Phase 6c: trilateral receipt data types ────────────────
+
+/// Ingress receipt — signed by the Relay node.
+///
+/// Proves the Relay accepted custody of a challenge for delivery
+/// to a firewalled Target.  Stored by the Validator as an audit
+/// trail.  If the challenge times out but this receipt exists,
+/// the Target's health is frozen and the Relay is penalized.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IngressReceipt {
+    /// The challenge ID from the ChallengeForward envelope.
+    pub challenge_id: [u8; 32],
+    /// The Relay's PeerId (string form).
+    pub relay_peer: String,
+    /// The firewalled Target's PeerId (string form).
+    pub target_peer: String,
+    /// When the Relay accepted custody (epoch-relative timestamp).
+    pub timestamp: u64,
+    /// Signature by the Relay over (challenge_id || relay_peer || target_peer || timestamp).
+    pub signature: Vec<u8>,
+}
+
+/// Egress receipt — signed by the Target node.
+///
+/// Proves the Target received the challenge through the specified
+/// Relay.  Includes the storage proof so the Validator can verify
+/// both delivery and data possession in one message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EgressReceipt {
+    /// The challenge ID from the ChallengeForward envelope.
+    pub challenge_id: [u8; 32],
+    /// The Relay that forwarded this challenge.
+    pub relay_peer: String,
+    /// The Target's PeerId (string form).
+    pub target_peer: String,
+    /// When the Target received the challenge (epoch-relative timestamp).
+    pub timestamp: u64,
+    /// The cryptographic storage proof — proves the Target
+    /// actually holds the data, not just received the message.
+    pub proof: StorageProofData,
+    /// Signature by the Target over (challenge_id || relay_peer || target_peer || timestamp || proof_hash).
+    pub signature: Vec<u8>,
+}
+
+/// Inline storage proof data (same fields as VerifyResponse::StorageProof,
+/// but as a concrete struct for embedding in receipts).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageProofData {
+    pub chunk_hash: [u8; 32],
+    pub salted_hash: [u8; 32],
+    pub merkle_proof: Vec<Vec<u8>>,
 }

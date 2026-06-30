@@ -1,4 +1,4 @@
-use libp2p::{gossipsub, kad, mdns, request_response, swarm::NetworkBehaviour};
+use libp2p::{gossipsub, kad, mdns, relay, dcutr, request_response, swarm::NetworkBehaviour};
 
 use crate::message::codec::rpc::{BalanceCodec, LatticeCodec};
 use crate::message::codec::rpc::VerifyCodec;
@@ -25,6 +25,8 @@ pub const LATTICE_KAD_PROTOCOL: &str = "/lattice/kad/v1";
 /// and the economic primitives layer.
 /// Phase 6 adds a third request-response channel for storage
 /// verification — the peer-verified contribution claims layer.
+/// Phase 6c adds relay client support (for firewalled nodes behind
+/// p2p-circuits) and DCUtR (for automatic NAT hole-punching).
 #[derive(NetworkBehaviour)]
 #[behaviour(out_event = "LatticeBehaviourEvent")]
 pub struct LatticeBehaviour {
@@ -34,6 +36,14 @@ pub struct LatticeBehaviour {
     pub balance_rpc: request_response::Behaviour<BalanceCodec>,
     pub verify_rpc: request_response::Behaviour<VerifyCodec>,
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
+    /// Relay client behaviour — enables firewalled nodes to
+    /// communicate through publicly reachable relay peers via
+    /// `/p2p-circuit` reservations.
+    pub relay_client: relay::client::Behaviour,
+    /// Direct Connection Upgrade through Relay — ambiently
+    /// attempts to upgrade a relayed connection to a direct
+    /// hole-punched path when firewalls permit.
+    pub dcutr: dcutr::Behaviour,
 }
 
 impl LatticeBehaviour {
@@ -44,6 +54,8 @@ impl LatticeBehaviour {
         balance_rpc: request_response::Behaviour<BalanceCodec>,
         verify_rpc: request_response::Behaviour<VerifyCodec>,
         kademlia: kad::Behaviour<kad::store::MemoryStore>,
+        relay_client: relay::client::Behaviour,
+        dcutr: dcutr::Behaviour,
     ) -> Self {
         Self {
             mdns,
@@ -52,6 +64,8 @@ impl LatticeBehaviour {
             balance_rpc,
             verify_rpc,
             kademlia,
+            relay_client,
+            dcutr,
         }
     }
 }
@@ -65,6 +79,11 @@ pub enum LatticeBehaviourEvent {
     BalanceRpc(request_response::Event<BalanceRequest, BalanceResponse>),
     VerifyRpc(request_response::Event<VerifyRequest, VerifyResponse>),
     Kad(kad::Event),
+    /// Relay client events — reservation lifecycle, circuit
+    /// establishment and teardown.
+    RelayClient(relay::client::Event),
+    /// DCUtR events — hole-punch attempts and outcomes.
+    Dcutr(dcutr::Event),
 }
 
 impl From<mdns::Event> for LatticeBehaviourEvent {
@@ -112,5 +131,17 @@ impl From<request_response::Event<VerifyRequest, VerifyResponse>>
         event: request_response::Event<VerifyRequest, VerifyResponse>,
     ) -> Self {
         LatticeBehaviourEvent::VerifyRpc(event)
+    }
+}
+
+impl From<relay::client::Event> for LatticeBehaviourEvent {
+    fn from(event: relay::client::Event) -> Self {
+        LatticeBehaviourEvent::RelayClient(event)
+    }
+}
+
+impl From<dcutr::Event> for LatticeBehaviourEvent {
+    fn from(event: dcutr::Event) -> Self {
+        LatticeBehaviourEvent::Dcutr(event)
     }
 }

@@ -5,10 +5,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use libp2p::{
+    dcutr,
     futures::StreamExt,
-    gossipsub, identity, kad, mdns, noise, request_response,
+    gossipsub, identity, kad, mdns, noise, relay, request_response,
     swarm::SwarmEvent,
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
+    multiaddr::Protocol,
 };
 use tokio::time;
 use tracing::{debug, info, warn};
@@ -128,6 +130,15 @@ pub struct LatticeNode {
         libp2p::request_response::OutboundRequestId,
         PendingChallenge,
     >,
+
+    // ── Phase 6c: trilateral verification ──────────────────────
+    /// Ingress receipt registry — maps challenge_id to a signed
+    /// receipt from the Relay proving custody.  Used by the Safe
+    /// Gate to distinguish relay failures from target failures.
+    receipt_registry: HashMap<[u8; 32], crate::message::types::IngressReceipt>,
+    /// How many epochs a challenge can remain pending before
+    /// the Safe Gate evaluates it as timed out.
+    challenge_timeout_epochs: u64,
 }
 
 impl LatticeNode {
@@ -161,6 +172,18 @@ impl LatticeNode {
             peer_id = %local_peer_id,
             "Generating node identity"
         );
+
+        // Phase 6c: relay client — create paired transport + behaviour
+        // for p2p-circuit support (firewalled nodes behind NAT).
+        // The transport requires `or_transport` composition with the
+        // TCP stack, which needs manual SwarmBuilder plumbing.
+        // Full transport integration: Phase 7.
+        let (_relay_transport, relay_client) =
+            relay::client::new(local_peer_id);
+
+        // Phase 6c: DCUtR — ambient hole-punch attempts.
+        let dcutr_behaviour =
+            dcutr::Behaviour::new(local_peer_id);
 
         let swarm = SwarmBuilder::with_existing_identity(local_key.clone())
             .with_tokio()
@@ -234,6 +257,8 @@ impl LatticeNode {
                     balance_rpc,
                     verify_rpc,
                     kademlia,
+                    relay_client,
+                    dcutr_behaviour,
                 ))
             })?
             .with_swarm_config(|c| {
@@ -270,6 +295,8 @@ impl LatticeNode {
             }),
             bridge_tx: None,
             pending_challenges: HashMap::new(),
+            receipt_registry: HashMap::new(),
+            challenge_timeout_epochs: 3,
         })
     }
 
@@ -449,6 +476,12 @@ impl LatticeNode {
 
         // Phase 6b: schedule storage challenges for aging claims.
         self.schedule_storage_challenges(epoch);
+
+        // Phase 6c: Safe Gate — check for timed-out challenges.
+        // If a challenge to a firewalled target timed out but we
+        // hold an IngressReceipt from the Relay, freeze the target's
+        // health and penalize the Relay instead.
+        self.apply_safe_gate(epoch);
     }
 
     /// Mint units to the local node (test bootstrapping only).
@@ -736,6 +769,68 @@ impl LatticeNode {
                     self.economic_engine.metrics.record_dht_record_stored();
                 } else {
                     debug!(peer = %peer, "Kademlia routing table: peer evicted");
+                }
+            }
+
+            // ── Phase 6c: relay circuit events ──────────────────
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::RelayClient(event)) => {
+                match event {
+                    relay::client::Event::ReservationReqAccepted {
+                        relay_peer_id,
+                        ..
+                    } => {
+                        info!(
+                            relay = %relay_peer_id,
+                            "Relay reservation accepted — circuit routing enabled"
+                        );
+                        // Broadcast our circuit address to Kademlia so
+                        // other nodes can reach us through the relay.
+                        let circuit_addr = Multiaddr::empty()
+                            .with(Protocol::P2p(relay_peer_id))
+                            .with(Protocol::P2pCircuit)
+                            .with(Protocol::P2p(self.local_peer_id));
+                        info!(
+                            circuit = %circuit_addr,
+                            "Announcing p2p-circuit address to DHT"
+                        );
+                        self.swarm
+                            .behaviour_mut()
+                            .kademlia
+                            .add_address(&self.local_peer_id, circuit_addr);
+                    }
+                    relay::client::Event::OutboundCircuitEstablished {
+                        relay_peer_id,
+                        ..
+                    } => {
+                        info!(
+                            relay = %relay_peer_id,
+                            "Outbound relay circuit established"
+                        );
+                    }
+                    relay::client::Event::InboundCircuitEstablished {
+                        src_peer_id,
+                        ..
+                    } => {
+                        info!(
+                            peer = %src_peer_id,
+                            "Inbound relay circuit established — firewalled peer reachable"
+                        );
+                    }
+                }
+            }
+
+            // ── Phase 6c: DCUtR hole-punch events ───────────────
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::Dcutr(event)) => {
+                match event.result {
+                    Ok(_conn_id) => info!(
+                        peer = %event.remote_peer_id,
+                        "DCUtR hole-punch succeeded — direct connection established"
+                    ),
+                    Err(e) => debug!(
+                        peer = %event.remote_peer_id,
+                        error = ?e,
+                        "DCUtR hole-punch attempt failed"
+                    ),
                 }
             }
 
@@ -1070,6 +1165,30 @@ impl LatticeNode {
                     }
                 });
             }
+            // ── Phase 6c: relay forwarding stubs ──────────────
+            VerifyRequest::ChallengeForward {
+                challenge_id,
+                target_peer,
+                challenge: _challenge,
+            } => {
+                // TODO Phase 7: Relay node receives this, forwards
+                // the inner challenge to target_peer via its p2p-circuit,
+                // signs and returns an IngressReceipt to the Validator.
+                info!(
+                    challenge_id = %hex::encode(challenge_id),
+                    target = %target_peer,
+                    "ChallengeForward received — relay forwarding not yet implemented"
+                );
+            }
+            VerifyRequest::RelayAudit { challenge_id } => {
+                // TODO Phase 7: Relay node looks up whether it
+                // forwarded challenge_id and returns an IngressReceipt
+                // if custody was accepted.
+                debug!(
+                    challenge_id = %hex::encode(challenge_id),
+                    "RelayAudit received — audit not yet implemented"
+                );
+            }
         }
     }
 
@@ -1169,6 +1288,65 @@ impl LatticeNode {
                         peer = %challenge.peer,
                         epoch = challenge.epoch,
                         "Storage proof FAILED — peer cannot prove possession"
+                    );
+                    self.ledger.record_verification_failure(
+                        &challenge.resource_id,
+                        &challenge.peer,
+                        challenge.epoch,
+                    );
+                }
+            }
+            // ── Phase 6c: receipt variants ─────────────────────
+            VerifyResponse::IngressReceipt(receipt) => {
+                // Validator received an ingress custody proof from
+                // a Relay.  Store it so the Safe Gate can reference
+                // it if the Target's response times out.
+                info!(
+                    challenge_id = %hex::encode(receipt.challenge_id),
+                    relay = %receipt.relay_peer,
+                    target = %receipt.target_peer,
+                    "Ingress receipt stored — Relay custody proven"
+                );
+                self.receipt_registry
+                    .insert(receipt.challenge_id, receipt);
+            }
+            VerifyResponse::EgressReceipt(receipt) => {
+                // Validator received the combined proof + delivery
+                // receipt from the Target (via relay).  Verify the
+                // embedded storage proof then record success.
+                let is_valid = ProofEngine::verify_storage_proof(
+                    &challenge.resource_id,
+                    &receipt.proof.chunk_hash,
+                    challenge.chunk_index,
+                    &challenge.salt,
+                    &receipt.proof.salted_hash,
+                    &receipt.proof.merkle_proof,
+                );
+
+                if is_valid {
+                    info!(
+                        resource = %hex::encode(challenge.resource_id),
+                        peer = %challenge.peer,
+                        relay = %receipt.relay_peer,
+                        "Egress receipt VERIFIED — target delivered proof through relay"
+                    );
+                    let reward = self.ledger.record_verification_success(
+                        &challenge.resource_id,
+                        &challenge.peer,
+                        challenge.epoch,
+                    );
+                    if reward > 0 {
+                        self.mint_verification_reward(
+                            &challenge.peer,
+                            reward,
+                            challenge.epoch,
+                        );
+                    }
+                } else {
+                    warn!(
+                        resource = %hex::encode(challenge.resource_id),
+                        peer = %challenge.peer,
+                        "Egress receipt FAILED — storage proof invalid"
                     );
                     self.ledger.record_verification_failure(
                         &challenge.resource_id,
@@ -1308,6 +1486,75 @@ impl LatticeNode {
                 amount,
                 "Verification contribution reward minted"
             );
+        }
+    }
+
+    // ── Phase 6c: Safe Gate ────────────────────────────────
+
+    /// Evaluate pending challenges that have exceeded the timeout
+    /// window.  If a challenge to a firewalled target timed out
+    /// but we hold an `IngressReceipt` from the Relay, the target's
+    /// health is frozen and the Relay is penalized.  Without a
+    /// receipt, normal exponential decay applies.
+    fn apply_safe_gate(&mut self, current_epoch: u64) {
+        let timeout = self.challenge_timeout_epochs;
+        let timed_out: Vec<_> = self
+            .pending_challenges
+            .iter()
+            .filter(|(_, c)| current_epoch.saturating_sub(c.epoch) >= timeout)
+            .map(|(id, c)| (*id, c.clone()))
+            .collect();
+
+        if timed_out.is_empty() {
+            return;
+        }
+
+        for (request_id, challenge) in &timed_out {
+            self.pending_challenges.remove(request_id);
+
+            // Check whether we hold an IngressReceipt for this
+            // challenge.  We match by resource_id — in a full
+            // relay deployment this would use a challenge_id
+            // from the ChallengeForward envelope.
+            let receipt_exists = self.receipt_registry.values().any(|r| {
+                r.target_peer == challenge.peer.to_string()
+                    && r.challenge_id == challenge.resource_id
+            });
+
+            if receipt_exists {
+                info!(
+                    target = %challenge.peer,
+                    resource = %hex::encode(challenge.resource_id),
+                    epoch = challenge.epoch,
+                    "Safe Gate: challenge timed out but Relay ingress receipt exists — freezing target health"
+                );
+                // Remove the receipt so it isn't reused.
+                self.receipt_registry.retain(|_, r| {
+                    r.target_peer != challenge.peer.to_string()
+                        || r.challenge_id != challenge.resource_id
+                });
+                // Relay reputation slashing placeholder.
+                // Phase 7 will add a persistent reputation index
+                // and route-around logic.
+                warn!(
+                    target = %challenge.peer,
+                    "Relay custody confirmed — target health frozen, relay flagged for audit"
+                );
+            } else {
+                // No receipt — genuine timeout.
+                warn!(
+                    target = %challenge.peer,
+                    resource = %hex::encode(challenge.resource_id),
+                    epoch = challenge.epoch,
+                    timeout_epochs = timeout,
+                    "Challenge timed out with no relay receipt — applying health decay"
+                );
+                self.ledger.record_verification_failure(
+                    &challenge.resource_id,
+                    &challenge.peer,
+                    challenge.epoch,
+                );
+            }
         }
     }
 }

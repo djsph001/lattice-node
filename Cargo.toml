@@ -21,6 +21,8 @@ libp2p = { version = "0.54", features = [
     "kad",
     "identify",
     "macros",
+    "relay",
+    "dcutr",
 ] }
 
 # Serialization

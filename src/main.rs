@@ -6,6 +6,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod economics;
+mod ingest;
 mod ledger;
 mod message;
 mod network;
@@ -114,6 +115,14 @@ struct Cli {
     /// verified mint amount.
     #[arg(long)]
     fake_relay_bytes: Option<u64>,
+
+    // ── Phase 7: TCP cert ingestion ─────────────────────────
+    /// Directory to watch for .pb Impact Certificate files
+    /// produced by the Python sandbox orchestrator (tfb:).
+    /// When a valid certificate appears, it is broadcast
+    /// on the lattice/enclave-cert/v1 gossipsub topic.
+    #[arg(long)]
+    cert_watch_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -176,6 +185,7 @@ async fn main() -> Result<()> {
         cli.storage_dir,
         cli.listen_addr,
         cli.external_addr,
+        cli.cert_watch_dir,
     )?;
 
     info!(

@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+// TCP v0.1.0 — Impact Certificate wire format
+// Shared contract between Python orchestrator (tfb:) and Rust lattice-node (lat:)
+// Compiled to both impact_certificate_pb2.py and impact_certificate.rs
+
+message DebateRound {
+    string proposer_turn = 1;   // Card 0: thesis expansion
+    string opposer_turn = 2;    // Card 1: antithesis critique
+    string synthesis = 3;       // CPU: resolved synthesis
+}
+
+enum ValidationOutcome {
+    VALIDATION_UNSPECIFIED = 0;
+    PASS = 1;
+    FAIL_LAND_VALUE_TAX = 2;
+    FAIL_CARBON_BUDGET = 3;
+    FAIL_RESOURCE_DEPLETION = 4;
+    FAIL_SYSTEMIC_RISK = 5;
+}
+
+message ImpactCertificate {
+    // Header tier [fields 1-4]
+    string proposal_id = 1;           // lvn: hash (sha256 first 16 chars)
+    string proposer_address = 2;      // lvn: identity string
+    string raw_text = 3;              // Original proposal text
+    string synthesized_text = 4;      // Final synthesis after tfb: rounds
+
+    // Simulation telemetry [fields 5-9]
+    repeated DebateRound debate_rounds = 5;  // 3 rounds of proposer/opposer
+    ValidationOutcome georgist_validation = 6;
+    float carbon_budget_impact = 7;           // In CO2e tons
+    float resource_depletion_years = 8;        // Years remaining estimate
+    string enclave_id = 9;                     // tfb: identity string
+
+    // Ratification state [fields 10-12]
+    string lat_commitment = 10;      // Hash for lattice-node commit
+    string witness_seed = 11;        // Sortition entropy (u64 as string)
+    string timestamp = 12;           // ISO 8601
+
+    // Cryptographic proofs [fields 13-16]
+    bytes lvn_signature = 13;        // Ed25519, 64 bytes
+    bytes tfb_enclave_signature = 14; // Ed25519, 64 bytes
+    bytes lat_consensus_payload = 15;
+    bytes receipt_hash = 16;         // Blake3 of fields 1-15
+}

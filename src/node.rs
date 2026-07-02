@@ -5,9 +5,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use libp2p::{
-    dcutr,
     futures::StreamExt,
-    gossipsub, identity, kad, mdns, noise, relay, request_response,
+    gossipsub, identity, kad, mdns, noise, request_response,
     swarm::SwarmEvent,
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
     multiaddr::Protocol,
@@ -26,6 +25,7 @@ use crate::message::types::{
 use crate::message::types::{VerifyRequest, VerifyResponse};
 use crate::network::protocol::{
     LatticeBehaviour, LatticeBehaviourEvent, LATTICE_HEARTBEAT_TOPIC, LATTICE_KAD_PROTOCOL,
+    LATTICE_ENCLAVE_CERT_TOPIC,
 };
 use crate::state::peers::PeerTable;
 use crate::economics::EconomicEngine;
@@ -157,6 +157,12 @@ pub struct LatticeNode {
     /// Optional publicly reachable address advertised via
     /// Kademlia for NAT traversal / port-forwarding setups.
     external_addr: Option<String>,
+
+    // ── Phase 7: TCP cert ingestion ──────────────────────────
+    /// Directory to watch for .pb Impact Certificate files.
+    /// When set, the node spawns a background watcher and
+    /// broadcasts valid certificates on the enclave-cert topic.
+    cert_watch_dir: Option<PathBuf>,
 }
 
 impl LatticeNode {
@@ -177,6 +183,7 @@ impl LatticeNode {
         storage_dir: Option<PathBuf>,
         listen_addr: String,
         external_addr: Option<String>,
+        cert_watch_dir: Option<PathBuf>,
     ) -> Result<Self> {
         let key_path = resolve_identity_path(identity_dir)?;
         let local_key = load_or_generate_identity(&key_path, fresh_identity)?;
@@ -192,18 +199,6 @@ impl LatticeNode {
             peer_id = %local_peer_id,
             "Generating node identity"
         );
-
-        // Phase 6c: relay client — create paired transport + behaviour
-        // for p2p-circuit support (firewalled nodes behind NAT).
-        // The transport requires `or_transport` composition with the
-        // TCP stack, which needs manual SwarmBuilder plumbing.
-        // Full transport integration: Phase 7.
-        let (_relay_transport, relay_client) =
-            relay::client::new(local_peer_id);
-
-        // Phase 6c: DCUtR — ambient hole-punch attempts.
-        let dcutr_behaviour =
-            dcutr::Behaviour::new(local_peer_id);
 
         let swarm = SwarmBuilder::with_existing_identity(local_key.clone())
             .with_tokio()
@@ -241,6 +236,14 @@ impl LatticeNode {
                     .subscribe(&tx_topic)
                     .map_err(|e| anyhow::anyhow!("gossipsub tx subscribe: {e}"))?;
 
+                // Phase 7: Subscribe to enclave certificate topic.
+                let cert_topic = gossipsub::IdentTopic::new(
+                    LATTICE_ENCLAVE_CERT_TOPIC,
+                );
+                gossipsub
+                    .subscribe(&cert_topic)
+                    .map_err(|e| anyhow::anyhow!("gossipsub cert subscribe: {e}"))?;
+
                 let rpc = request_response::Behaviour::new(
                     [(LatticeProtocol, request_response::ProtocolSupport::Full)],
                     request_response::Config::default(),
@@ -277,8 +280,6 @@ impl LatticeNode {
                     balance_rpc,
                     verify_rpc,
                     kademlia,
-                    relay_client,
-                    dcutr_behaviour,
                 ))
             })?
             .with_swarm_config(|c| {
@@ -321,6 +322,7 @@ impl LatticeNode {
             recent_message_hashes: HashSet::new(),
             listen_addr,
             external_addr,
+            cert_watch_dir,
         })
     }
 
@@ -429,6 +431,20 @@ impl LatticeNode {
             tokio::sync::mpsc::channel::<InternalBridgeEvent>(100);
         self.bridge_tx = Some(bridge_tx.clone());
 
+        // Phase 7: certificate watcher channel.
+        // When --cert-watch-dir is set, a background task scans
+        // for new .pb files and sends raw bytes here for broadcast.
+        let (cert_tx, mut cert_rx) =
+            tokio::sync::mpsc::channel::<Vec<u8>>(10);
+
+        if let Some(ref watch_dir) = self.cert_watch_dir {
+            info!(
+                dir = %watch_dir.display(),
+                "Starting certificate watcher"
+            );
+            crate::ingest::spawn_cert_watcher(watch_dir.clone(), cert_tx);
+        }
+
         info!(
             name = %self.node_name,
             heartbeat_interval = ?self.heartbeat_interval,
@@ -452,6 +468,9 @@ impl LatticeNode {
                 }
                 Some(bridge_event) = bridge_rx.recv() => {
                     self.handle_bridge_event(bridge_event);
+                }
+                Some(cert_bytes) = cert_rx.recv() => {
+                    self.handle_cert_broadcast(cert_bytes).await;
                 }
             }
         }
@@ -858,68 +877,6 @@ impl LatticeNode {
                 }
             }
 
-            // ── Phase 6c: relay circuit events ──────────────────
-            SwarmEvent::Behaviour(LatticeBehaviourEvent::RelayClient(event)) => {
-                match event {
-                    relay::client::Event::ReservationReqAccepted {
-                        relay_peer_id,
-                        ..
-                    } => {
-                        info!(
-                            relay = %relay_peer_id,
-                            "Relay reservation accepted — circuit routing enabled"
-                        );
-                        // Broadcast our circuit address to Kademlia so
-                        // other nodes can reach us through the relay.
-                        let circuit_addr = Multiaddr::empty()
-                            .with(Protocol::P2p(relay_peer_id))
-                            .with(Protocol::P2pCircuit)
-                            .with(Protocol::P2p(self.local_peer_id));
-                        info!(
-                            circuit = %circuit_addr,
-                            "Announcing p2p-circuit address to DHT"
-                        );
-                        self.swarm
-                            .behaviour_mut()
-                            .kademlia
-                            .add_address(&self.local_peer_id, circuit_addr);
-                    }
-                    relay::client::Event::OutboundCircuitEstablished {
-                        relay_peer_id,
-                        ..
-                    } => {
-                        info!(
-                            relay = %relay_peer_id,
-                            "Outbound relay circuit established"
-                        );
-                    }
-                    relay::client::Event::InboundCircuitEstablished {
-                        src_peer_id,
-                        ..
-                    } => {
-                        info!(
-                            peer = %src_peer_id,
-                            "Inbound relay circuit established — firewalled peer reachable"
-                        );
-                    }
-                }
-            }
-
-            // ── Phase 6c: DCUtR hole-punch events ───────────────
-            SwarmEvent::Behaviour(LatticeBehaviourEvent::Dcutr(event)) => {
-                match event.result {
-                    Ok(_conn_id) => info!(
-                        peer = %event.remote_peer_id,
-                        "DCUtR hole-punch succeeded — direct connection established"
-                    ),
-                    Err(e) => debug!(
-                        peer = %event.remote_peer_id,
-                        error = ?e,
-                        "DCUtR hole-punch attempt failed"
-                    ),
-                }
-            }
-
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 info!(peer = %peer_id, "Connection established");
                 if !self.mdns_peers.contains(&peer_id) {
@@ -998,6 +955,22 @@ impl LatticeNode {
         // participating in propagating.  The gossipsub layer handles
         // the actual forwarding; we track the contribution.
         self.economic_engine.metrics.record_relay(data.len() as u64);
+
+        // Phase 7: detect enclave certificate messages by protobuf
+        // signature.  These are raw ImpactCertificate payloads, not
+        // LatticeMessage envelopes.  Decode and log receipt.
+        {
+            use prost::Message;
+            if let Ok(cert) = crate::ingest::proto::ImpactCertificate::decode(data) {
+                info!(
+                    proposal_id = %cert.proposal_id,
+                    from = %propagation_source,
+                    bytes = data.len(),
+                    "[cert-receive] Enclave certificate received via gossipsub"
+                );
+                return;
+            }
+        }
 
         let msg: LatticeMessage = match crate::message::codec::decode(data) {
             Ok(m) => m,
@@ -1740,6 +1713,57 @@ impl LatticeNode {
                     &challenge.resource_id,
                     &challenge.peer,
                     challenge.epoch,
+                );
+            }
+        }
+    }
+
+    // ── Phase 7: certificate broadcast ─────────────────────────
+
+    /// Broadcast a validated Impact Certificate on the enclave-cert
+    /// gossipsub topic. Called from the event loop when the cert
+    /// watcher sends raw protobuf bytes through the channel.
+    async fn handle_cert_broadcast(&mut self, raw: Vec<u8>) {
+        use crate::ingest::proto;
+        use prost::Message;
+
+        let cert = match proto::ImpactCertificate::decode(&raw[..]) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("[cert-broadcast] Decode failed: {}", e);
+                return;
+            }
+        };
+
+        tracing::info!(
+            proposal_id = %cert.proposal_id,
+            bytes = raw.len(),
+            "[cert-broadcast] Broadcasting enclave certificate"
+        );
+
+        // Re-encode for wire transmission (the raw bytes are the
+        // certificate; we publish them directly on the topic).
+        let topic = gossipsub::IdentTopic::new(LATTICE_ENCLAVE_CERT_TOPIC);
+        match self
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(topic, raw)
+        {
+            Ok(message_id) => {
+                tracing::info!(
+                    message_id = %message_id,
+                    proposal_id = %cert.proposal_id,
+                    "[cert-broadcast] Certificate published to mesh"
+                );
+                self.economic_engine.metrics.record_relay(
+                    cert.encode_to_vec().len() as u64,
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "[cert-broadcast] Failed to publish certificate"
                 );
             }
         }

@@ -12,7 +12,7 @@ use libp2p::{
     multiaddr::Protocol,
 };
 use tokio::time;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::ledger::state::LedgerState;
 use crate::ledger::types::{DigitalUtilityUnit, SignedTransaction, Transaction};
@@ -163,6 +163,24 @@ pub struct LatticeNode {
     /// When set, the node spawns a background watcher and
     /// broadcasts valid certificates on the enclave-cert topic.
     cert_watch_dir: Option<PathBuf>,
+
+    // ── Phase 7: multi-sig sortition ─────────────────────────
+    /// PeerIds excluded from Witness panel selection due to
+    /// recent escalation participation (last 3 rounds).
+    escalation_exclusions: Vec<PeerId>,
+    /// Witness signatures collected per proposal_id.
+    /// Key: proposal_id, Value: list of (peer_id, signature) pairs.
+    /// When 3-of-5 threshold is met, the certificate is ratified.
+    witness_sigs: HashMap<String, Vec<(PeerId, Vec<u8>)>>,
+
+    // ── Phase 7: commit layer ───────────────────────────────
+    /// Raw protobuf bytes of decoded certificates, keyed by
+    /// proposal_id.  Cached so the commit layer can write the
+    /// full certificate to disk when quorum is reached.
+    cert_cache: HashMap<String, Vec<u8>>,
+    /// Append-only Blake3 hash-chain ledger for ratified
+    /// certificates (State 4: Committed).
+    commit_manager: crate::commit::CommitManager,
 }
 
 impl LatticeNode {
@@ -287,6 +305,8 @@ impl LatticeNode {
             })
             .build();
 
+        let storage_path = storage_dir.unwrap_or_else(|| PathBuf::from("./lattice-storage"));
+
         Ok(Self {
             swarm,
             peer_table: PeerTable::new(),
@@ -311,9 +331,7 @@ impl LatticeNode {
             epoch_interval: Duration::from_secs(epoch_interval_secs),
             base_mint_rate,
             base_tax_rate,
-            storage_dir: storage_dir.unwrap_or_else(|| {
-                PathBuf::from("./lattice-storage")
-            }),
+            storage_dir: storage_path.clone(),
             bridge_tx: None,
             pending_challenges: HashMap::new(),
             receipt_registry: HashMap::new(),
@@ -323,6 +341,10 @@ impl LatticeNode {
             listen_addr,
             external_addr,
             cert_watch_dir,
+            escalation_exclusions: Vec::new(),
+            witness_sigs: HashMap::new(),
+            cert_cache: HashMap::new(),
+            commit_manager: crate::commit::CommitManager::open(&storage_path),
         })
     }
 
@@ -445,6 +467,10 @@ impl LatticeNode {
             crate::ingest::spawn_cert_watcher(watch_dir.clone(), cert_tx);
         }
 
+        // Phase 7: API server — Unix Domain Socket for local queries
+        let api_socket = self.storage_dir.join("lattice.sock");
+        let mut api_rx = crate::api::spawn_api_server(api_socket);
+
         info!(
             name = %self.node_name,
             heartbeat_interval = ?self.heartbeat_interval,
@@ -471,6 +497,9 @@ impl LatticeNode {
                 }
                 Some(cert_bytes) = cert_rx.recv() => {
                     self.handle_cert_broadcast(cert_bytes).await;
+                }
+                Some(api_msg) = api_rx.recv() => {
+                    self.handle_api_message(api_msg);
                 }
             }
         }
@@ -958,7 +987,8 @@ impl LatticeNode {
 
         // Phase 7: detect enclave certificate messages by protobuf
         // signature.  These are raw ImpactCertificate payloads, not
-        // LatticeMessage envelopes.  Decode and log receipt.
+        // LatticeMessage envelopes.  Decode, run Witness sortition,
+        // and begin multi-sig collection if selected.
         {
             use prost::Message;
             if let Ok(cert) = crate::ingest::proto::ImpactCertificate::decode(data) {
@@ -968,6 +998,22 @@ impl LatticeNode {
                     bytes = data.len(),
                     "[cert-receive] Enclave certificate received via gossipsub"
                 );
+
+                // Cache raw bytes for the commit layer
+                self.cert_cache
+                    .insert(cert.proposal_id.clone(), data.to_vec());
+
+                // ── Phase 7: Witness sortition ──────────────────
+                self.run_witness_sortition(&cert);
+
+                return;
+            }
+
+            // ── Phase 7: witness attestation handler ────────────
+            // Messages starting with 0x01 are witness attestations,
+            // not ImpactCertificates. Parse, verify, and collect.
+            if data.first() == Some(&0x01) {
+                self.handle_witness_attestation(data, propagation_source);
                 return;
             }
         }
@@ -1735,6 +1781,10 @@ impl LatticeNode {
             }
         };
 
+        // Cache the raw certificate bytes for the commit layer
+        self.cert_cache
+            .insert(cert.proposal_id.clone(), raw.clone());
+
         tracing::info!(
             proposal_id = %cert.proposal_id,
             bytes = raw.len(),
@@ -1767,6 +1817,340 @@ impl LatticeNode {
                 );
             }
         }
+
+        // ── Phase 7: run sortition locally ──────────────────
+        // The publishing node must also check if it's on the
+        // witness panel — gossipsub doesn't loop back to self.
+        self.run_witness_sortition(&cert);
+    }
+
+    /// Run witness sortition for a decoded ImpactCertificate.
+    ///
+    /// Called from both the cert-broadcast path (local ingest)
+    /// and the cert-receive path (gossipsub inbound). Every node
+    /// deterministically computes the same panel.
+    fn run_witness_sortition(&mut self, cert: &crate::ingest::proto::ImpactCertificate) {
+        let peer_pool: Vec<PeerId> = self
+            .peer_table
+            .iter()
+            .map(|info| info.peer_id)
+            .chain(std::iter::once(self.local_peer_id))
+            .collect();
+
+        let panel = crate::sortition::select_witness_panel(
+            &cert.witness_seed,
+            &peer_pool,
+            &self.escalation_exclusions,
+        );
+
+        if crate::sortition::is_local_witness(&panel, &self.local_peer_id) {
+            info!(
+                proposal_id = %cert.proposal_id,
+                panel = ?panel.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+                "[sortition] Local node selected as Witness — signing certificate"
+            );
+
+            let sig = match self.local_key.sign(cert.proposal_id.as_bytes()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "[sortition] Failed to sign certificate");
+                    return;
+                }
+            };
+
+            self.witness_sigs
+                .entry(cert.proposal_id.clone())
+                .or_default()
+                .push((self.local_peer_id, sig.clone()));
+
+            let pid_bytes = cert.proposal_id.as_bytes();
+            let pubkey_bytes = self.local_key.public().encode_protobuf();
+            let mut attestation = Vec::with_capacity(
+                1 + 2 + pid_bytes.len() + 2 + pubkey_bytes.len() + 2 + sig.len(),
+            );
+            attestation.push(0x01);
+            attestation.extend_from_slice(&(pid_bytes.len() as u16).to_be_bytes());
+            attestation.extend_from_slice(pid_bytes);
+            attestation.extend_from_slice(&(pubkey_bytes.len() as u16).to_be_bytes());
+            attestation.extend_from_slice(&pubkey_bytes);
+            attestation.extend_from_slice(&(sig.len() as u16).to_be_bytes());
+            attestation.extend_from_slice(&sig);
+
+            let topic =
+                gossipsub::IdentTopic::new(crate::network::protocol::LATTICE_ENCLAVE_CERT_TOPIC);
+            match self.swarm.behaviour_mut().gossipsub.publish(topic, attestation) {
+                Ok(msg_id) => {
+                    info!(
+                        message_id = %msg_id,
+                        proposal_id = %cert.proposal_id,
+                        "[sortition] Witness attestation published to mesh"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "[sortition] Failed to publish witness attestation"
+                    );
+                }
+            }
+        } else {
+            debug!(
+                proposal_id = %cert.proposal_id,
+                panel_size = panel.len(),
+                "[sortition] Local node not on panel — observing quorum"
+            );
+        }
+    }
+
+    /// Handle an incoming witness attestation (0x01 marker).
+    ///
+    /// Wire format:
+    ///   [0x01] [2-byte pid_len] [proposal_id]
+    ///   [2-byte pubkey_len] [public_key protobuf]
+    ///   [2-byte sig_len] [Ed25519 signature]
+    ///
+    /// Verifies the signature against the proposal_id using the
+    /// embedded public key, then collects signatures toward the
+    /// 3-of-5 quorum threshold.
+    fn handle_witness_attestation(&mut self, data: &[u8], propagation_source: PeerId) {
+        // Skip 0x01 marker
+        let rest = &data[1..];
+        if rest.len() < 4 {
+            warn!("[attestation] Message too short for header");
+            return;
+        }
+
+        // Parse proposal_id
+        let pid_len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+        let after_pid = 2 + pid_len;
+        if rest.len() < after_pid {
+            warn!("[attestation] Truncated proposal_id field");
+            return;
+        }
+        let proposal_id = match std::str::from_utf8(&rest[2..after_pid]) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                warn!("[attestation] Invalid UTF-8 in proposal_id");
+                return;
+            }
+        };
+
+        // Parse public key
+        let rest = &rest[after_pid..];
+        if rest.len() < 2 {
+            warn!("[attestation] Missing pubkey length");
+            return;
+        }
+        let pk_len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+        let after_pk = 2 + pk_len;
+        if rest.len() < after_pk {
+            warn!("[attestation] Truncated public key");
+            return;
+        }
+        let pk_bytes = &rest[2..after_pk];
+
+        // Parse signature
+        let rest = &rest[after_pk..];
+        if rest.len() < 2 {
+            warn!("[attestation] Missing signature length");
+            return;
+        }
+        let sig_len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+        if rest.len() < 2 + sig_len {
+            warn!("[attestation] Truncated signature");
+            return;
+        }
+        let sig = &rest[2..2 + sig_len];
+
+        // Decode public key and derive PeerId
+        let pubkey = match libp2p::identity::PublicKey::try_decode_protobuf(pk_bytes) {
+            Ok(pk) => pk,
+            Err(e) => {
+                warn!(error = %e, "[attestation] Failed to decode public key");
+                return;
+            }
+        };
+        let signer_peer_id = pubkey.to_peer_id();
+
+        // Verify signature
+        if !pubkey.verify(proposal_id.as_bytes(), sig) {
+            warn!(
+                proposal_id = %proposal_id,
+                signer = %signer_peer_id,
+                "[attestation] Signature verification failed — rejected"
+            );
+            return;
+        }
+
+        info!(
+            proposal_id = %proposal_id,
+            signer = %signer_peer_id,
+            from_gossipsub = %propagation_source,
+            "[attestation] Witness signature verified ✓"
+        );
+
+        // Collect signature
+        let sigs = self.witness_sigs.entry(proposal_id.clone()).or_default();
+
+        // Deduplicate — one sig per peer
+        if sigs.iter().any(|(pid, _)| *pid == signer_peer_id) {
+            debug!(
+                proposal_id = %proposal_id,
+                signer = %signer_peer_id,
+                "[attestation] Duplicate signature ignored"
+            );
+            return;
+        }
+
+        sigs.push((signer_peer_id, sig.to_vec()));
+        let count = sigs.len();
+
+        info!(
+            proposal_id = %proposal_id,
+            signatures_collected = count,
+            threshold = 3,
+            "[attestation] Signature collected — {}/3 toward quorum",
+            count
+        );
+
+        // Check quorum — when reached, commit to the hash-chain ledger
+        if count >= 3 {
+            // Dedup guard: skip if already committed (trailing attestations)
+            if self.commit_manager.is_committed(&proposal_id) {
+                debug!(
+                    proposal_id = %proposal_id,
+                    "[attestation] Trailing attestation — already committed, skipping"
+                );
+                return;
+            }
+
+            info!(
+                proposal_id = %proposal_id,
+                signers = ?sigs.iter().map(|(pid, _)| pid.to_string()).collect::<Vec<_>>(),
+                "═══════════════════════════════════════════\n\
+                 [RATIFIED] 3-of-5 witness quorum reached!\n\
+                 Certificate {} is now State 3: Ratified\n\
+                 ═══════════════════════════════════════════",
+                proposal_id
+            );
+
+            // ── State 4: Committed ────────────────────────────
+            // Write the ratified certificate and its signatures
+            // to the append-only Blake3 hash-chain ledger.
+            if let Some(cert_bytes) = self.cert_cache.get(&proposal_id) {
+                match self.commit_manager.commit(
+                    cert_bytes,
+                    &proposal_id,
+                    sigs,
+                ) {
+                    Ok(block_hash) => {
+                        info!(
+                            proposal_id = %proposal_id,
+                            block_hash = %hex::encode(block_hash),
+                            height = self.commit_manager.height(),
+                            "═══════════════════════════════════════════\n\
+                             [COMMITTED] State 4 — written to hash-chain ledger\n\
+                             Block height: {}\n\
+                             ═══════════════════════════════════════════",
+                            self.commit_manager.height()
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            proposal_id = %proposal_id,
+                            error = %e,
+                            "[commit] Failed to write to ledger"
+                        );
+                    }
+                }
+            } else {
+                warn!(
+                    proposal_id = %proposal_id,
+                    "[commit] Cert not in cache — cannot commit"
+                );
+            }
+        }
+    }
+
+    /// Handle an API request from the Unix Domain Socket server.
+    fn handle_api_message(&mut self, msg: crate::api::ApiMessage) {
+        use crate::api::{ApiRequest, ApiResponse};
+        use prost::Message;
+
+        let response = match msg.request {
+            ApiRequest::GetHeight => ApiResponse::Height {
+                height: self.commit_manager.height(),
+            },
+            ApiRequest::GetBlock { height } => {
+                match self.commit_manager.get_block_bytes(height) {
+                    Some(raw) => {
+                        let bh = if raw.len() >= 72 {
+                            hex::encode(&raw[8..40])
+                        } else {
+                            String::new()
+                        };
+                        let ch = if raw.len() >= 72 {
+                            hex::encode(&raw[40..72])
+                        } else {
+                            String::new()
+                        };
+                        let sc = if raw.len() >= 74 {
+                            let mut off = 72 + 4;
+                            if off + 4 <= raw.len() {
+                                let cl = u32::from_be_bytes([
+                                    raw[72], raw[73], raw[74], raw[75],
+                                ]) as usize;
+                                off += cl;
+                                if off + 2 <= raw.len() {
+                                    u16::from_be_bytes([raw[off], raw[off + 1]])
+                                } else { 0 }
+                            } else { 0 }
+                        } else { 0 };
+                        ApiResponse::Block {
+                            height,
+                            block_hash: bh,
+                            cert_hash: ch,
+                            sig_count: sc,
+                        }
+                    }
+                    None => ApiResponse::Error {
+                        message: format!("Block {} not found", height),
+                    },
+                }
+            }
+            ApiRequest::GetCertificate { proposal_id } => {
+                match self.cert_cache.get(&proposal_id) {
+                    Some(raw) => {
+                        match crate::ingest::proto::ImpactCertificate::decode(&raw[..]) {
+                            Ok(cert) => {
+                                let seed = cert.witness_seed.clone();
+                                let validation = format!("{:?}", cert.georgist_validation());
+                                ApiResponse::Certificate {
+                                    proposal_id: cert.proposal_id,
+                                    enclave_id: cert.enclave_id,
+                                    rounds: cert.debate_rounds.len() as u32,
+                                    witness_seed: seed,
+                                    validation,
+                                    bytes: raw.len() as u64,
+                                }
+                            }
+                            Err(e) => ApiResponse::Error {
+                                message: format!("Decode error: {}", e),
+                            },
+                        }
+                    }
+                    None => ApiResponse::Error {
+                        message: format!("Certificate {} not found", proposal_id),
+                    },
+                }
+            }
+            ApiRequest::GetStats => ApiResponse::Stats {
+                height: self.commit_manager.height(),
+                committed_count: self.commit_manager.height(),
+            },
+        };
+
+        let _ = msg.reply.send(response);
     }
 }
 

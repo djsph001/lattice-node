@@ -5,12 +5,15 @@ use clap::Parser;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod api;
+mod commit;
 mod economics;
 mod ingest;
 mod ledger;
 mod message;
 mod network;
 mod node;
+mod sortition;
 mod state;
 mod storage;
 

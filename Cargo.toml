@@ -58,6 +58,7 @@ hex = "0.4"
 # Protobuf (Phase 7: TCP wire format — shared contract with Python sandbox)
 prost = "0.13"
 sha2 = "0.10"
+serde_json = "1"
 
 [build-dependencies]
 prost-build = "0.13"

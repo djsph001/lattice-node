@@ -1,8 +1,7 @@
-// FIXME(phase-6c): relay_client and dcutr temporarily removed due to
-// libp2p-relay 0.18 race condition (transport channel closed before
-// behaviour polled). Tracked as: relay startup panic blocks mesh test.
-// Re-add before cross-internet NAT traversal testing with Mac/Windows nodes.
-use libp2p::{gossipsub, kad, mdns, request_response, swarm::NetworkBehaviour};
+// Phase 6c: relay client for NAT traversal and p2p-circuit support.
+// DCUtR re-add deferred — relay must be proven first before hole-punch
+// upgrade layer can be re-enabled.
+use libp2p::{gossipsub, kad, mdns, relay, request_response, swarm::NetworkBehaviour};
 
 use crate::message::codec::rpc::{BalanceCodec, LatticeCodec};
 use crate::message::codec::rpc::VerifyCodec;
@@ -46,6 +45,8 @@ pub struct LatticeBehaviour {
     pub balance_rpc: request_response::Behaviour<BalanceCodec>,
     pub verify_rpc: request_response::Behaviour<VerifyCodec>,
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
+    /// Phase 6c: relay client for p2p-circuit NAT traversal.
+    pub relay_client: relay::client::Behaviour,
 }
 
 impl LatticeBehaviour {
@@ -56,6 +57,7 @@ impl LatticeBehaviour {
         balance_rpc: request_response::Behaviour<BalanceCodec>,
         verify_rpc: request_response::Behaviour<VerifyCodec>,
         kademlia: kad::Behaviour<kad::store::MemoryStore>,
+        relay_client: relay::client::Behaviour,
     ) -> Self {
         Self {
             mdns,
@@ -64,6 +66,7 @@ impl LatticeBehaviour {
             balance_rpc,
             verify_rpc,
             kademlia,
+            relay_client,
         }
     }
 }
@@ -77,6 +80,8 @@ pub enum LatticeBehaviourEvent {
     BalanceRpc(request_response::Event<BalanceRequest, BalanceResponse>),
     VerifyRpc(request_response::Event<VerifyRequest, VerifyResponse>),
     Kad(kad::Event),
+    /// Phase 6c: relay client events (reservation, circuit establishment).
+    RelayClient(relay::client::Event),
 }
 
 impl From<mdns::Event> for LatticeBehaviourEvent {
@@ -114,6 +119,12 @@ impl From<request_response::Event<BalanceRequest, BalanceResponse>>
 impl From<kad::Event> for LatticeBehaviourEvent {
     fn from(event: kad::Event) -> Self {
         LatticeBehaviourEvent::Kad(event)
+    }
+}
+
+impl From<relay::client::Event> for LatticeBehaviourEvent {
+    fn from(event: relay::client::Event) -> Self {
+        LatticeBehaviourEvent::RelayClient(event)
     }
 }
 

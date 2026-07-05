@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use libp2p::{
     futures::StreamExt,
-    gossipsub, identity, kad, mdns, noise, request_response,
+    gossipsub, identity, kad, mdns, noise, relay, request_response,
     swarm::SwarmEvent,
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
     multiaddr::Protocol,
@@ -225,7 +225,14 @@ impl LatticeNode {
                 noise::Config::new,
                 yamux::Config::default,
             )?
-            .with_behaviour(|key| {
+            // Phase 6c: relay client — wires relay transport into
+            // the swarm stack and exposes relay::client::Behaviour
+            // to the with_behaviour closure.
+            .with_relay_client(
+                noise::Config::new,
+                yamux::Config::default,
+            )?
+            .with_behaviour(|key, relay_client| {
                 let mdns = mdns::tokio::Behaviour::new(
                     mdns::Config::default(),
                     key.public().to_peer_id(),
@@ -298,6 +305,7 @@ impl LatticeNode {
                     balance_rpc,
                     verify_rpc,
                     kademlia,
+                    relay_client,
                 ))
             })?
             .with_swarm_config(|c| {
@@ -903,6 +911,21 @@ impl LatticeNode {
                     self.economic_engine.metrics.record_dht_record_stored();
                 } else {
                     debug!(peer = %peer, "Kademlia routing table: peer evicted");
+                }
+            }
+
+            // ── Phase 6c: relay client events ──────────────────
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::RelayClient(event)) => {
+                match event {
+                    relay::client::Event::ReservationReqAccepted {
+                        relay_peer_id, ..
+                    } => {
+                        info!(
+                            relay = %relay_peer_id,
+                            "Relay reservation accepted — circuit routing enabled"
+                        );
+                    }
+                    _ => debug!(?event, "Relay client event"),
                 }
             }
 

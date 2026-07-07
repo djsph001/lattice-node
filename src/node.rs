@@ -155,6 +155,8 @@ pub struct LatticeNode {
     // ── Deployment ──────────────────────────────────────────
     /// IP address the listener is bound to.
     listen_addr: String,
+    /// Port the listener binds to (0 = OS-assigned random port).
+    port: u16,
     /// Optional publicly reachable address advertised via
     /// Kademlia for NAT traversal / port-forwarding setups.
     external_addr: Option<String>,
@@ -187,7 +189,7 @@ pub struct LatticeNode {
 impl LatticeNode {
     /// Create a new Lattice node.
     pub fn new(
-        _port: u16,
+        port: u16,
         name: Option<String>,
         heartbeat_secs: u64,
         identity_dir: Option<PathBuf>,
@@ -378,6 +380,7 @@ impl LatticeNode {
             receipt_store: Vec::new(),
             recent_message_hashes: HashSet::new(),
             listen_addr,
+            port,
             external_addr,
             cert_watch_dir,
             escalation_exclusions: Vec::new(),
@@ -409,7 +412,7 @@ impl LatticeNode {
     /// Main event loop.
     pub async fn run(&mut self) -> Result<()> {
         let listen_addr: Multiaddr =
-            format!("/ip4/{}/tcp/{}", self.listen_addr, 0)
+            format!("/ip4/{}/tcp/{}", self.listen_addr, self.port)
                 .parse()
                 .expect("valid multiaddr");
         self.swarm.listen_on(listen_addr)?;

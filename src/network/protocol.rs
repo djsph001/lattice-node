@@ -1,7 +1,8 @@
 // Phase 6c: relay client for NAT traversal and p2p-circuit support.
 // DCUtR re-add deferred — relay must be proven first before hole-punch
 // upgrade layer can be re-enabled.
-use libp2p::{gossipsub, kad, mdns, relay, request_response, swarm::NetworkBehaviour};
+use libp2p::{gossipsub, identify, kad, mdns, relay, request_response, swarm::NetworkBehaviour};
+use libp2p::swarm::behaviour::toggle::Toggle;
 
 use crate::message::codec::rpc::{BalanceCodec, LatticeCodec};
 use crate::message::codec::rpc::VerifyCodec;
@@ -47,6 +48,14 @@ pub struct LatticeBehaviour {
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
     /// Phase 6c: relay client for p2p-circuit NAT traversal.
     pub relay_client: relay::client::Behaviour,
+    /// Phase 6c: relay server — when enabled (via Toggle), this node
+    /// accepts and forwards relay circuits for other nodes.  Disabled
+    /// for ordinary nodes that only use the relay client.
+    pub relay_server: Toggle<relay::Behaviour>,
+    /// Identify protocol — enables peers to exchange protocol
+    /// support information.  Required for relay client to discover
+    /// relay-capable peers.
+    pub identify: identify::Behaviour,
 }
 
 impl LatticeBehaviour {
@@ -58,6 +67,8 @@ impl LatticeBehaviour {
         verify_rpc: request_response::Behaviour<VerifyCodec>,
         kademlia: kad::Behaviour<kad::store::MemoryStore>,
         relay_client: relay::client::Behaviour,
+        relay_server: Toggle<relay::Behaviour>,
+        identify: identify::Behaviour,
     ) -> Self {
         Self {
             mdns,
@@ -67,6 +78,8 @@ impl LatticeBehaviour {
             verify_rpc,
             kademlia,
             relay_client,
+            relay_server,
+            identify,
         }
     }
 }
@@ -82,6 +95,12 @@ pub enum LatticeBehaviourEvent {
     Kad(kad::Event),
     /// Phase 6c: relay client events (reservation, circuit establishment).
     RelayClient(relay::client::Event),
+    /// Phase 6c: relay server events — inbound reservation/circuit
+    /// requests from other nodes that this node is relaying for.
+    RelayServer(relay::Event),
+    /// Identify protocol events — enables discovery of relay-capable
+    /// peers and other protocol support information.
+    Identify(identify::Event),
 }
 
 impl From<mdns::Event> for LatticeBehaviourEvent {
@@ -125,6 +144,18 @@ impl From<kad::Event> for LatticeBehaviourEvent {
 impl From<relay::client::Event> for LatticeBehaviourEvent {
     fn from(event: relay::client::Event) -> Self {
         LatticeBehaviourEvent::RelayClient(event)
+    }
+}
+
+impl From<relay::Event> for LatticeBehaviourEvent {
+    fn from(event: relay::Event) -> Self {
+        LatticeBehaviourEvent::RelayServer(event)
+    }
+}
+
+impl From<identify::Event> for LatticeBehaviourEvent {
+    fn from(event: identify::Event) -> Self {
+        LatticeBehaviourEvent::Identify(event)
     }
 }
 

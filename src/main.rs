@@ -126,6 +126,14 @@ struct Cli {
     /// on the lattice/enclave-cert/v1 gossipsub topic.
     #[arg(long)]
     cert_watch_dir: Option<PathBuf>,
+
+    // ── Phase 6c: relay server ───────────────────────────────
+    /// Enable the relay server — this node accepts inbound relay
+    /// reservation and circuit requests from other nodes and
+    /// forwards traffic on their behalf.  Off by default; most
+    /// nodes should only run the relay client, not the server.
+    #[arg(long, default_value_t = false)]
+    relay_server: bool,
 }
 
 #[tokio::main]
@@ -189,6 +197,7 @@ async fn main() -> Result<()> {
         cli.listen_addr,
         cli.external_addr,
         cli.cert_watch_dir,
+        cli.relay_server,
     )?;
 
     info!(

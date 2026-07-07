@@ -6,11 +6,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use libp2p::{
     futures::StreamExt,
-    gossipsub, identity, kad, mdns, noise, relay, request_response,
+    gossipsub, identify, identity, kad, mdns, noise, relay, request_response,
     swarm::SwarmEvent,
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
     multiaddr::Protocol,
 };
+use libp2p::swarm::behaviour::toggle::Toggle;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
@@ -202,6 +203,7 @@ impl LatticeNode {
         listen_addr: String,
         external_addr: Option<String>,
         cert_watch_dir: Option<PathBuf>,
+        relay_server_enabled: bool,
     ) -> Result<Self> {
         let key_path = resolve_identity_path(identity_dir)?;
         let local_key = load_or_generate_identity(&key_path, fresh_identity)?;
@@ -298,6 +300,33 @@ impl LatticeNode {
                 };
                 kademlia.set_mode(Some(kad::Mode::Server));
 
+                // Phase 6c: relay server — when --relay-server is set,
+                // this node accepts and forwards relay circuits for
+                // other nodes.  Most nodes pass None and only run the
+                // relay client side.
+                //
+                // relay::Config::default() ships with resource limits
+                // tuned for general-purpose use (max_reservations,
+                // max_circuits, max_circuit_bytes, max_circuit_duration,
+                // per-peer/per-IP rate limiters).  If the cross-machine
+                // test on macOS/Windows later needs longer-lived circuits
+                // or higher throughput, tune those fields here.
+                let relay_server = if relay_server_enabled {
+                    Toggle::from(Some(relay::Behaviour::new(
+                        key.public().to_peer_id(),
+                        relay::Config::default(),
+                    )))
+                } else {
+                    Toggle::from(None)
+                };
+
+                let identify = identify::Behaviour::new(
+                    identify::Config::new(
+                        "/lattice/identify/v1".to_string(),
+                        key.public(),
+                    ),
+                );
+
                 Ok(LatticeBehaviour::new(
                     mdns,
                     gossipsub,
@@ -306,6 +335,8 @@ impl LatticeNode {
                     verify_rpc,
                     kademlia,
                     relay_client,
+                    relay_server,
+                    identify,
                 ))
             })?
             .with_swarm_config(|c| {
@@ -926,6 +957,69 @@ impl LatticeNode {
                         );
                     }
                     _ => debug!(?event, "Relay client event"),
+                }
+            }
+
+            // ── Phase 6c: relay server events ──────────────────
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::RelayServer(event)) => {
+                match event {
+                    relay::Event::ReservationReqAccepted {
+                        src_peer_id,
+                        renewed,
+                    } => {
+                        info!(
+                            src = %src_peer_id,
+                            renewed,
+                            "RELAY-SERVER: reservation accepted — node is now relaying for this peer"
+                        );
+                    }
+                    relay::Event::CircuitReqAccepted {
+                        src_peer_id,
+                        dst_peer_id,
+                    } => {
+                        info!(
+                            src = %src_peer_id,
+                            dst = %dst_peer_id,
+                            "RELAY-SERVER: circuit accepted — forwarding traffic between peers"
+                        );
+                    }
+                    relay::Event::CircuitReqDenied {
+                        src_peer_id,
+                        dst_peer_id,
+                    } => {
+                        warn!(
+                            src = %src_peer_id,
+                            dst = %dst_peer_id,
+                            "RELAY-SERVER: circuit denied"
+                        );
+                    }
+                    _ => debug!(?event, "Relay server event"),
+                }
+            }
+
+            // ── Identify events ─────────────────────────────
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::Identify(event)) => {
+                match event {
+                    identify::Event::Received { peer_id, info, .. } => {
+                        debug!(
+                            peer = %peer_id,
+                            protocols = ?info.protocols,
+                            "Identify: received peer info"
+                        );
+                        // Log relay support — this is how the relay
+                        // client discovers relay-capable peers.
+                        let supports_relay = info
+                            .protocols
+                            .iter()
+                            .any(|p| p == &libp2p::relay::HOP_PROTOCOL_NAME);
+                        if supports_relay {
+                            info!(
+                                peer = %peer_id,
+                                "Identify: peer supports relay (HOP_PROTOCOL)"
+                            );
+                        }
+                    }
+                    _ => debug!(?event, "Identify event"),
                 }
             }
 

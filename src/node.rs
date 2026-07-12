@@ -26,8 +26,9 @@ use crate::message::types::{
 use crate::message::types::{VerifyRequest, VerifyResponse};
 use crate::network::protocol::{
     LatticeBehaviour, LatticeBehaviourEvent, LATTICE_HEARTBEAT_TOPIC, LATTICE_KAD_PROTOCOL,
-    LATTICE_ENCLAVE_CERT_TOPIC,
+    LATTICE_ENCLAVE_CERT_TOPIC, LATTICE_AGENT_TOPIC,
 };
+use crate::agent::codec::AGENT_STATE_PROTOCOL;
 use crate::state::peers::PeerTable;
 use crate::economics::EconomicEngine;
 use crate::economics::receipts::{RelayReceipt, SignedReceipt, validate_receipt};
@@ -184,6 +185,12 @@ pub struct LatticeNode {
     /// Append-only Blake3 hash-chain ledger for ratified
     /// certificates (State 4: Committed).
     commit_manager: crate::commit::CommitManager,
+
+    // ── Phase 8: agent harness ────────────────────────────────
+    /// File-backed registry of agent tasks and their state.
+    agent_registry: crate::agent::registry::AgentRegistry,
+    /// Whether this node accepts agent task execution.
+    agent_mode: bool,
 }
 
 impl LatticeNode {
@@ -206,6 +213,7 @@ impl LatticeNode {
         external_addr: Option<String>,
         cert_watch_dir: Option<PathBuf>,
         relay_server_enabled: bool,
+        agent_mode: bool,
     ) -> Result<Self> {
         let key_path = resolve_identity_path(identity_dir)?;
         let local_key = load_or_generate_identity(&key_path, fresh_identity)?;
@@ -273,6 +281,14 @@ impl LatticeNode {
                     .subscribe(&cert_topic)
                     .map_err(|e| anyhow::anyhow!("gossipsub cert subscribe: {e}"))?;
 
+                // Phase 8: Subscribe to agent task topic.
+                let agent_topic = gossipsub::IdentTopic::new(
+                    LATTICE_AGENT_TOPIC,
+                );
+                gossipsub
+                    .subscribe(&agent_topic)
+                    .map_err(|e| anyhow::anyhow!("gossipsub agent subscribe: {e}"))?;
+
                 let rpc = request_response::Behaviour::new(
                     [(LatticeProtocol, request_response::ProtocolSupport::Full)],
                     request_response::Config::default(),
@@ -287,6 +303,15 @@ impl LatticeNode {
                 // Storage verification RPC channel (Phase 6).
                 let verify_rpc = request_response::Behaviour::new(
                     [(VerifyProtocol, request_response::ProtocolSupport::Full)],
+                    request_response::Config::default(),
+                );
+
+                // Phase 8: agent state query RPC channel.
+                let agent_rpc = request_response::Behaviour::new(
+                    [(
+                        StreamProtocol::new(AGENT_STATE_PROTOCOL),
+                        request_response::ProtocolSupport::Full,
+                    )],
                     request_response::Config::default(),
                 );
 
@@ -339,6 +364,7 @@ impl LatticeNode {
                     relay_client,
                     relay_server,
                     identify,
+                    agent_rpc,
                 ))
             })?
             .with_swarm_config(|c| {
@@ -387,12 +413,81 @@ impl LatticeNode {
             witness_sigs: HashMap::new(),
             cert_cache: HashMap::new(),
             commit_manager: crate::commit::CommitManager::open(&storage_path),
+            agent_registry: crate::agent::registry::AgentRegistry::open(&storage_path),
+            agent_mode,
         })
     }
 
     /// The node's public peer ID.
     pub fn peer_id(&self) -> &PeerId {
         &self.local_peer_id
+    }
+
+    /// Submit an agent task to the mesh and store it in the local registry.
+    pub fn submit_agent_task(
+        &mut self,
+        task_id: String,
+        model: String,
+        graph_blob: Vec<u8>,
+        deadline_epoch: u64,
+    ) -> Result<()> {
+        let graph_hash: [u8; 32] = blake3::hash(&graph_blob).into();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let msg = crate::message::types::AgentTaskMsg {
+            task_id: task_id.clone(),
+            origin: self.local_peer_id.to_string(),
+            model: model.clone(),
+            harness_version: 1,
+            graph_blob: graph_blob.clone(),
+            graph_hash,
+            deadline_epoch,
+            created_at: now,
+        };
+
+        let record = crate::agent::state::AgentRecord {
+            task: crate::agent::state::AgentTask {
+                task_id: task_id.clone(),
+                origin: self.local_peer_id.to_string(),
+                model,
+                harness_version: 1,
+                graph_blob,
+                graph_hash,
+                deadline_epoch,
+                created_at: now,
+            },
+            assigned_node: self.local_peer_id.to_string(),
+            status: crate::agent::state::AgentStatus::Idle,
+            last_checkpoint: None,
+            updated_at: now,
+        };
+
+        self.agent_registry
+            .register(record)
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let envelope = crate::message::types::LatticeMessage::AgentTask(msg);
+        let bytes = serde_cbor::to_vec(&envelope)?;
+
+        match self.swarm.behaviour_mut().gossipsub.publish(
+            gossipsub::IdentTopic::new(crate::network::protocol::LATTICE_AGENT_TOPIC),
+            bytes,
+        ) {
+            Ok(_id) => {
+                info!(task_id = %task_id, "[agent] Task submitted and broadcast");
+            }
+            Err(gossipsub::PublishError::InsufficientPeers) => {
+                debug!(task_id = %task_id, "[agent] Task stored locally (no peers yet)");
+            }
+            Err(e) => {
+                warn!(error = %e, "[agent] Failed to publish agent task");
+            }
+        }
+
+        Ok(())
     }
 
     /// DEBUG ONLY: inflate self-reported relay metrics for testing
@@ -1026,6 +1121,56 @@ impl LatticeNode {
                 }
             }
 
+            // ── Phase 8: agent state query events ──────────
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::AgentRpc(event)) => {
+                match event {
+                    request_response::Event::Message { peer, message } => {
+                        match message {
+                            request_response::Message::Request {
+                                request, channel, ..
+                            } => {
+                                debug!(
+                                    task_id = %request.task_id,
+                                    from = %peer,
+                                    "[agent] Agent state query received"
+                                );
+                                let record =
+                                    self.agent_registry.get(&request.task_id).cloned();
+                                let reply = crate::agent::state::AgentStateReply { record };
+                                if let Err(e) = self.swarm.behaviour_mut().agent_rpc
+                                    .send_response(channel, reply)
+                                {
+                                    warn!(error = ?e, "[agent] Failed to send agent state response");
+                                }
+                            }
+                            request_response::Message::Response { response, .. } => {
+                                if let Some(record) = &response.record {
+                                    info!(
+                                        task_id = %record.task.task_id,
+                                        status = ?record.status,
+                                        node = %record.assigned_node,
+                                        "[agent] Agent state response"
+                                    );
+                                } else {
+                                    debug!("[agent] Agent state query returned None");
+                                }
+                            }
+                        }
+                    }
+                    request_response::Event::OutboundFailure {
+                        peer, request_id, error,
+                    } => {
+                        warn!(%peer, ?request_id, %error, "[agent] Agent state query failed");
+                    }
+                    request_response::Event::InboundFailure {
+                        peer, request_id, error,
+                    } => {
+                        warn!(%peer, ?request_id, %error, "[agent] Inbound agent state request failed");
+                    }
+                    _ => {}
+                }
+            }
+
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 info!(peer = %peer_id, "Connection established");
                 if !self.mdns_peers.contains(&peer_id) {
@@ -1196,6 +1341,22 @@ impl LatticeNode {
                     Err(e) => {
                         warn!(error = %e, "Invalid transaction rejected");
                     }
+                }
+            }
+            LatticeMessage::AgentTask(msg) => {
+                // Phase 8: dedup guard — skip if already registered.
+                if self.agent_registry.contains(&msg.task_id) {
+                    debug!(
+                        task_id = %msg.task_id,
+                        "[agent] Duplicate agent task received — skipping"
+                    );
+                } else {
+                    info!(
+                        task_id = %msg.task_id,
+                        origin = %msg.origin,
+                        model = %msg.model,
+                        "[agent] Agent task received via gossipsub"
+                    );
                 }
             }
         }
@@ -2261,6 +2422,45 @@ impl LatticeNode {
                     }
                     None => ApiResponse::Error {
                         message: format!("Certificate {} not found", proposal_id),
+                    },
+                }
+            }
+            ApiRequest::AgentSubmit {
+                task_id,
+                model,
+                graph_blob_b64,
+                deadline_epoch,
+            } => {
+                use base64::Engine as _;
+                let graph_blob = match base64::engine::general_purpose::STANDARD
+                    .decode(&graph_blob_b64)
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = msg.reply.send(ApiResponse::AgentError {
+                            task_id,
+                            error: format!("Base64 decode error: {}", e),
+                        });
+                        return;
+                    }
+                };
+                match self.submit_agent_task(task_id.clone(), model, graph_blob, deadline_epoch) {
+                    Ok(_) => {
+                        let hash = blake3::hash(
+                            &self
+                                .agent_registry
+                                .get(&task_id)
+                                .map(|r| r.task.graph_blob.clone())
+                                .unwrap_or_default(),
+                        );
+                        ApiResponse::AgentSubmitted {
+                            task_id,
+                            graph_hash: hex::encode(hash.as_bytes()),
+                        }
+                    }
+                    Err(e) => ApiResponse::AgentError {
+                        task_id,
+                        error: format!("{}", e),
                     },
                 }
             }

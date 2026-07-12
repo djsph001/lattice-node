@@ -5,6 +5,7 @@ use clap::Parser;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod agent;
 mod api;
 mod commit;
 mod economics;
@@ -134,6 +135,12 @@ struct Cli {
     /// nodes should only run the relay client, not the server.
     #[arg(long, default_value_t = false)]
     relay_server: bool,
+
+    // ── Phase 8: agent harness ─────────────────────────────────
+    /// Enable agent mode — this node can accept and execute agent
+    /// tasks from the mesh.
+    #[arg(long, default_value_t = false)]
+    agent_mode: bool,
 }
 
 #[tokio::main]
@@ -198,6 +205,7 @@ async fn main() -> Result<()> {
         cli.external_addr,
         cli.cert_watch_dir,
         cli.relay_server,
+        cli.agent_mode,
     )?;
 
     info!(

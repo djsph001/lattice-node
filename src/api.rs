@@ -30,6 +30,13 @@ pub enum ApiRequest {
     GetBlock { height: u64 },
     GetCertificate { proposal_id: String },
     GetStats,
+    /// Phase 8: Submit an agent task for distributed execution.
+    AgentSubmit {
+        task_id: String,
+        model: String,
+        graph_blob_b64: String,
+        deadline_epoch: u64,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -59,6 +66,14 @@ pub enum ApiResponse {
     },
     Error {
         message: String,
+    },
+    AgentSubmitted {
+        task_id: String,
+        graph_hash: String,
+    },
+    AgentError {
+        task_id: String,
+        error: String,
     },
 }
 

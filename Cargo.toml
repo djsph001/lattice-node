@@ -59,6 +59,7 @@ hex = "0.4"
 prost = "0.13"
 sha2 = "0.10"
 serde_json = "1"
+base64 = "0.22"
 
 [build-dependencies]
 prost-build = "0.13"

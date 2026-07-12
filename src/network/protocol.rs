@@ -8,6 +8,8 @@ use crate::message::codec::rpc::{BalanceCodec, LatticeCodec};
 use crate::message::codec::rpc::VerifyCodec;
 use crate::message::types::{BalanceRequest, BalanceResponse, StatusRequest, StatusResponse};
 use crate::message::types::{VerifyRequest, VerifyResponse};
+use crate::agent::codec::{AgentStateCodec, AGENT_STATE_PROTOCOL};
+use crate::agent::state::{AgentStateQuery, AgentStateReply};
 
 /// The gossipsub topic all Lattice nodes subscribe to for heartbeat
 /// propagation. Versioned so the wire protocol can evolve without
@@ -22,6 +24,9 @@ pub const LATTICE_KAD_PROTOCOL: &str = "/lattice/kad/v1";
 /// Impact Certificates produced by the Python sandbox (tfb:) are
 /// broadcast on this topic after validation by the local node.
 pub const LATTICE_ENCLAVE_CERT_TOPIC: &str = "lattice/enclave-cert/v1";
+
+/// Gossipsub topic for agent task propagation (Phase 8).
+pub const LATTICE_AGENT_TOPIC: &str = "lattice/agent/v1";
 
 /// Composed network behaviour for a Lattice node.
 ///
@@ -56,6 +61,8 @@ pub struct LatticeBehaviour {
     /// support information.  Required for relay client to discover
     /// relay-capable peers.
     pub identify: identify::Behaviour,
+    /// Phase 8: agent state query RPC.
+    pub agent_rpc: request_response::Behaviour<AgentStateCodec>,
 }
 
 impl LatticeBehaviour {
@@ -69,6 +76,7 @@ impl LatticeBehaviour {
         relay_client: relay::client::Behaviour,
         relay_server: Toggle<relay::Behaviour>,
         identify: identify::Behaviour,
+        agent_rpc: request_response::Behaviour<AgentStateCodec>,
     ) -> Self {
         Self {
             mdns,
@@ -80,6 +88,7 @@ impl LatticeBehaviour {
             relay_client,
             relay_server,
             identify,
+            agent_rpc,
         }
     }
 }
@@ -101,6 +110,8 @@ pub enum LatticeBehaviourEvent {
     /// Identify protocol events — enables discovery of relay-capable
     /// peers and other protocol support information.
     Identify(identify::Event),
+    /// Phase 8: agent state query events.
+    AgentRpc(request_response::Event<AgentStateQuery, AgentStateReply>),
 }
 
 impl From<mdns::Event> for LatticeBehaviourEvent {
@@ -156,6 +167,16 @@ impl From<relay::Event> for LatticeBehaviourEvent {
 impl From<identify::Event> for LatticeBehaviourEvent {
     fn from(event: identify::Event) -> Self {
         LatticeBehaviourEvent::Identify(event)
+    }
+}
+
+impl From<request_response::Event<AgentStateQuery, AgentStateReply>>
+    for LatticeBehaviourEvent
+{
+    fn from(
+        event: request_response::Event<AgentStateQuery, AgentStateReply>,
+    ) -> Self {
+        LatticeBehaviourEvent::AgentRpc(event)
     }
 }
 

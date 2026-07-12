@@ -18,6 +18,9 @@ pub enum LatticeMessage {
     /// A signed economic transaction
     Transaction(SignedTransaction),
 
+    /// Phase 8: Agent task submission.
+    AgentTask(AgentTaskMsg),
+
     // === Future phases ===
     // /// Governance proposal or vote
     // Governance(GovernanceAction),
@@ -55,6 +58,20 @@ impl StatusReport {
     pub fn protocol_compatible(&self, other: &StatusReport) -> bool {
         self.protocol_version == other.protocol_version
     }
+}
+
+/// A message carrying an agent task for distributed execution.
+/// Phase 8: broadcast on the lattice/agent/v1 gossipsub topic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentTaskMsg {
+    pub task_id: String,
+    pub origin: String,
+    pub model: String,
+    pub harness_version: u32,
+    pub graph_blob: Vec<u8>,
+    pub graph_hash: [u8; 32],
+    pub deadline_epoch: u64,
+    pub created_at: u64,
 }
 
 /// Direct request for a peer's status, sent over the request-response

@@ -191,6 +191,8 @@ pub struct LatticeNode {
     agent_registry: crate::agent::registry::AgentRegistry,
     /// Whether this node accepts agent task execution.
     agent_mode: bool,
+    /// Peers that advertise agent protocol support (Phase 8b.1 sortition).
+    agent_peers: HashSet<PeerId>,
 }
 
 impl LatticeNode {
@@ -415,6 +417,7 @@ impl LatticeNode {
             commit_manager: crate::commit::CommitManager::open(&storage_path),
             agent_registry: crate::agent::registry::AgentRegistry::open(&storage_path),
             agent_mode,
+            agent_peers: HashSet::new(),
         })
     }
 
@@ -993,6 +996,7 @@ impl LatticeNode {
                     self.peer_table.remove_peer(&peer_id);
                     self.mdns_peers.remove(&peer_id);
                     self.queried_peers.remove(&peer_id);
+                    self.agent_peers.remove(&peer_id);
 
                     // Phase 8b: heartbeat-failure migration —
                     // reassign expired peer's tasks to self.
@@ -1201,6 +1205,20 @@ impl LatticeNode {
                             info!(
                                 peer = %peer_id,
                                 "Identify: peer supports relay (HOP_PROTOCOL)"
+                            );
+                        }
+                        // Phase 8b.1: track agent-capable peers for sortition.
+                        let supports_agent = info
+                            .protocols
+                            .iter()
+                            .any(|p| p == &libp2p::StreamProtocol::new(
+                                crate::agent::codec::AGENT_STATE_PROTOCOL
+                            ));
+                        if supports_agent {
+                            self.agent_peers.insert(peer_id);
+                            debug!(
+                                peer = %peer_id,
+                                "[agent] Peer supports agent protocol — added to sortition pool"
                             );
                         }
                     }
@@ -1438,38 +1456,62 @@ impl LatticeNode {
                         "[agent] Duplicate agent task received — skipping"
                     );
                 } else if self.agent_mode {
-                    // Phase 8b: auto-register received tasks when agent mode is on.
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
+                    // Phase 8b.1: sortition-based executor selection.
+                    // Build candidate pool: agent-capable peers + self, sorted
+                    // for determinism. Use graph_hash as Blake3 seed to pick
+                    // one executor. All nodes compute the same index, so only
+                    // one node registers the task.
+                    let mut pool: Vec<PeerId> = self.agent_peers.iter().cloned().collect();
+                    pool.push(self.local_peer_id);
+                    pool.sort(); // deterministic ordering
+                    pool.dedup();
 
-                    let record = crate::agent::state::AgentRecord {
-                        task: crate::agent::state::AgentTask {
-                            task_id: msg.task_id.clone(),
-                            origin: msg.origin.clone(),
-                            model: msg.model.clone(),
-                            harness_version: msg.harness_version,
-                            graph_blob: msg.graph_blob.clone(),
-                            graph_hash: msg.graph_hash,
-                            deadline_epoch: msg.deadline_epoch,
-                            created_at: msg.created_at,
-                        },
-                        assigned_node: self.local_peer_id.to_string(),
-                        status: crate::agent::state::AgentStatus::Idle,
-                        last_checkpoint: None,
-                        updated_at: now,
-                    };
+                    let hash_bytes = blake3::hash(&msg.graph_hash);
+                    let seed_bytes: [u8; 8] = hash_bytes.as_bytes()[..8].try_into().unwrap();
+                    let index = u64::from_be_bytes(seed_bytes) as usize % pool.len();
+                    let selected = pool[index];
 
-                    info!(
-                        task_id = %msg.task_id,
-                        origin = %msg.origin,
-                        model = %msg.model,
-                        "[agent] Agent task received — auto-registering (agent mode)"
-                    );
+                    if selected == self.local_peer_id {
+                        info!(
+                            task_id = %msg.task_id,
+                            origin = %msg.origin,
+                            model = %msg.model,
+                            pool_size = pool.len(),
+                            "[agent] Selected as executor — registering task"
+                        );
 
-                    if let Err(e) = self.agent_registry.register(record) {
-                        warn!(error = %e, "[agent] Failed to register received task");
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+
+                        let record = crate::agent::state::AgentRecord {
+                            task: crate::agent::state::AgentTask {
+                                task_id: msg.task_id.clone(),
+                                origin: msg.origin.clone(),
+                                model: msg.model.clone(),
+                                harness_version: msg.harness_version,
+                                graph_blob: msg.graph_blob.clone(),
+                                graph_hash: msg.graph_hash,
+                                deadline_epoch: msg.deadline_epoch,
+                                created_at: msg.created_at,
+                            },
+                            assigned_node: self.local_peer_id.to_string(),
+                            status: crate::agent::state::AgentStatus::Idle,
+                            last_checkpoint: None,
+                            updated_at: now,
+                        };
+
+                        if let Err(e) = self.agent_registry.register(record) {
+                            warn!(error = %e, "[agent] Failed to register received task");
+                        }
+                    } else {
+                        debug!(
+                            task_id = %msg.task_id,
+                            selected = %selected,
+                            pool_size = pool.len(),
+                            "[agent] Not selected as executor — skipping"
+                        );
                     }
                 } else {
                     info!(

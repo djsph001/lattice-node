@@ -60,10 +60,15 @@ pub struct NodeMetrics {
     /// Bytes relayed as proven by signed peer receipts.
     /// This is the trustless metric — only incremented when a
     /// receipt from another peer confirms the relay.
+    /// Bytes relayed as proven by signed peer receipts.
     pub verified_bytes_relayed: u64,
-
     /// Messages relayed as proven by signed peer receipts.
     pub verified_messages_relayed: u64,
+
+    // ── Phase 8: agent harness ──────────────────────────
+    /// Number of agent tasks this node is actively executing.
+    /// Compute contribution — running models for the mesh.
+    pub agent_tasks_active: u64,
 }
 
 impl NodeMetrics {
@@ -80,6 +85,7 @@ impl NodeMetrics {
             transactions_submitted: 0,
             verified_bytes_relayed: 0,
             verified_messages_relayed: 0,
+            agent_tasks_active: 0,
         }
     }
 
@@ -98,7 +104,8 @@ impl NodeMetrics {
     /// contribute.
     pub fn contribution_ratio(&self) -> f64 {
         let contributions =
-            self.bytes_relayed + self.messages_propagated + self.dht_records_stored;
+            self.bytes_relayed + self.messages_propagated + self.dht_records_stored
+            + self.agent_tasks_active;
         let consumption = self.bytes_consumed + self.queries_issued;
 
         // Fresh node — neutral ratio, not punitive.

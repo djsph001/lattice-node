@@ -735,6 +735,17 @@ impl LatticeNode {
         // Sync heartbeats_sent from node into metrics.
         self.economic_engine.metrics.heartbeats_sent = self.heartbeats_sent;
 
+        // Phase 8b: sync agent task count into contribution metrics.
+        let active_tasks = self
+            .agent_registry
+            .all()
+            .filter(|r| {
+                !matches!(r.status, crate::agent::state::AgentStatus::Completed)
+                    && !matches!(r.status, crate::agent::state::AgentStatus::Failed { .. })
+            })
+            .count() as u64;
+        self.economic_engine.metrics.agent_tasks_active = active_tasks;
+
         let new_balance = self.ledger.balance_of(&self.local_peer_id);
         let ratio = self.economic_engine.metrics.contribution_ratio();
         info!(
@@ -751,8 +762,44 @@ impl LatticeNode {
         // Phase 6c: Safe Gate — check for timed-out challenges.
         // If a challenge to a firewalled target timed out but we
         // hold an IngressReceipt from the Relay, freeze the target's
-        // health and penalize the Relay instead.
+        // Phase 6c: Safe Gate — check for timed-out challenges.
         self.apply_safe_gate(epoch);
+
+        // Phase 8b: deadline monitor — expire tasks past their deadline.
+        self.expire_agent_tasks(epoch);
+    }
+
+    /// Phase 8b: Mark agent tasks as Failed if past deadline_epoch.
+    fn expire_agent_tasks(&mut self, current_epoch: u64) {
+        let expired: Vec<String> = self
+            .agent_registry
+            .all()
+            .filter(|r| {
+                r.task.deadline_epoch <= current_epoch
+                    && !matches!(r.status, crate::agent::state::AgentStatus::Completed)
+                    && !matches!(r.status, crate::agent::state::AgentStatus::Failed { .. })
+            })
+            .map(|r| r.task.task_id.clone())
+            .collect();
+
+        for task_id in &expired {
+            if let Err(e) = self.agent_registry.update_status(
+                task_id,
+                crate::agent::state::AgentStatus::Failed {
+                    step: 0,
+                    reason: format!("Deadline epoch {} reached", current_epoch),
+                },
+                None,
+            ) {
+                warn!(task_id = %task_id, error = %e, "[agent] Failed to expire task");
+            } else {
+                info!(task_id = %task_id, epoch = current_epoch, "[agent] Task expired");
+            }
+        }
+
+        if !expired.is_empty() {
+            info!(count = expired.len(), "[agent] Expired {} tasks", expired.len());
+        }
     }
 
     /// Mint units to the local node (test bootstrapping only).
@@ -946,6 +993,46 @@ impl LatticeNode {
                     self.peer_table.remove_peer(&peer_id);
                     self.mdns_peers.remove(&peer_id);
                     self.queried_peers.remove(&peer_id);
+
+                    // Phase 8b: heartbeat-failure migration —
+                    // reassign expired peer's tasks to self.
+                    let peer_str = peer_id.to_string();
+                    let orphaned: Vec<String> = self
+                        .agent_registry
+                        .tasks_for_node(&peer_str)
+                        .iter()
+                        .filter(|r| {
+                            !matches!(r.status, crate::agent::state::AgentStatus::Completed)
+                                && !matches!(r.status, crate::agent::state::AgentStatus::Failed { .. })
+                        })
+                        .map(|r| r.task.task_id.clone())
+                        .collect();
+
+                    for task_id in &orphaned {
+                        let self_str = self.local_peer_id.to_string();
+                        match self.agent_registry.reassign(task_id, &self_str) {
+                            Ok(()) => info!(
+                                task_id = %task_id,
+                                from = %peer_str,
+                                to = %self_str,
+                                "[agent] Task migrated from expired peer"
+                            ),
+                            Err(e) => warn!(
+                                task_id = %task_id,
+                                error = %e,
+                                "[agent] Failed to migrate task"
+                            ),
+                        }
+                    }
+
+                    if !orphaned.is_empty() {
+                        info!(
+                            count = orphaned.len(),
+                            peer = %peer_str,
+                            "[agent] Migrated {} tasks from expired peer",
+                            orphaned.len()
+                        );
+                    }
                 }
             }
 
@@ -1350,6 +1437,40 @@ impl LatticeNode {
                         task_id = %msg.task_id,
                         "[agent] Duplicate agent task received — skipping"
                     );
+                } else if self.agent_mode {
+                    // Phase 8b: auto-register received tasks when agent mode is on.
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+
+                    let record = crate::agent::state::AgentRecord {
+                        task: crate::agent::state::AgentTask {
+                            task_id: msg.task_id.clone(),
+                            origin: msg.origin.clone(),
+                            model: msg.model.clone(),
+                            harness_version: msg.harness_version,
+                            graph_blob: msg.graph_blob.clone(),
+                            graph_hash: msg.graph_hash,
+                            deadline_epoch: msg.deadline_epoch,
+                            created_at: msg.created_at,
+                        },
+                        assigned_node: self.local_peer_id.to_string(),
+                        status: crate::agent::state::AgentStatus::Idle,
+                        last_checkpoint: None,
+                        updated_at: now,
+                    };
+
+                    info!(
+                        task_id = %msg.task_id,
+                        origin = %msg.origin,
+                        model = %msg.model,
+                        "[agent] Agent task received — auto-registering (agent mode)"
+                    );
+
+                    if let Err(e) = self.agent_registry.register(record) {
+                        warn!(error = %e, "[agent] Failed to register received task");
+                    }
                 } else {
                     info!(
                         task_id = %msg.task_id,

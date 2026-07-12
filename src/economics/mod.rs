@@ -90,6 +90,7 @@ impl EconomicEngine {
                 - self.epoch_metrics.transactions_submitted,
             verified_bytes_relayed: 0,
             verified_messages_relayed: 0,
+            agent_tasks_active: self.metrics.agent_tasks_active,
         };
 
         tracing::debug!(

@@ -26,10 +26,12 @@
 
 pub mod checkpoint;
 pub mod codec;
+pub mod executor;
 pub mod registry;
 pub mod state;
 
 pub use checkpoint::Checkpoint;
 pub use codec::{AgentStateCodec, AGENT_STATE_PROTOCOL};
+pub use executor::OllamaExecutor;
 pub use registry::AgentRegistry;
 pub use state::{AgentRecord, AgentStateQuery, AgentStateReply, AgentStatus, AgentTask};

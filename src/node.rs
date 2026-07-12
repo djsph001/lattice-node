@@ -72,6 +72,18 @@ enum InternalBridgeEvent {
     },
 }
 
+// ── Phase 9: execution result channel ──────────────────
+
+/// Result of an Ollama execution, sent from a background tokio task
+/// back to the main event loop for registry update.
+struct ExecutionResult {
+    task_id: String,
+    success: bool,
+    checkpoint: Option<crate::agent::checkpoint::Checkpoint>,
+    error: Option<String>,
+    epoch: u64,
+}
+
 /// A sovereign node in the Lattice mesh.
 pub struct LatticeNode {
     swarm: libp2p::Swarm<LatticeBehaviour>,
@@ -193,6 +205,10 @@ pub struct LatticeNode {
     agent_mode: bool,
     /// Peers that advertise agent protocol support (Phase 8b.1 sortition).
     agent_peers: HashSet<PeerId>,
+    /// Phase 9: model execution bridge (Ollama).
+    executor: crate::agent::executor::OllamaExecutor,
+    /// Phase 9: channel sender for background execution results.
+    exec_tx: Option<tokio::sync::mpsc::Sender<ExecutionResult>>,
 }
 
 impl LatticeNode {
@@ -418,6 +434,8 @@ impl LatticeNode {
             agent_registry: crate::agent::registry::AgentRegistry::open(&storage_path),
             agent_mode,
             agent_peers: HashSet::new(),
+            executor: crate::agent::executor::OllamaExecutor::new(),
+            exec_tx: None,
         })
     }
 
@@ -487,6 +505,47 @@ impl LatticeNode {
             }
             Err(e) => {
                 warn!(error = %e, "[agent] Failed to publish agent task");
+            }
+        }
+
+        // Phase 9: if agent_mode is on, trigger execution locally.
+        // Gossipsub doesn't loop back, so local submissions must
+        // spawn execution directly.
+        if self.agent_mode {
+            if let Some(ref tx) = self.exec_tx {
+                let tid = task_id.clone();
+                let blob = self.agent_registry
+                    .get(&task_id)
+                    .map(|r| r.task.graph_blob.clone())
+                    .unwrap_or_default();
+                let hash = graph_hash;
+                let exec_client = crate::agent::executor::OllamaExecutor::new();
+                let ttx = tx.clone();
+                let epoch = self.economic_engine.epoch_count();
+
+                tokio::spawn(async move {
+                    match exec_client.execute(&tid, &blob, &hash).await {
+                        Ok(checkpoint) => {
+                            let _ = ttx.send(ExecutionResult {
+                                task_id: tid,
+                                success: true,
+                                checkpoint: Some(checkpoint),
+                                error: None,
+                                epoch,
+                            }).await;
+                        }
+                        Err(e) => {
+                            warn!(task_id = %tid, error = %e, "[executor] Local execution failed");
+                            let _ = ttx.send(ExecutionResult {
+                                task_id: tid,
+                                success: false,
+                                checkpoint: None,
+                                error: Some(e.to_string()),
+                                epoch,
+                            }).await;
+                        }
+                    }
+                });
             }
         }
 
@@ -607,6 +666,13 @@ impl LatticeNode {
             crate::ingest::spawn_cert_watcher(watch_dir.clone(), cert_tx);
         }
 
+        // Phase 9: execution result channel.
+        // Background Ollama tasks drop results here; the main loop
+        // picks them up and updates the agent registry.
+        let (exec_tx, mut exec_rx) =
+            tokio::sync::mpsc::channel::<ExecutionResult>(32);
+        self.exec_tx = Some(exec_tx.clone());
+
         // Phase 7: API server — Unix Domain Socket for local queries
         let api_socket = self.storage_dir.join("lattice.sock");
         let mut api_rx = crate::api::spawn_api_server(api_socket);
@@ -641,6 +707,42 @@ impl LatticeNode {
                 Some(api_msg) = api_rx.recv() => {
                     self.handle_api_message(api_msg);
                 }
+                Some(exec_result) = exec_rx.recv() => {
+                    self.handle_execution_result(exec_result);
+                }
+            }
+        }
+    }
+
+    /// Phase 9: handle an execution result from a background Ollama task.
+    fn handle_execution_result(&mut self, result: ExecutionResult) {
+        if result.success {
+            if let Some(ref checkpoint) = result.checkpoint {
+                info!(
+                    task_id = %result.task_id,
+                    response_len = checkpoint.state_blob.len(),
+                    "[executor] Task completed — updating registry"
+                );
+                if let Err(e) = self.agent_registry.update_status(
+                    &result.task_id,
+                    crate::agent::state::AgentStatus::Completed,
+                    Some(checkpoint.clone()),
+                ) {
+                    warn!(task_id = %result.task_id, error = %e, "[executor] Failed to update status");
+                }
+            }
+        } else {
+            let reason = result.error.unwrap_or_else(|| "Unknown error".to_string());
+            warn!(task_id = %result.task_id, reason = %reason, "[executor] Task failed");
+            if let Err(e) = self.agent_registry.update_status(
+                &result.task_id,
+                crate::agent::state::AgentStatus::Failed {
+                    step: 0,
+                    reason,
+                },
+                None,
+            ) {
+                warn!(task_id = %result.task_id, error = %e, "[executor] Failed to update status");
             }
         }
     }
@@ -1505,6 +1607,38 @@ impl LatticeNode {
                         if let Err(e) = self.agent_registry.register(record) {
                             warn!(error = %e, "[agent] Failed to register received task");
                         }
+
+                        // Phase 9: spawn model execution via Ollama.
+                        let task_id = msg.task_id.clone();
+                        let graph_blob = msg.graph_blob.clone();
+                        let graph_hash = msg.graph_hash;
+                        let exec_client = crate::agent::executor::OllamaExecutor::new();
+                        let tx = self.exec_tx.clone().expect("exec_tx not set");
+                        let epoch = self.economic_engine.epoch_count();
+
+                        tokio::spawn(async move {
+                            match exec_client.execute(&task_id, &graph_blob, &graph_hash).await {
+                                Ok(checkpoint) => {
+                                    let _ = tx.send(ExecutionResult {
+                                        task_id,
+                                        success: true,
+                                        checkpoint: Some(checkpoint),
+                                        error: None,
+                                        epoch,
+                                    }).await;
+                                }
+                                Err(e) => {
+                                    warn!(task_id = %task_id, error = %e, "[executor] Execution failed");
+                                    let _ = tx.send(ExecutionResult {
+                                        task_id,
+                                        success: false,
+                                        checkpoint: None,
+                                        error: Some(e.to_string()),
+                                        epoch,
+                                    }).await;
+                                }
+                            }
+                        });
                     } else {
                         debug!(
                             task_id = %msg.task_id,

@@ -1,38 +1,26 @@
-// Phase 9 — Model Execution Bridge
+// Phase 9b — Streaming Model Execution Bridge
 //
-// The OllamaExecutor bridges the lattice's sortition-based task selection
-// with actual model inference. When a node is selected as executor for
-// an AgentTask, the executor:
+// Upgraded from single-response blocking to NDJSON token streaming.
+// Ollama sends newline-delimited JSON chunks like:
+//   {"model":"llama3.2","created_at":"...","response":"He","done":false}
+//   {"model":"llama3.2","created_at":"...","response":"llo","done":false}
+//   ...
+//   {"model":"llama3.2","created_at":"...","response":"","done":true,"total_duration":...}
 //
-// 1. Parses the task's graph_blob as a JSON execution request
-// 2. POSTs to the local Ollama API (http://localhost:11434/api/generate)
-// 3. Stores the response as a Blake3-verified Checkpoint
-// 4. Returns the checkpoint for registry update
-//
-// Graph blob format (JSON):
-// {
-//   "prompt": "What is the capital of France?",
-//   "model": "llama3.2:3b",
-//   "params": {
-//     "temperature": 0.7,
-//     "max_tokens": 100
-//   }
-// }
+// The executor accumulates tokens into a complete response, then
+// builds a single Blake3-verified Checkpoint at stream end.
 
 use std::time::Duration;
 
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use super::checkpoint::Checkpoint;
 
-/// Default Ollama API endpoint.
 const DEFAULT_OLLAMA_ENDPOINT: &str = "http://localhost:11434/api/generate";
-
-/// Default request timeout (5 minutes — covers cold model loads).
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
-/// The parsed execution request extracted from a task's graph_blob.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionRequest {
     pub prompt: String,
@@ -54,7 +42,6 @@ pub struct ExecutionParams {
     pub max_tokens: Option<u32>,
 }
 
-/// Errors that can occur during model execution.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutorError {
     #[error("Invalid graph blob: {0}")]
@@ -69,14 +56,12 @@ pub enum ExecutorError {
     NotReachable(String),
 }
 
-/// Executes agent tasks by calling a local Ollama instance.
 pub struct OllamaExecutor {
     client: reqwest::Client,
     endpoint: String,
 }
 
 impl OllamaExecutor {
-    /// Create a new executor with default settings.
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
@@ -89,17 +74,17 @@ impl OllamaExecutor {
         }
     }
 
-    /// Execute a task by sending its prompt to Ollama.
+    /// Execute a task by streaming tokens from Ollama.
     ///
-    /// Parses `graph_blob` as JSON, POSTs to the Ollama generate endpoint,
-    /// and returns a Checkpoint containing the model's response.
+    /// Uses `stream: true` and processes NDJSON chunks as they arrive.
+    /// Tokens are accumulated into a single response, then sealed into
+    /// a Blake3-verified Checkpoint at stream end.
     pub async fn execute(
         &self,
         task_id: &str,
         graph_blob: &[u8],
         graph_hash: &[u8; 32],
     ) -> Result<Checkpoint, ExecutorError> {
-        // Parse the execution request from the graph blob
         let req: ExecutionRequest = serde_json::from_slice(graph_blob)
             .map_err(|e| ExecutorError::InvalidBlob(format!("JSON parse: {}", e)))?;
 
@@ -107,21 +92,19 @@ impl OllamaExecutor {
             task_id = %task_id,
             model = %req.model,
             prompt_len = req.prompt.len(),
-            "[executor] Sending request to Ollama"
+            "[executor] Streaming request to Ollama"
         );
 
-        // Build the Ollama generate request body
         let body = serde_json::json!({
             "model": req.model,
             "prompt": req.prompt,
-            "stream": false,
+            "stream": true,
             "options": {
                 "temperature": req.params.temperature.unwrap_or(0.7),
-                "num_predict": req.params.max_tokens.unwrap_or(100),
+                "num_predict": req.params.max_tokens.unwrap_or(200),
             }
         });
 
-        // POST to Ollama
         let response = match self.client
             .post(&self.endpoint)
             .json(&body)
@@ -140,25 +123,53 @@ impl OllamaExecutor {
             }
         };
 
-        // Parse the Ollama response
-        let ollama_resp: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| ExecutorError::OllamaError(format!("Response parse: {}", e)))?;
+        // Stream NDJSON chunks
+        let mut stream = response.bytes_stream();
+        let mut complete_response = String::new();
+        let mut token_count = 0u64;
 
-        // Check for Ollama error
-        if let Some(error) = ollama_resp.get("error") {
-            return Err(ExecutorError::OllamaResponse(error.to_string()));
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.map_err(|e| ExecutorError::OllamaError(e.to_string()))?;
+            let text = String::from_utf8_lossy(&chunk);
+
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+
+                match serde_json::from_str::<serde_json::Value>(line) {
+                    Ok(parsed) => {
+                        // Check for error
+                        if let Some(error) = parsed.get("error") {
+                            return Err(ExecutorError::OllamaResponse(error.to_string()));
+                        }
+
+                        // Collect token
+                        if let Some(token) = parsed.get("response").and_then(|v| v.as_str()) {
+                            complete_response.push_str(token);
+                            token_count += 1;
+                        }
+
+                        // Done signal
+                        if parsed.get("done").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            debug!(
+                                task_id = %task_id,
+                                tokens = token_count,
+                                total_len = complete_response.len(),
+                                "[executor] Stream complete"
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        // Skip malformed lines gracefully
+                        debug!(task_id = %task_id, line = %line, "[executor] Skipping malformed NDJSON line");
+                    }
+                }
+            }
         }
 
-        // Extract the generated text
-        let response_text = ollama_resp
-            .get("response")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let state_blob = response_text.into_bytes();
+        let state_blob = complete_response.into_bytes();
         let state_hash = Checkpoint::compute_state_hash(&state_blob);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -167,8 +178,9 @@ impl OllamaExecutor {
 
         info!(
             task_id = %task_id,
+            tokens = token_count,
             response_len = state_blob.len(),
-            "[executor] Ollama response received"
+            "[executor] Streamed response complete"
         );
 
         Ok(Checkpoint {
@@ -177,7 +189,7 @@ impl OllamaExecutor {
             step_index: 0,
             state_blob,
             state_hash,
-            epoch: 0, // set by caller
+            epoch: 0,
             timestamp: now,
         })
     }

@@ -62,7 +62,8 @@ serde_json = "1"
 base64 = "0.22"
 
 # HTTP client (Phase 9: Ollama execution bridge)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+futures = "0.3"
 
 [build-dependencies]
 prost-build = "0.13"

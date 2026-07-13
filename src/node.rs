@@ -209,6 +209,10 @@ pub struct LatticeNode {
     agent_peers: HashMap<PeerId, ModelSize>,
     /// This node's maximum model capability (Phase 10a).
     max_model_size: ModelSize,
+    /// Disable economic participation — minting, witness panels, and
+    /// ledger mutations are gated. The node still relays gossip traffic
+    /// (Phase 10b: public relay safety).
+    no_economics: bool,
     /// Phase 9: model execution bridge (Ollama).
     executor: crate::agent::executor::OllamaExecutor,
     /// Phase 9: channel sender for background execution results.
@@ -237,6 +241,7 @@ impl LatticeNode {
         relay_server_enabled: bool,
         agent_mode: bool,
         max_model_size: ModelSize,
+        no_economics: bool,
     ) -> Result<Self> {
         let key_path = resolve_identity_path(identity_dir)?;
         let local_key = load_or_generate_identity(&key_path, fresh_identity)?;
@@ -440,6 +445,7 @@ impl LatticeNode {
             agent_mode,
             agent_peers: HashMap::new(),
             max_model_size,
+            no_economics,
             executor: crate::agent::executor::OllamaExecutor::new(),
             exec_tx: None,
         })
@@ -758,6 +764,11 @@ impl LatticeNode {
 
     /// Run one economic epoch: measure contribution, mint reward, tax & redistribute.
     async fn run_economic_epoch(&mut self) {
+        // Phase 10b: public relay safety — don't mint or participate
+        // in economic cycles when running as a pure relay.
+        if self.no_economics {
+            return;
+        }
         let self_balance = self.ledger.balance_of(&self.local_peer_id);
         let epoch = self.economic_engine.epoch_count() + 1;
 
@@ -1541,22 +1552,28 @@ impl LatticeNode {
                 );
                 // We're relaying this economic traffic for the sender.
                 self.economic_engine.metrics.record_transaction_relayed();
-                match validation::validate_and_apply(
-                    &signed,
-                    &mut self.ledger,
-                    &mut self.seen_nonces,
-                ) {
-                    Ok(()) => {
-                        let signer: PeerId = signed.transaction.signer().parse().unwrap();
-                        let balance = self.ledger.balance_of(&signer);
-                        info!(
-                            signer = %signer,
-                            balance = %balance,
-                            "Transaction applied to local ledger"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Invalid transaction rejected");
+                // Phase 10b: public relays propagate transactions but don't
+                // endorse them — relay the gossip, skip ledger mutation.
+                if self.no_economics {
+                    debug!("[relay] Forwarding transaction without applying — no_economics mode");
+                } else {
+                    match validation::validate_and_apply(
+                        &signed,
+                        &mut self.ledger,
+                        &mut self.seen_nonces,
+                    ) {
+                        Ok(()) => {
+                            let signer: PeerId = signed.transaction.signer().parse().unwrap();
+                            let balance = self.ledger.balance_of(&signer);
+                            info!(
+                                signer = %signer,
+                                balance = %balance,
+                                "Transaction applied to local ledger"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Transaction validation failed");
+                        }
                     }
                 }
             }
@@ -2442,6 +2459,11 @@ impl LatticeNode {
     /// and the cert-receive path (gossipsub inbound). Every node
     /// deterministically computes the same panel.
     fn run_witness_sortition(&mut self, cert: &crate::ingest::proto::ImpactCertificate) {
+        // Phase 10b: public relays don't participate in governance.
+        if self.no_economics {
+            debug!("[sortition] Skipping witness sortition — no_economics mode");
+            return;
+        }
         let peer_pool: Vec<PeerId> = self
             .peer_table
             .iter()

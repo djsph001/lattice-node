@@ -148,6 +148,13 @@ struct Cli {
     /// One of: tiny (3B-class), small (8B-class), medium (30B-class), large (70B+).
     #[arg(long, default_value = "small")]
     max_model_size: String,
+
+    // ── Phase 10b: public relay safety ─────────────────────────
+    /// Disable economic participation — no minting, no witness
+    /// panels, no ledger mutations. The node still relays gossip.
+    /// Automatically set when --relay-server is active.
+    #[arg(long, default_value_t = false)]
+    no_economics: bool,
 }
 
 #[tokio::main]
@@ -199,6 +206,8 @@ async fn main() -> Result<()> {
         "large" => ModelSize::Large,
         other => anyhow::bail!("Unknown model size: {}. Use tiny|small|medium|large", other),
     };
+    // Phase 10b: public relays are pure infrastructure — no economic participation.
+    let no_economics = cli.no_economics || cli.relay_server;
 
     let mut node = LatticeNode::new(
         cli.port,
@@ -220,6 +229,7 @@ async fn main() -> Result<()> {
         cli.relay_server,
         cli.agent_mode,
         model_size,
+        no_economics,
     )?;
 
     info!(

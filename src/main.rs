@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::Parser;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+use crate::agent::ModelSize;
 
 mod agent;
 mod api;
@@ -141,6 +142,12 @@ struct Cli {
     /// tasks from the mesh.
     #[arg(long, default_value_t = false)]
     agent_mode: bool,
+
+    // ── Phase 10a: resource-aware sortition ────────────────────
+    /// Maximum model size this node can execute.
+    /// One of: tiny (3B-class), small (8B-class), medium (30B-class), large (70B+).
+    #[arg(long, default_value = "small")]
+    max_model_size: String,
 }
 
 #[tokio::main]
@@ -185,8 +192,14 @@ async fn main() -> Result<()> {
             None
         }
     });
+    let model_size = match cli.max_model_size.to_lowercase().as_str() {
+        "tiny" => ModelSize::Tiny,
+        "small" => ModelSize::Small,
+        "medium" => ModelSize::Medium,
+        "large" => ModelSize::Large,
+        other => anyhow::bail!("Unknown model size: {}. Use tiny|small|medium|large", other),
+    };
 
-    // Bootstrap the node
     let mut node = LatticeNode::new(
         cli.port,
         cli.name,
@@ -206,6 +219,7 @@ async fn main() -> Result<()> {
         cli.cert_watch_dir,
         cli.relay_server,
         cli.agent_mode,
+        model_size,
     )?;
 
     info!(

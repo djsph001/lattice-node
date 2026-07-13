@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::agent::state::ModelSize;
 use crate::ledger::types::SignedTransaction;
 
 /// Top-level message envelope for all Lattice protocol messages.
@@ -46,6 +47,8 @@ pub struct StatusReport {
     pub peer_id: String,
     pub timestamp: DateTime<Utc>,
     pub peer_count: usize,
+    /// Maximum model size this node can execute (Phase 10a: sortition filtering).
+    pub max_model_size: ModelSize,
     /// Uptime in seconds since node start
     pub uptime_secs: u64,
     /// Software version
@@ -67,6 +70,7 @@ pub struct AgentTaskMsg {
     pub task_id: String,
     pub origin: String,
     pub model: String,
+    pub model_size: ModelSize,
     pub harness_version: u32,
     pub graph_blob: Vec<u8>,
     pub graph_hash: [u8; 32],
@@ -113,6 +117,8 @@ pub struct StatusResponse {
     pub timestamp: DateTime<Utc>,
     /// Number of peers the responder currently sees.
     pub peer_count: usize,
+    /// Maximum model size this node can execute (Phase 10a).
+    pub max_model_size: ModelSize,
     /// Uptime in seconds since the responder started.
     pub uptime_secs: u64,
     /// Total heartbeats this node has broadcast.

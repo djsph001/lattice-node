@@ -15,6 +15,7 @@ use libp2p::swarm::behaviour::toggle::Toggle;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
+use crate::agent::ModelSize;
 use crate::ledger::state::LedgerState;
 use crate::ledger::types::{DigitalUtilityUnit, SignedTransaction, Transaction};
 use crate::ledger::validation;
@@ -203,8 +204,11 @@ pub struct LatticeNode {
     agent_registry: crate::agent::registry::AgentRegistry,
     /// Whether this node accepts agent task execution.
     agent_mode: bool,
-    /// Peers that advertise agent protocol support (Phase 8b.1 sortition).
-    agent_peers: HashSet<PeerId>,
+    /// Peers that advertise agent protocol support, mapped to their
+    /// max model capability (Phase 8b.1 sortition + Phase 10a filtering).
+    agent_peers: HashMap<PeerId, ModelSize>,
+    /// This node's maximum model capability (Phase 10a).
+    max_model_size: ModelSize,
     /// Phase 9: model execution bridge (Ollama).
     executor: crate::agent::executor::OllamaExecutor,
     /// Phase 9: channel sender for background execution results.
@@ -232,6 +236,7 @@ impl LatticeNode {
         cert_watch_dir: Option<PathBuf>,
         relay_server_enabled: bool,
         agent_mode: bool,
+        max_model_size: ModelSize,
     ) -> Result<Self> {
         let key_path = resolve_identity_path(identity_dir)?;
         let local_key = load_or_generate_identity(&key_path, fresh_identity)?;
@@ -433,7 +438,8 @@ impl LatticeNode {
             commit_manager: crate::commit::CommitManager::open(&storage_path),
             agent_registry: crate::agent::registry::AgentRegistry::open(&storage_path),
             agent_mode,
-            agent_peers: HashSet::new(),
+            agent_peers: HashMap::new(),
+            max_model_size,
             executor: crate::agent::executor::OllamaExecutor::new(),
             exec_tx: None,
         })
@@ -449,6 +455,7 @@ impl LatticeNode {
         &mut self,
         task_id: String,
         model: String,
+        model_size: ModelSize,
         graph_blob: Vec<u8>,
         deadline_epoch: u64,
     ) -> Result<()> {
@@ -462,6 +469,7 @@ impl LatticeNode {
             task_id: task_id.clone(),
             origin: self.local_peer_id.to_string(),
             model: model.clone(),
+            model_size,
             harness_version: 1,
             graph_blob: graph_blob.clone(),
             graph_hash,
@@ -474,6 +482,7 @@ impl LatticeNode {
                 task_id: task_id.clone(),
                 origin: self.local_peer_id.to_string(),
                 model,
+                model_size,
                 harness_version: 1,
                 graph_blob,
                 graph_hash,
@@ -1317,7 +1326,8 @@ impl LatticeNode {
                                 crate::agent::codec::AGENT_STATE_PROTOCOL
                             ));
                         if supports_agent {
-                            self.agent_peers.insert(peer_id);
+                            // Phase 10a: initially assume Tiny until StatusResponse provides actual capability.
+                            self.agent_peers.entry(peer_id).or_insert(ModelSize::Tiny);
                             debug!(
                                 peer = %peer_id,
                                 "[agent] Peer supports agent protocol — added to sortition pool"
@@ -1558,15 +1568,32 @@ impl LatticeNode {
                         "[agent] Duplicate agent task received — skipping"
                     );
                 } else if self.agent_mode {
-                    // Phase 8b.1: sortition-based executor selection.
-                    // Build candidate pool: agent-capable peers + self, sorted
-                    // for determinism. Use graph_hash as Blake3 seed to pick
-                    // one executor. All nodes compute the same index, so only
-                    // one node registers the task.
-                    let mut pool: Vec<PeerId> = self.agent_peers.iter().cloned().collect();
-                    pool.push(self.local_peer_id);
+                    // Phase 8b.1 + Phase 10a: resource-aware sortition.
+                    // Filter pool to nodes that can handle this task's model size,
+                    // then select deterministically via Blake3. All nodes compute
+                    // the same result because both task.model_size and peer
+                    // capabilities arrive via gossipsub/status — same data everywhere.
+                    let mut pool: Vec<PeerId> = self
+                        .agent_peers
+                        .iter()
+                        .filter(|(_, cap)| **cap >= msg.model_size)
+                        .map(|(id, _)| *id)
+                        .collect();
+                    // Include self only if capable
+                    if self.max_model_size >= msg.model_size {
+                        pool.push(self.local_peer_id);
+                    }
                     pool.sort(); // deterministic ordering
                     pool.dedup();
+
+                    if pool.is_empty() {
+                        warn!(
+                            task_id = %msg.task_id,
+                            required = ?msg.model_size,
+                            "[agent] No capable nodes in pool — task dropped"
+                        );
+                        return;
+                    }
 
                     let hash_bytes = blake3::hash(&msg.graph_hash);
                     let seed_bytes: [u8; 8] = hash_bytes.as_bytes()[..8].try_into().unwrap();
@@ -1592,6 +1619,7 @@ impl LatticeNode {
                                 task_id: msg.task_id.clone(),
                                 origin: msg.origin.clone(),
                                 model: msg.model.clone(),
+                                model_size: msg.model_size,
                                 harness_version: msg.harness_version,
                                 graph_blob: msg.graph_blob.clone(),
                                 graph_hash: msg.graph_hash,
@@ -1759,6 +1787,11 @@ impl LatticeNode {
                     info!(peer = %peer, from = %response.node_name, "Inserting peer from RPC");
                     self.peer_table.insert_peer(peer);
                 }
+                // Phase 10a: update peer's max model capability from status response.
+                self.agent_peers
+                    .entry(peer)
+                    .and_modify(|cap| *cap = response.max_model_size)
+                    .or_insert(response.max_model_size);
                 info!(
                     from = %response.node_name,
                     peer = %peer,
@@ -1853,6 +1886,7 @@ impl LatticeNode {
             peer_id: self.local_peer_id.to_string(),
             timestamp: chrono::Utc::now(),
             peer_count: self.peer_table.len(),
+            max_model_size: self.max_model_size,
             uptime_secs: self.start_time.elapsed().as_secs(),
             heartbeats_sent: self.heartbeats_sent,
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2725,6 +2759,7 @@ impl LatticeNode {
             ApiRequest::AgentSubmit {
                 task_id,
                 model,
+                model_size,
                 graph_blob_b64,
                 deadline_epoch,
             } => {
@@ -2741,7 +2776,20 @@ impl LatticeNode {
                         return;
                     }
                 };
-                match self.submit_agent_task(task_id.clone(), model, graph_blob, deadline_epoch) {
+                let ms = match model_size.to_lowercase().as_str() {
+                    "tiny" => ModelSize::Tiny,
+                    "small" => ModelSize::Small,
+                    "medium" => ModelSize::Medium,
+                    "large" => ModelSize::Large,
+                    other => {
+                        let _ = msg.reply.send(ApiResponse::AgentError {
+                            task_id,
+                            error: format!("Unknown model_size: {}. Use tiny|small|medium|large", other),
+                        });
+                        return;
+                    }
+                };
+                match self.submit_agent_task(task_id.clone(), model, ms, graph_blob, deadline_epoch) {
                     Ok(_) => {
                         let hash = blake3::hash(
                             &self

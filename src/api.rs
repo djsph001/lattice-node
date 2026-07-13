@@ -34,6 +34,7 @@ pub enum ApiRequest {
     AgentSubmit {
         task_id: String,
         model: String,
+        model_size: String,  // "tiny"|"small"|"medium"|"large" — Phase 10a
         graph_blob_b64: String,
         deadline_epoch: u64,
     },

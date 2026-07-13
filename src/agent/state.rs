@@ -6,6 +6,22 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Model size tier — used for resource-aware sortition filtering.
+/// Nodes advertise their max capability; tasks declare their requirement.
+/// Derives Ord so filtering is `peer.max_model_size >= task.model_size`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelSize {
+    /// 3B-class models (edge devices, Pi 5)
+    Tiny = 1,
+    /// 8B-class models (mid-range workstations)
+    Small = 2,
+    /// 30B-class models (high-end workstations)
+    Medium = 3,
+    /// 70B+ models (clusters, cloud)
+    Large = 4,
+}
+
 /// The lifecycle status of an agent running on a node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AgentStatus {
@@ -30,6 +46,8 @@ pub struct AgentTask {
     pub origin: String,
     /// The model required to execute this task (e.g. "nemotron-3-nano").
     pub model: String,
+    /// Resource tier required for this task (Phase 10a: sortition filtering).
+    pub model_size: ModelSize,
     /// Version of the agent harness this task was built for.
     pub harness_version: u32,
     /// Opaque task payload — the execution graph serialized as bytes.

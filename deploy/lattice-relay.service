@@ -12,6 +12,8 @@ ExecStart=/opt/lattice-node/target/release/lattice-node \
     --name relay-hub \
     --port 4001 \
     --listen-addr 0.0.0.0 \
+    --identity-dir /opt/lattice-node/data/identity \
+    --storage-dir /opt/lattice-node/data/storage \
     --relay-server
 Restart=always
 RestartSec=5

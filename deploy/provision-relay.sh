@@ -13,7 +13,16 @@ echo ""
 # ── System dependencies ────────────────────
 echo "► Installing system dependencies..."
 sudo apt-get update -qq
-sudo apt-get install -y -qq build-essential pkg-config libssl-dev curl git
+sudo apt-get install -y -qq build-essential pkg-config libssl-dev protobuf-compiler curl git
+
+# ── Swap for low-memory instances ────────────
+if [ ! -f /swapfile ]; then
+    echo "► Creating 4GB swap (for Rust compilation on low-memory VPS)..."
+    sudo fallocate -l 4G /swapfile
+    sudo chmod 600 /swapfile
+    sudo mkswap /swapfile
+    sudo swapon /swapfile
+fi
 
 # ── Create lattice user ────────────────────
 if ! id lattice &>/dev/null; then
@@ -41,13 +50,13 @@ fi
 if ! command -v rustup >/dev/null 2>&1; then
     echo "► Installing Rust..."
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    source "$HOME/.cargo/env"
 fi
+source "$HOME/.cargo/env"
 
 # ── Build ──────────────────────────────────
-echo "► Building lattice-node (release)..."
+echo "► Building lattice-node (release, single-job for low memory)..."
 cd /opt/lattice-node
-sudo -u lattice bash -c 'source "$HOME/.cargo/env" && cargo build --release'
+CARGO_BUILD_JOBS=1 cargo build --release
 
 # ── Data dir ───────────────────────────────
 echo "► Creating data directory..."

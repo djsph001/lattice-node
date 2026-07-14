@@ -51,6 +51,35 @@ pub fn validate_and_apply(
         }
     }
 
+    // 4b. For vouches, check sufficient unencumbered thickness
+    if let Transaction::Vouch {
+        voucher,
+        staked_fraction,
+        ..
+    } = &tx.transaction
+    {
+        let voucher_peer: PeerId = voucher
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid voucher PeerId: {e}"))?;
+        let voucher_total = state.thickness_graph.total_thickness(&voucher_peer);
+        if voucher_total <= 0.0 {
+            bail!(
+                "insufficient thickness: {} has no thickness to stake",
+                voucher
+            );
+        }
+        let stake = voucher_total * *staked_fraction;
+        let usable = state.thickness_graph.usable_thickness(&voucher_peer);
+        if stake > usable {
+            bail!(
+                "insufficient unencumbered thickness: {} needs {:.4}, has {:.4} usable",
+                voucher,
+                stake,
+                usable
+            );
+        }
+    }
+
     // 5. Apply to local state
     state.apply_transaction(&tx.transaction)?;
 
@@ -97,6 +126,7 @@ fn check_timestamp(tx: &SignedTransaction) -> Result<()> {
     let tx_time = match &tx.transaction {
         Transaction::Transfer { timestamp, .. } => timestamp,
         Transaction::Mint { timestamp, .. } => timestamp,
+        Transaction::Vouch { timestamp, .. } => timestamp,
     };
 
     let now = chrono::Utc::now();

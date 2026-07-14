@@ -226,6 +226,13 @@ pub struct LatticeNode {
     /// ledger mutations are gated. The node still relays gossip traffic
     /// (Phase 10b: public relay safety).
     no_economics: bool,
+    /// Phase 11: thickness floor weight for sortition (security parameter).
+    /// Pinned to 1/T_min where T_min is expected minimum honest thickness.
+    floor_weight: f64,
+    /// Phase 11: density margin multiplier for panel-access invariant.
+    /// honest_T must exceed N_eligible × floor_weight × margin before
+    /// witness panels can form.
+    density_margin: f64,
     /// Phase 9: model execution bridge (Ollama).
     executor: crate::agent::executor::OllamaExecutor,
     /// Phase 9: channel sender for background execution results.
@@ -256,6 +263,8 @@ impl LatticeNode {
         max_model_size: ModelSize,
         vram_bytes: u64,
         no_economics: bool,
+        floor_weight: f64,
+        density_margin: f64,
     ) -> Result<Self> {
         let key_path = resolve_identity_path(identity_dir)?;
         let local_key = load_or_generate_identity(&key_path, fresh_identity)?;
@@ -465,6 +474,8 @@ impl LatticeNode {
             max_model_size,
             vram_bytes,
             no_economics,
+            floor_weight,
+            density_margin,
             executor: crate::agent::executor::OllamaExecutor::new(),
             exec_tx: None,
         })
@@ -782,6 +793,12 @@ impl LatticeNode {
                     self.broadcast_heartbeat().await;
                 }
                 _ = epoch_timer.tick() => {
+                    // Phase 11: unwind expired vouches before economic cycle
+                    let epoch = self.economic_engine.epoch_count() + 1;
+                    let unwound = self.ledger.thickness_graph.process_epoch_expiration(epoch);
+                    if unwound > 0 {
+                        info!(epoch, unwound, "[thickness] Expired vouches unwound");
+                    }
                     self.run_economic_epoch().await;
                 }
                 Some(bridge_event) = bridge_rx.recv() => {
@@ -2558,16 +2575,40 @@ impl LatticeNode {
             debug!("[sortition] Skipping witness sortition — no_economics mode");
             return;
         }
-        let peer_pool: Vec<PeerId> = self
+
+        // ── Build weighted pool from thickness graph ──────────
+        let weighted_pool: Vec<(PeerId, f64)> = self
             .peer_table
             .iter()
-            .map(|info| info.peer_id)
-            .chain(std::iter::once(self.local_peer_id))
+            .map(|info| {
+                let t = self.ledger.thickness_graph.total_thickness(&info.peer_id);
+                (info.peer_id, t)
+            })
+            .chain(std::iter::once({
+                let t = self
+                    .ledger
+                    .thickness_graph
+                    .total_thickness(&self.local_peer_id);
+                (self.local_peer_id, t)
+            }))
             .collect();
 
-        let panel = crate::sortition::select_witness_panel(
+        // ── Panel-access invariant guard ──────────────────────
+        // Conservative: count ALL pool members as potentially Sybil.
+        if !check_panel_access_density(&weighted_pool, self.density_margin) {
+            warn!(
+                n_eligible = weighted_pool.len(),
+                floor_weight = crate::sortition::FLOOR_WEIGHT,
+                margin = self.density_margin,
+                "[governance] Panel REFUSED — insufficient trust density. Mesh stays participation-only."
+            );
+            return;
+        }
+
+        // ── Weighted sortition ───────────────────────────────
+        let panel = crate::sortition::select_weighted_witness_panel(
             &cert.witness_seed,
-            &peer_pool,
+            &weighted_pool,
             &self.escalation_exclusions,
         );
 
@@ -2936,6 +2977,30 @@ impl LatticeNode {
     }
 }
 
+// ── Phase 11: panel-access density check ──────────────────────
+
+/// Check whether honest thickness is sufficient to safely form a witness panel.
+///
+/// Conservative: counts ALL pool members as potentially Sybil.
+/// honest_T = sum of thickness for peers above FLOOR_WEIGHT.
+/// Threshold = N_eligible × FLOOR_WEIGHT × density_margin.
+///
+/// Returns true if the panel can safely form, false if it should be refused.
+fn check_panel_access_density(pool: &[(PeerId, f64)], density_margin: f64) -> bool {
+    let honest_t: f64 = pool
+        .iter()
+        .map(|(_, w)| *w)
+        .filter(|w| *w > crate::sortition::FLOOR_WEIGHT)
+        .sum();
+    let n_eligible = pool.len();
+    if n_eligible == 0 {
+        return false;
+    }
+    let sybil_floor_total = n_eligible as f64 * crate::sortition::FLOOR_WEIGHT;
+    let threshold = sybil_floor_total * density_margin;
+    honest_t >= threshold
+}
+
 // ── Identity helpers ──────────────────────────────────────────
 
 /// Set the nonce field on a Transaction (used after TaxEngine produces
@@ -2944,6 +3009,7 @@ fn set_transaction_nonce(tx: &mut Transaction, nonce: u64) {
     match tx {
         Transaction::Transfer { nonce: ref mut n, .. } => *n = nonce,
         Transaction::Mint { nonce: ref mut n, .. } => *n = nonce,
+        Transaction::Vouch { nonce: ref mut n, .. } => *n = nonce,
     }
 }
 
@@ -3012,4 +3078,104 @@ fn write_key_file(path: &Path, bytes: &[u8]) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod panel_access_tests {
+    use super::*;
+
+    #[test]
+    fn sparse_mesh_refuses_panel() {
+        // All floor-weight peers, zero honest thickness.
+        // N=10, floor=0.01, margin=2.0 → threshold = 10 × 0.01 × 2.0 = 0.20
+        // honest_T = 0 → 0 < 0.20 → REFUSE
+        let pool: Vec<(PeerId, f64)> = (0..10)
+            .map(|_| (PeerId::random(), 0.0))
+            .collect();
+        assert!(!check_panel_access_density(&pool, 2.0));
+    }
+
+    #[test]
+    fn dense_mesh_permits_panel() {
+        // One honest node with T=100, nine floor-weight peers.
+        // N=10, floor=0.01, margin=2.0 → threshold = 0.20
+        // honest_T = 100 → 100 >= 0.20 → PERMIT
+        let mut pool: Vec<(PeerId, f64)> = vec![(PeerId::random(), 100.0)];
+        for _ in 0..9 {
+            pool.push((PeerId::random(), 0.0));
+        }
+        assert!(check_panel_access_density(&pool, 2.0));
+    }
+
+    #[test]
+    fn transition_refuse_to_permit() {
+        // Start sparse, add thickness, should transition.
+        let mut pool: Vec<(PeerId, f64)> = (0..5)
+            .map(|_| (PeerId::random(), 0.0))
+            .collect();
+
+        // Sparse: N=5, threshold = 5 × 0.01 × 2.0 = 0.10, honest_T=0 → REFUSE
+        assert!(!check_panel_access_density(&pool, 2.0));
+
+        // Add honest node with T=50
+        pool.push((PeerId::random(), 50.0));
+
+        // Dense: N=6, threshold = 6 × 0.01 × 2.0 = 0.12, honest_T=50 → PERMIT
+        assert!(check_panel_access_density(&pool, 2.0));
+    }
+
+    #[test]
+    fn empty_pool_refuses() {
+        let pool: Vec<(PeerId, f64)> = vec![];
+        assert!(!check_panel_access_density(&pool, 2.0));
+    }
+
+    #[test]
+    fn exactly_at_threshold_permits() {
+        // N=5, threshold = 5 × 0.01 × 2.0 = 0.10
+        // honest_T = 0.10 → 0.10 >= 0.10 → PERMIT (boundary)
+        let pool: Vec<(PeerId, f64)> = vec![
+            (PeerId::random(), 0.10),
+            (PeerId::random(), 0.0),
+            (PeerId::random(), 0.0),
+            (PeerId::random(), 0.0),
+            (PeerId::random(), 0.0),
+        ];
+        assert!(check_panel_access_density(&pool, 2.0));
+    }
+
+    #[test]
+    fn higher_margin_makes_guard_stricter() {
+        // Same pool, margin=2.0 passes, margin=10.0 fails
+        let pool: Vec<(PeerId, f64)> = vec![
+            (PeerId::random(), 1.0),
+            (PeerId::random(), 0.0),
+            (PeerId::random(), 0.0),
+            (PeerId::random(), 0.0),
+            (PeerId::random(), 0.0),
+        ];
+        // margin 2.0: threshold = 5 × 0.01 × 2.0 = 0.10, honest_T=1.0 → pass
+        assert!(check_panel_access_density(&pool, 2.0));
+        // margin 10.0: threshold = 5 × 0.01 × 10.0 = 0.50, honest_T=1.0 → still pass
+        assert!(check_panel_access_density(&pool, 10.0));
+        // margin 2000.0: threshold = 5 × 0.01 × 2000 = 100, honest_T=1.0 → FAIL
+        assert!(!check_panel_access_density(&pool, 2000.0));
+    }
+
+    #[test]
+    fn real_mesh_threshold_formula() {
+        // Print the threshold formula for documentation.
+        // With N_all peers, honest_T needed = N_all × 0.01 × 2.0 = N_all × 0.02
+        // So for N_all=2 (Z4 + relay): need honest_T >= 0.04
+        // For N_all=3 (+1 Pi5): need honest_T >= 0.06
+        // For N_all=10: need honest_T >= 0.20
+        // For N_all=100: need honest_T >= 2.00
+        for n in &[2u64, 3, 5, 10, 50, 100] {
+            let threshold = *n as f64 * crate::sortition::FLOOR_WEIGHT * 2.0;
+            eprintln!(
+                "N_all={}: honest_T needed >= {:.4} (conservative, margin=2.0, floor={:.4})",
+                n, threshold, crate::sortition::FLOOR_WEIGHT
+            );
+        }
+    }
 }

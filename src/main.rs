@@ -89,6 +89,19 @@ struct Cli {
     #[arg(long, default_value_t = 5)]
     base_tax_rate: u64,
 
+    // ── Phase 11: thickness governance ──────────────────────
+    /// Floor weight for thickness-based sortition (security parameter).
+    /// Pinned to 1/T_min where T_min is expected minimum honest thickness.
+    /// Lower values make Sybil swarms more expensive but slow newcomer onboarding.
+    #[arg(long, default_value_t = 0.01)]
+    floor_weight: f64,
+
+    /// Density margin multiplier for panel-access invariant.
+    /// honest_T must exceed N_eligible × floor_weight × margin before
+    /// witness panels can form. Higher values are stricter.
+    #[arg(long, default_value_t = 2.0)]
+    density_margin: f64,
+
     // ── Phase 6: storage verification ──────────────────────
     /// Directory for verified resource storage (blake3-addressed
     /// chunk files).  Defaults to ./lattice-storage.
@@ -237,6 +250,8 @@ async fn main() -> Result<()> {
         model_size,
         cli.vram_bytes,
         no_economics,
+        cli.floor_weight,
+        cli.density_margin,
     )?;
 
     info!(

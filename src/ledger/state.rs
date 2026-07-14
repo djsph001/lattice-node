@@ -4,6 +4,7 @@ use anyhow::{bail, Result};
 use libp2p::PeerId;
 use tracing::{debug, info, warn};
 
+use super::thickness::ThicknessGraph;
 use super::types::{DigitalUtilityUnit, ResourceClaim, Transaction};
 
 /// How many epochs must pass before a previously-verified claim
@@ -21,6 +22,9 @@ pub struct LedgerState {
     balances: HashMap<PeerId, DigitalUtilityUnit>,
     /// Resource claims tracked by this node, keyed by resource_id.
     claims: HashMap<[u8; 32], ResourceClaim>,
+    /// Thickness provenance graph — tracks contribution-derived and
+    /// vouch-derived thickness with full derivation lineage.
+    pub thickness_graph: ThicknessGraph,
 }
 
 impl LedgerState {
@@ -28,6 +32,7 @@ impl LedgerState {
         Self {
             balances: HashMap::new(),
             claims: HashMap::new(),
+            thickness_graph: ThicknessGraph::new(),
         }
     }
 
@@ -86,6 +91,36 @@ impl LedgerState {
                     .checked_add(*amount)
                     .ok_or_else(|| anyhow::anyhow!("balance overflow on mint"))?;
                 self.balances.insert(to_peer, new_balance);
+            }
+            Transaction::Vouch {
+                voucher,
+                vouchee,
+                staked_fraction,
+                expiration_epoch,
+                nonce,
+                ..
+            } => {
+                let voucher_peer: PeerId = voucher
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("invalid voucher PeerId: {e}"))?;
+                let vouchee_peer: PeerId = vouchee
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("invalid vouchee PeerId: {e}"))?;
+
+                // The validation layer already checked unencumbered thickness.
+                // Here we just apply the graph mutation.
+                let per_vouchee = self
+                    .thickness_graph
+                    .stake_vouch(&voucher_peer, &vouchee_peer, *staked_fraction, *nonce, *expiration_epoch)
+                    .map_err(|e| anyhow::anyhow!("vouch failed: {e}"))?;
+
+                info!(
+                    voucher = %voucher,
+                    vouchee = %vouchee,
+                    per_vouchee = format!("{:.4}", per_vouchee),
+                    expires = ?expiration_epoch,
+                    "Vouch applied — derived thickness granted"
+                );
             }
         }
         Ok(())
@@ -178,6 +213,19 @@ impl LedgerState {
         // tenure earn more.  The reward scales with both the
         // resource size and the current health multiplier.
         let reward = (claim.size_bytes as f64 * claim.tenure_health) as u64;
+
+        // Layer 1 thickness: verified storage contribution mints thickness.
+        // This is the ONLY source of NEW thickness in the provenance graph.
+        // Amount = size_bytes × tenure_health / 1_000_000, so a 10 MiB
+        // resource at 1.0 health mints ~10.5 thickness units.
+        let thickness_amount = (claim.size_bytes as f64 * claim.tenure_health) / 1_000_000.0;
+        if thickness_amount > 0.0 {
+            self.thickness_graph.add_verified_contribution(
+                peer,
+                *resource_id,
+                thickness_amount,
+            );
+        }
 
         info!(
             resource = %hex::encode(*resource_id),

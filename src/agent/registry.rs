@@ -191,6 +191,7 @@ mod tests {
                 origin: "test-origin".to_string(),
                 model: "test-model".to_string(),
                 model_size: ModelSize::Small,
+                vram_bytes: 0,
                 harness_version: 1,
                 graph_blob: vec![1, 2, 3],
                 graph_hash: blake3::hash(b"test-graph").into(),

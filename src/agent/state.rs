@@ -48,6 +48,8 @@ pub struct AgentTask {
     pub model: String,
     /// Resource tier required for this task (Phase 10a: sortition filtering).
     pub model_size: ModelSize,
+    /// Minimum VRAM in bytes required to execute this task.
+    pub vram_bytes: u64,
     /// Version of the agent harness this task was built for.
     pub harness_version: u32,
     /// Opaque task payload — the execution graph serialized as bytes.

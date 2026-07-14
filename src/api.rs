@@ -35,6 +35,9 @@ pub enum ApiRequest {
         task_id: String,
         model: String,
         model_size: String,  // "tiny"|"small"|"medium"|"large" — Phase 10a
+        /// Minimum VRAM in bytes required (default: 0 = no VRAM requirement).
+        #[serde(default)]
+        vram_bytes: u64,
         graph_blob_b64: String,
         deadline_epoch: u64,
     },

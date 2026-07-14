@@ -49,6 +49,8 @@ pub struct StatusReport {
     pub peer_count: usize,
     /// Maximum model size this node can execute (Phase 10a: sortition filtering).
     pub max_model_size: ModelSize,
+    /// Available GPU VRAM in bytes that this node can allocate.
+    pub vram_bytes: u64,
     /// Uptime in seconds since node start
     pub uptime_secs: u64,
     /// Software version
@@ -71,6 +73,9 @@ pub struct AgentTaskMsg {
     pub origin: String,
     pub model: String,
     pub model_size: ModelSize,
+    /// Minimum VRAM in bytes required to execute this task.
+    /// Sortition filters out nodes with insufficient GPU memory.
+    pub vram_bytes: u64,
     pub harness_version: u32,
     pub graph_blob: Vec<u8>,
     pub graph_hash: [u8; 32],
@@ -119,6 +124,8 @@ pub struct StatusResponse {
     pub peer_count: usize,
     /// Maximum model size this node can execute (Phase 10a).
     pub max_model_size: ModelSize,
+    /// Available GPU VRAM in bytes that this node can allocate.
+    pub vram_bytes: u64,
     /// Uptime in seconds since the responder started.
     pub uptime_secs: u64,
     /// Total heartbeats this node has broadcast.

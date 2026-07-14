@@ -85,6 +85,15 @@ struct ExecutionResult {
     epoch: u64,
 }
 
+/// A peer's agent execution capability — used for resource-aware sortition.
+/// Both model_size (tier) and vram_bytes (exact memory) must meet a task's
+/// requirements for the peer to be eligible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentCapability {
+    pub model_size: ModelSize,
+    pub vram_bytes: u64,
+}
+
 /// A sovereign node in the Lattice mesh.
 pub struct LatticeNode {
     swarm: libp2p::Swarm<LatticeBehaviour>,
@@ -205,10 +214,12 @@ pub struct LatticeNode {
     /// Whether this node accepts agent task execution.
     agent_mode: bool,
     /// Peers that advertise agent protocol support, mapped to their
-    /// max model capability (Phase 8b.1 sortition + Phase 10a filtering).
-    agent_peers: HashMap<PeerId, ModelSize>,
+    /// capability (model size + VRAM) (Phase 8b.1 sortition + Phase 10a filtering).
+    agent_peers: HashMap<PeerId, AgentCapability>,
     /// This node's maximum model capability (Phase 10a).
     max_model_size: ModelSize,
+    /// This node's available GPU VRAM in bytes.
+    vram_bytes: u64,
     /// Disable economic participation — minting, witness panels, and
     /// ledger mutations are gated. The node still relays gossip traffic
     /// (Phase 10b: public relay safety).
@@ -241,6 +252,7 @@ impl LatticeNode {
         relay_server_enabled: bool,
         agent_mode: bool,
         max_model_size: ModelSize,
+        vram_bytes: u64,
         no_economics: bool,
     ) -> Result<Self> {
         let key_path = resolve_identity_path(identity_dir)?;
@@ -445,6 +457,7 @@ impl LatticeNode {
             agent_mode,
             agent_peers: HashMap::new(),
             max_model_size,
+            vram_bytes,
             no_economics,
             executor: crate::agent::executor::OllamaExecutor::new(),
             exec_tx: None,
@@ -462,9 +475,24 @@ impl LatticeNode {
         task_id: String,
         model: String,
         model_size: ModelSize,
+        vram_bytes: u64,
         graph_blob: Vec<u8>,
         deadline_epoch: u64,
     ) -> Result<()> {
+        // Guard: reject tasks this node cannot execute
+        if self.max_model_size < model_size {
+            return Err(anyhow::anyhow!(
+                "Task requires model_size {:?} but node max is {:?}",
+                model_size, self.max_model_size
+            ));
+        }
+        if self.vram_bytes < vram_bytes {
+            return Err(anyhow::anyhow!(
+                "Task requires {} bytes VRAM but node has {} bytes",
+                vram_bytes, self.vram_bytes
+            ));
+        }
+
         let graph_hash: [u8; 32] = blake3::hash(&graph_blob).into();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -476,6 +504,7 @@ impl LatticeNode {
             origin: self.local_peer_id.to_string(),
             model: model.clone(),
             model_size,
+            vram_bytes,
             harness_version: 1,
             graph_blob: graph_blob.clone(),
             graph_hash,
@@ -489,6 +518,7 @@ impl LatticeNode {
                 origin: self.local_peer_id.to_string(),
                 model,
                 model_size,
+                vram_bytes,
                 harness_version: 1,
                 graph_blob,
                 graph_hash,
@@ -1337,8 +1367,11 @@ impl LatticeNode {
                                 crate::agent::codec::AGENT_STATE_PROTOCOL
                             ));
                         if supports_agent {
-                            // Phase 10a: initially assume Tiny until StatusResponse provides actual capability.
-                            self.agent_peers.entry(peer_id).or_insert(ModelSize::Tiny);
+                            // Phase 10a: initially assume Tiny/0-VRAM until StatusResponse provides actual capability.
+                            self.agent_peers.entry(peer_id).or_insert(AgentCapability {
+                                model_size: ModelSize::Tiny,
+                                vram_bytes: 0,
+                            });
                             debug!(
                                 peer = %peer_id,
                                 "[agent] Peer supports agent protocol — added to sortition pool"
@@ -1586,18 +1619,23 @@ impl LatticeNode {
                     );
                 } else if self.agent_mode {
                     // Phase 8b.1 + Phase 10a: resource-aware sortition.
-                    // Filter pool to nodes that can handle this task's model size,
-                    // then select deterministically via Blake3. All nodes compute
-                    // the same result because both task.model_size and peer
-                    // capabilities arrive via gossipsub/status — same data everywhere.
+                    // Filter pool to nodes that can handle this task's model size
+                    // and VRAM requirement, then select deterministically via Blake3.
+                    // All nodes compute the same result because capabilities
+                    // arrive via gossipsub/status — same data everywhere.
                     let mut pool: Vec<PeerId> = self
                         .agent_peers
                         .iter()
-                        .filter(|(_, cap)| **cap >= msg.model_size)
+                        .filter(|(_, cap)| {
+                            cap.model_size >= msg.model_size
+                                && cap.vram_bytes >= msg.vram_bytes
+                        })
                         .map(|(id, _)| *id)
                         .collect();
                     // Include self only if capable
-                    if self.max_model_size >= msg.model_size {
+                    if self.max_model_size >= msg.model_size
+                        && self.vram_bytes >= msg.vram_bytes
+                    {
                         pool.push(self.local_peer_id);
                     }
                     pool.sort(); // deterministic ordering
@@ -1637,6 +1675,7 @@ impl LatticeNode {
                                 origin: msg.origin.clone(),
                                 model: msg.model.clone(),
                                 model_size: msg.model_size,
+                                vram_bytes: msg.vram_bytes,
                                 harness_version: msg.harness_version,
                                 graph_blob: msg.graph_blob.clone(),
                                 graph_hash: msg.graph_hash,
@@ -1804,11 +1843,17 @@ impl LatticeNode {
                     info!(peer = %peer, from = %response.node_name, "Inserting peer from RPC");
                     self.peer_table.insert_peer(peer);
                 }
-                // Phase 10a: update peer's max model capability from status response.
+                // Phase 10a: update peer's capability (model size + VRAM) from status response.
                 self.agent_peers
                     .entry(peer)
-                    .and_modify(|cap| *cap = response.max_model_size)
-                    .or_insert(response.max_model_size);
+                    .and_modify(|cap| {
+                        cap.model_size = response.max_model_size;
+                        cap.vram_bytes = response.vram_bytes;
+                    })
+                    .or_insert(AgentCapability {
+                        model_size: response.max_model_size,
+                        vram_bytes: response.vram_bytes,
+                    });
                 info!(
                     from = %response.node_name,
                     peer = %peer,
@@ -1904,6 +1949,7 @@ impl LatticeNode {
             timestamp: chrono::Utc::now(),
             peer_count: self.peer_table.len(),
             max_model_size: self.max_model_size,
+            vram_bytes: self.vram_bytes,
             uptime_secs: self.start_time.elapsed().as_secs(),
             heartbeats_sent: self.heartbeats_sent,
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2782,6 +2828,7 @@ impl LatticeNode {
                 task_id,
                 model,
                 model_size,
+                vram_bytes,
                 graph_blob_b64,
                 deadline_epoch,
             } => {
@@ -2811,7 +2858,7 @@ impl LatticeNode {
                         return;
                     }
                 };
-                match self.submit_agent_task(task_id.clone(), model, ms, graph_blob, deadline_epoch) {
+                match self.submit_agent_task(task_id.clone(), model, ms, vram_bytes, graph_blob, deadline_epoch) {
                     Ok(_) => {
                         let hash = blake3::hash(
                             &self

@@ -149,6 +149,12 @@ struct Cli {
     #[arg(long, default_value = "small")]
     max_model_size: String,
 
+    /// Available GPU VRAM in bytes this node can allocate for model execution.
+    /// Default: 0 (VRAM-unaware / no GPU). Nodes with VRAM advertise it for
+    /// memory-aware sortition filtering alongside model size.
+    #[arg(long, default_value_t = 0)]
+    vram_bytes: u64,
+
     // ── Phase 10b: public relay safety ─────────────────────────
     /// Disable economic participation — no minting, no witness
     /// panels, no ledger mutations. The node still relays gossip.
@@ -229,6 +235,7 @@ async fn main() -> Result<()> {
         cli.relay_server,
         cli.agent_mode,
         model_size,
+        cli.vram_bytes,
         no_economics,
     )?;
 

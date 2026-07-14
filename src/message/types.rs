@@ -50,6 +50,7 @@ pub struct StatusReport {
     /// Maximum model size this node can execute (Phase 10a: sortition filtering).
     pub max_model_size: ModelSize,
     /// Available GPU VRAM in bytes that this node can allocate.
+    #[serde(default)]
     pub vram_bytes: u64,
     /// Uptime in seconds since node start
     pub uptime_secs: u64,
@@ -75,6 +76,7 @@ pub struct AgentTaskMsg {
     pub model_size: ModelSize,
     /// Minimum VRAM in bytes required to execute this task.
     /// Sortition filters out nodes with insufficient GPU memory.
+    #[serde(default)]
     pub vram_bytes: u64,
     pub harness_version: u32,
     pub graph_blob: Vec<u8>,
@@ -125,6 +127,7 @@ pub struct StatusResponse {
     /// Maximum model size this node can execute (Phase 10a).
     pub max_model_size: ModelSize,
     /// Available GPU VRAM in bytes that this node can allocate.
+    #[serde(default)]
     pub vram_bytes: u64,
     /// Uptime in seconds since the responder started.
     pub uptime_secs: u64,

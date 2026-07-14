@@ -12,6 +12,7 @@ use libp2p::{
     multiaddr::Protocol,
 };
 use libp2p::swarm::behaviour::toggle::Toggle;
+use serde::{Deserialize, Serialize};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
@@ -88,9 +89,10 @@ struct ExecutionResult {
 /// A peer's agent execution capability — used for resource-aware sortition.
 /// Both model_size (tier) and vram_bytes (exact memory) must meet a task's
 /// requirements for the peer to be eligible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentCapability {
     pub model_size: ModelSize,
+    #[serde(default)]
     pub vram_bytes: u64,
 }
 
@@ -292,7 +294,11 @@ impl LatticeNode {
 
                 let gossipsub_config = gossipsub::ConfigBuilder::default()
                     .heartbeat_interval(Duration::from_secs(1))
-                    .validation_mode(gossipsub::ValidationMode::Strict)
+                    .validation_mode(gossipsub::ValidationMode::Permissive)
+                    .mesh_outbound_min(1)
+                    .mesh_n_low(1)
+                    .mesh_n(2)
+                    .mesh_n_high(4)
                     .build()
                     .map_err(|e| anyhow::anyhow!("gossipsub config: {e}"))?;
 
@@ -1195,6 +1201,13 @@ impl LatticeNode {
             SwarmEvent::Behaviour(LatticeBehaviourEvent::Gossipsub(
                 gossipsub::Event::Message { message, propagation_source, .. },
             )) => {
+                let topic = message.topic.to_string();
+                debug!(
+                    topic = %topic,
+                    from = %propagation_source,
+                    bytes = message.data.len(),
+                    "[gossipsub] Message received"
+                );
                 self.handle_gossip_message(&message.data, propagation_source);
             }
 

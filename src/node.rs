@@ -559,44 +559,79 @@ impl LatticeNode {
             }
         }
 
-        // Phase 9: if agent_mode is on, trigger execution locally.
-        // Gossipsub doesn't loop back, so local submissions must
-        // spawn execution directly.
+        // Phase 9: unified sortition gate.
+        // All tasks — local and remote — flow through the same deterministic
+        // election. If this node is not the winner, it does NOT execute;
+        // the winner will pick up the task via gossipsub.
         if self.agent_mode {
-            if let Some(ref tx) = self.exec_tx {
-                let tid = task_id.clone();
-                let blob = self.agent_registry
-                    .get(&task_id)
-                    .map(|r| r.task.graph_blob.clone())
-                    .unwrap_or_default();
-                let hash = graph_hash;
-                let exec_client = crate::agent::executor::OllamaExecutor::new();
-                let ttx = tx.clone();
-                let epoch = self.economic_engine.epoch_count();
+            // Build capability-filtered pool (same logic as gossip handler).
+            let mut pool: Vec<PeerId> = self
+                .agent_peers
+                .iter()
+                .filter(|(_, cap)| {
+                    cap.model_size >= model_size
+                        && cap.vram_bytes >= vram_bytes
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            // Include self — capability already verified by guard above.
+            pool.push(self.local_peer_id);
+            pool.sort();
+            pool.dedup();
 
-                tokio::spawn(async move {
-                    match exec_client.execute(&tid, &blob, &hash).await {
-                        Ok(checkpoint) => {
-                            let _ = ttx.send(ExecutionResult {
-                                task_id: tid,
-                                success: true,
-                                checkpoint: Some(checkpoint),
-                                error: None,
-                                epoch,
-                            }).await;
+            let hash_bytes = blake3::hash(&graph_hash);
+            let seed_bytes: [u8; 8] = hash_bytes.as_bytes()[..8].try_into().unwrap();
+            let index = u64::from_be_bytes(seed_bytes) as usize % pool.len();
+            let selected = pool[index];
+
+            if selected == self.local_peer_id {
+                info!(
+                    task_id = %task_id,
+                    pool_size = pool.len(),
+                    "[agent] Selected as executor via sortition — spawning"
+                );
+                if let Some(ref tx) = self.exec_tx {
+                    let tid = task_id.clone();
+                    let blob = self.agent_registry
+                        .get(&task_id)
+                        .map(|r| r.task.graph_blob.clone())
+                        .unwrap_or_default();
+                    let hash = graph_hash;
+                    let exec_client = crate::agent::executor::OllamaExecutor::new();
+                    let ttx = tx.clone();
+                    let epoch = self.economic_engine.epoch_count();
+
+                    tokio::spawn(async move {
+                        match exec_client.execute(&tid, &blob, &hash).await {
+                            Ok(checkpoint) => {
+                                let _ = ttx.send(ExecutionResult {
+                                    task_id: tid,
+                                    success: true,
+                                    checkpoint: Some(checkpoint),
+                                    error: None,
+                                    epoch,
+                                }).await;
+                            }
+                            Err(e) => {
+                                warn!(task_id = %tid, error = %e, "[executor] Local execution failed");
+                                let _ = ttx.send(ExecutionResult {
+                                    task_id: tid,
+                                    success: false,
+                                    checkpoint: None,
+                                    error: Some(e.to_string()),
+                                    epoch,
+                                }).await;
+                            }
                         }
-                        Err(e) => {
-                            warn!(task_id = %tid, error = %e, "[executor] Local execution failed");
-                            let _ = ttx.send(ExecutionResult {
-                                task_id: tid,
-                                success: false,
-                                checkpoint: None,
-                                error: Some(e.to_string()),
-                                epoch,
-                            }).await;
-                        }
-                    }
-                });
+                    });
+                }
+            } else {
+                info!(
+                    task_id = %task_id,
+                    selected = %selected,
+                    pool_size = pool.len(),
+                    "[agent] Not selected as executor — gossip will route to winner"
+                );
             }
         }
 

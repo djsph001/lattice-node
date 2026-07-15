@@ -88,8 +88,10 @@ impl EconomicEngine {
             queries_issued: self.metrics.queries_issued - self.epoch_metrics.queries_issued,
             transactions_submitted: self.metrics.transactions_submitted
                 - self.epoch_metrics.transactions_submitted,
-            verified_bytes_relayed: 0,
-            verified_messages_relayed: 0,
+            verified_bytes_relayed: self.metrics.verified_bytes_relayed
+                - self.epoch_metrics.verified_bytes_relayed,
+            verified_messages_relayed: self.metrics.verified_messages_relayed
+                - self.epoch_metrics.verified_messages_relayed,
             agent_tasks_active: self.metrics.agent_tasks_active,
         };
 

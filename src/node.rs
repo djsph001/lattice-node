@@ -713,7 +713,7 @@ impl LatticeNode {
                     .add_address(&peer_id, transport_addr);
                 debug!(peer = %peer_id, "Added bootstrap peer to Kademlia routing table");
             } else {
-                warn!(addr = %addr, "Bootstrap peer address missing /p2p/<PeerId> segment");
+                info!(addr = %addr, "Bootstrap peer address lacks /p2p/ segment — will discover PeerId on connect");
             }
 
             if let Err(e) = self.swarm.dial(addr.clone()) {
@@ -972,6 +972,18 @@ impl LatticeNode {
             ratio = %format!("{:.2}", ratio),
             "Epoch complete"
         );
+
+        // Legibility: if we have peers but earned nothing, explain why.
+        // Relaying is a three-party act — at n=2, every message is origin,
+        // not relay, so the receipt-gated mint correctly produces 0.
+        if self.peer_table.len() > 0 && verified_msgs == 0 && epoch > 1 {
+            info!(
+                epoch,
+                peers = self.peer_table.len(),
+                "Receipt-gated mint: 0 DUUs. Relaying requires a third party — \
+                 every message at this mesh size is origin, not relay. Correct."
+            );
+        }
 
         // Phase 6b: schedule storage challenges for aging claims.
         self.schedule_storage_challenges(epoch);

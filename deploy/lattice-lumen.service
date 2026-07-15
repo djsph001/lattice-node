@@ -1,0 +1,41 @@
+[Unit]
+Description=Lattice Lumen Node — persistent agent/claim executor
+Documentation=https://github.com/djsph001/lattice-node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lattice
+Group=lattice
+ExecStart=/opt/lattice-node/target/release/lattice-node \
+    --name lumen \
+    --port 0 \
+    --listen-addr 0.0.0.0 \
+    --identity-dir /opt/lattice-node/data/identity \
+    --storage-dir /opt/lattice-node/data/storage \
+    --agent-mode \
+    --max-model-size small \
+    --bootstrap-peer /ip4/167.233.223.174/tcp/4001
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/lattice-node/data
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+MemoryMax=512M
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lattice-lumen
+
+[Install]
+WantedBy=multi-user.target

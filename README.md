@@ -1,155 +1,145 @@
 # Lattice Node
 
-Sovereign peer-to-peer application layer for the Lattice mesh network.
+Sovereign peer-to-peer node for the Lattice mesh network. Join the mesh in 15 minutes.
 
 ## Quick Start
 
 ```bash
-# One-time setup (Linux/Mac):
-./scripts/setup-linux.sh   # or setup-mac.sh
+# 1. Install Rust (skip if you have it)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
 
-# Start a node:
-cargo run -- --name alpha --heartbeat-interval 5
+# 2. Clone and build
+git clone https://github.com/djsph001/lattice-node.git
+cd lattice-node
+cargo build --release
 
-# In a second terminal:
-cargo run -- --name bravo --heartbeat-interval 5 --no-mdns \
-  --bootstrap-peer /ip4/127.0.0.1/tcp/0/p2p/<alpha-peer-id>
-
-# They discover each other via Kademlia DHT within seconds.
+# 3. Start your node — it connects to the public relay
+./target/release/lattice-node \
+  --name your-name-here \
+  --port 0 \
+  --listen-addr 0.0.0.0 \
+  --identity-dir ~/.lattice \
+  --storage-dir ./lattice-storage \
+  --bootstrap-peer /ip4/167.233.223.174/tcp/4001
 ```
 
-## Cross-Platform Deployment
-
-The Lattice runs on Linux, macOS, and Windows. Each platform has a one-command setup script in `scripts/`.
-
-### Setup
-
-| Platform | Script | Binary |
-|----------|--------|--------|
-| Linux (Debian/Ubuntu) | `scripts/setup-linux.sh` | `target/release/lattice-node` |
-| macOS (Apple Silicon / Intel) | `scripts/setup-mac.sh` | `target/release/lattice-node` |
-| Windows | `scripts/setup-windows.ps1` | `target\release\lattice-node.exe` |
-
-Each script installs Rust (if needed) and runs `cargo build --release`. The Linux script also optionally sets up `aarch64` cross-compilation for Raspberry Pi.
-
-### Bootstrap Flow
-
-The first node starts without a bootstrap peer and prints its PeerId:
+Your node generates a persistent Ed25519 identity, connects to the relay in Germany, and joins the mesh. Look for:
 
 ```
-cargo run -- --name genesis --heartbeat-interval 5
-# → peer_id = 12D3KooWAbCdEf...
-# → Listening on /ip4/0.0.0.0/tcp/XXXXX
+Connection established peer=12D3KooWBoVfr...
+Identify: peer supports relay (HOP_PROTOCOL)
+Kademlia routing table: peer added
+Status response received from=relay-hub
 ```
 
-Subsequent nodes point at it:
+## What's Running
 
-```
-# From another machine:
-cargo run -- --name mac-edge --no-mdns --heartbeat-interval 5 \
-  --bootstrap-peer /dns4/<genesis-host>/tcp/<port>/p2p/12D3KooWAbCdEf...
+The Lattice is a mesh of sovereign nodes — no central server, no blockchain, no crypto wallet required. Nodes peer directly, exchange gossip, and coordinate through cryptographic attestation.
 
-# Windows:
-.\target\release\lattice-node.exe --name win-edge --no-mdns ^
-  --bootstrap-peer /dns4/<genesis-host>/tcp/<port>/p2p/12D3KooWAbCdEf...
-```
+**Current mesh:** two nodes (Florida + Germany), one operator. Cross-Atlantic gossip confirmed. The receipt-gated mint correctly produces 0 DUUs — contribution requires a third party to relay traffic for, and there isn't one yet.
 
-The `/dns4/<host>` syntax in the bootstrap address lets libp2p resolve hostnames. Use `/ip4/<ip>` for raw IPs.
+**When a third peer joins:** real relay work begins, receipts flow to nodes that earned them, and the mint produces its first honest DUUs. At 5+ independent nodes, quorum-gated certification and thickness-based governance activate.
 
-### Listen Address
+## What You Need
 
-By default the node binds to `0.0.0.0` (all interfaces). On multi-homed machines (Docker bridges, VPNs, multiple NICs), pin the listener to a specific interface:
+- A computer with internet (laptop, Pi, cloud VM — anything running Linux or macOS)
+- Rust toolchain (installed above)
+- 15 minutes
 
-```
-cargo run -- --name z4 --listen-addr 192.168.1.100
-```
+No signup. No wallet. No approval. You run the binary and you're on the mesh.
 
-### External Address (NAT Traversal)
+## Keeping It Running
 
-Nodes behind NAT can advertise their public address so remote peers know where to dial:
-
-```
-cargo run -- --name edge --no-mdns \
-  --external-addr /ip4/203.0.113.5/tcp/6001 \
-  --bootstrap-peer /dns4/genesis.example.com/tcp/6001/p2p/<peer-id>
-```
-
-When `--external-addr` is set, libp2p registers it with Kademlia and the Identify protocol. Remote peers see the public address rather than the private bind address.
-
-## Cross-Compile for Raspberry Pi
+The node stops when you close the terminal. To run it as a persistent service, use the systemd unit at `deploy/lattice-lumen.service`:
 
 ```bash
-# One-time: install the aarch64 target and cross-linker
-rustup target add aarch64-unknown-linux-gnu
-sudo apt install gcc-aarch64-linux-gnu
-
-# Build for Pi
-cargo build --release --target aarch64-unknown-linux-gnu
-# Binary: target/aarch64-unknown-linux-gnu/release/lattice-node
+sudo cp deploy/lattice-lumen.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable lattice-lumen
+sudo systemctl start lattice-lumen
 ```
 
-Or use `cross` (Docker-based, no system linker needed):
+Customize `--name`, paths, and user before installing.
+
+## Two Nodes on One Machine
+
+You can run multiple nodes on the same machine with separate identities:
 
 ```bash
-cargo install cross
-cross build --release --target aarch64-unknown-linux-gnu
+# Node 1
+./target/release/lattice-node \
+  --name alpha \
+  --port 0 \
+  --identity-dir ~/.lattice-alpha \
+  --storage-dir ./storage-alpha \
+  --bootstrap-peer /ip4/167.233.223.174/tcp/4001
+
+# Node 2 (different terminal)
+./target/release/lattice-node \
+  --name bravo \
+  --port 0 \
+  --identity-dir ~/.lattice-bravo \
+  --storage-dir ./storage-bravo \
+  --bootstrap-peer /ip4/167.233.223.174/tcp/4001
 ```
 
-## Logging
+Each gets its own Ed25519 keypair on first run. Distinct `--identity-dir` and `--storage-dir` keep them isolated.
 
-Set `RUST_LOG` for granularity:
-
-```bash
-RUST_LOG=debug cargo run -- --name alpha
-RUST_LOG=lattice_node::state=trace cargo run -- --name alpha
-```
-
-## Module Map
+## Architecture
 
 ```
 src/
-├── main.rs              CLI, tokio runtime bootstrap
+├── main.rs              CLI, tokio runtime
 ├── node.rs              Node identity, swarm, event loop
 ├── network/
-│   └── protocol.rs      Composed libp2p behaviour (mDNS, gossipsub, Kademlia, RPC, relay)
+│   └── protocol.rs      libp2p behaviour (mDNS, gossipsub, Kademlia, RPC, relay)
 ├── message/
-│   ├── types.rs         Heartbeat, StatusReport, Transactions, Verify receipts
+│   ├── types.rs         Heartbeat, StatusReport, Transactions, receipts
 │   └── codec/           CBOR encode/decode, RPC codecs
-├── state/
-│   └── peers.rs         In-memory peer table
-├── ledger/              Transaction types, validation, local state
-├── economics/           Georgist resource accounting engine
-├── storage/             Blake3-addressed chunks, Merkle proofs, challenge engine
-└── scripts/             Platform setup scripts
+├── ledger/              Thickness provenance graph, transactions, validation
+├── economics/           Georgist engine, receipt-gated minting, metrics
+├── agent/               Distributed task registry, executor bridge
+├── claims/              Verify-before-sign claim architecture
+├── sortition.rs         Deterministic weighted witness panel selection
+├── commit.rs            Append-only Blake3 hash-chain ledger
+├── storage/             Blake3-addressed chunks, Merkle proofs
+├── api.rs               Unix Domain Socket query API
+└── deploy/              Systemd units, provisioning scripts
+```
+
+## Options
+
+```
+lattice-node [OPTIONS]
+
+  -p, --port <PORT>              Port to listen on (0 = random) [default: 0]
+  -n, --name <NAME>              Human-readable node name
+      --listen-addr <ADDR>       IP to bind to [default: 0.0.0.0]
+      --identity-dir <DIR>       Persistent key storage [default: ~/.lattice]
+      --storage-dir <DIR>        Chain and registry storage
+      --bootstrap-peer <ADDR>    Relay multiaddr (repeatable)
+      --agent-mode               Accept agent task execution
+      --max-model-size <SIZE>    tiny|small|medium|large [default: small]
+      --vram-bytes <BYTES>       Available GPU VRAM [default: 0]
+      --relay-server             Accept relay circuits for other nodes
+      --external-addr <ADDR>     Public address for NAT traversal
+      --no-mdns                  Disable local network discovery
+      --fresh-identity           Generate new key (discards existing)
 ```
 
 ## Roadmap
 
-- [x] **Phase 2a**: Persist node identity to disk (stable PeerId across restarts)
-- [x] **Phase 2b**: Gossipsub for heartbeat propagation to all peers
-- [x] **Phase 2c**: Request-response protocol for direct peer queries
-- [x] **Phase 3**: Kademlia DHT for discovery beyond LAN
-- [x] **Phase 4**: Digital utility unit transaction types
-- [x] **Phase 5**: Georgist resource accounting and economic engine
-- [x] **Phase 6**: Peer-verified contribution claims via relay receipts — trustless minting
-- [x] **Phase 6b**: Scheduled storage challenges with tenure decay model
-- [x] **Phase 6c**: Trilateral verification receipts, relay client, DCUtR
-- [ ] **Phase 7**: Relay transport composition and full p2p-circuit routing
-
-## Receipt-Based Verification (Phase 6)
-
-The Lattice does not trust self-reported metrics. Every contribution claim must be backed by at least one peer's signed receipt confirming it happened.
-
-### How it works
-
-1. **Receipt issuance**: When node A receives a gossipsub message delivered by node B (and the message wasn't from A), A signs a `RelayReceipt` stating "B relayed this message to me" and sends it back to B via request-response.
-
-2. **Receipt collection**: Each node collects `SignedReceipt`s from its peers during the epoch. Receipts are validated against recently-seen message hashes (prevents forged receipts) and signature-verified.
-
-3. **Trustless minting**: At epoch boundary, the mint calculation uses ONLY receipt-verified metrics. Self-reported relay bytes become diagnostics — logged but not used for minting.
-
-4. **Receipt consumption**: Receipts are cleared after each epoch to prevent replay.
-
-### Adversarial test
-
-Use `--fake-relay-bytes <amount>` to inflate self-reported relay metrics without actual relaying. The inflated numbers appear in logs but do NOT increase the verified mint amount — proving receipt-based verification catches dishonest reporting.
+- [x] Phase 2: Persistent identity, gossipsub heartbeat propagation
+- [x] Phase 3: Kademlia DHT for cross-network discovery
+- [x] Phase 4: Digital utility unit transactions (Transfer, Mint, Vouch)
+- [x] Phase 5: Georgist resource accounting engine
+- [x] Phase 6: Receipt-gated minting — self-report path removed
+- [x] Phase 6b–6c: Storage verification, trilateral receipts, relay transport
+- [x] Thickness provenance graph with chained clawback
+- [x] Weighted witness sortition with panel-access density guard
+- [x] Verify-before-sign claim architecture
+- [ ] BootstrapEnded: one-way chain-anchored transition to quorum governance
+- [ ] Economic events riding the certificate/chain flow
+- [ ] State persistence via chain replay
+- [ ] Pi 5 edge node deployment

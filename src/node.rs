@@ -3200,4 +3200,12 @@ mod panel_access_tests {
             );
         }
     }
+
+    #[test]
+    fn gauge_scale_invariance_holds() {
+        let fw1 = crate::ledger::state::floor_weight(1_000_000.0);
+        let fw2 = crate::ledger::state::floor_weight(1_000_000_000.0);
+        let s = 1_000_000_000.0 / 1_000_000.0;
+        assert!((fw1 / fw2 - s).abs() < 1e-10, "floor_weight must scale inversely with gauge");
+    }
 }

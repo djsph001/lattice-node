@@ -41,6 +41,16 @@ pub enum ApiRequest {
         graph_blob_b64: String,
         deadline_epoch: u64,
     },
+    SubmitClaim {
+        claim_id: String,
+        domain_tag: String,
+        claim_type: String,
+        bound_commit: String,
+        content: String,
+        #[serde(default)]
+        evidence: Vec<String>,
+        thickness: f64,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -78,6 +88,15 @@ pub enum ApiResponse {
     AgentError {
         task_id: String,
         error: String,
+    },
+    ClaimSigned {
+        claim_id: String,
+        signature: String,
+    },
+    ClaimRefused {
+        claim_id: String,
+        reason: String,
+        refused_because: String,
     },
 }
 

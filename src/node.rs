@@ -2971,6 +2971,23 @@ impl LatticeNode {
                 height: self.commit_manager.height(),
                 committed_count: self.commit_manager.height(),
             },
+            ApiRequest::SubmitClaim {
+                claim_id,
+                domain_tag,
+                claim_type,
+                bound_commit,
+                ..
+            } => match domain_tag.as_str() {
+                "STATE" => crate::claims::handle_state_claim(
+                    &self.local_key, &claim_id, &claim_type, &bound_commit,
+                ),
+                "JUDGMENT" => crate::claims::handle_judgment_claim(
+                    &self.local_key, &claim_id, &claim_type, &bound_commit,
+                ),
+                _ => ApiResponse::Error {
+                    message: format!("Unknown domain_tag: {}", domain_tag),
+                },
+            },
         };
 
         let _ = msg.reply.send(response);

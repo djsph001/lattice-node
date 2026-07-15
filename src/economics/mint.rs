@@ -30,19 +30,10 @@ use super::metrics::NodeMetrics;
 
 /// Compute the mint amount from self-reported metrics.
 ///
-/// Used when no peer receipts are available (solo operation,
-/// or before any receipts have been collected).
-///
-/// # Formula
-///
-/// ```text
-/// contribution_score =
-///     RELAY_WEIGHT       * bytes_relayed_this_epoch
-///   + ROUTE_WEIGHT       * dht_records_stored
-///   + PROPAGATION_WEIGHT * messages_propagated_this_epoch
-///
-/// mint_amount = base_rate * contribution_score
-/// ```
+/// Phase 5 scaffolding. Not used in the production mint path —
+/// self-reported metrics are diagnostics, not economic inputs.
+/// Retained for testing only.
+#[cfg(test)]
 pub fn calculate_mint(
     metrics: &NodeMetrics,
     base_rate: u64,
@@ -64,26 +55,48 @@ pub fn calculate_mint(
 ///
 /// Phase 6: trustless minting.  Only bytes and messages confirmed
 /// by at least one peer's signed receipt count toward the mint.
-/// Self-reported metrics are ignored when receipts exist.
 ///
-/// Falls back to self-reported metrics if no receipts have been
-/// collected (solo node operation).
+/// Returns 0 when no verified receipts are available — self-reported
+/// metrics are diagnostics, not economic inputs. A node with no peers
+/// to witness its relay work correctly earns nothing.
 pub fn calculate_mint_from_receipts(
     metrics: &NodeMetrics,
     base_rate: u64,
 ) -> u64 {
-    // If we have verified metrics, use them exclusively.
-    if metrics.verified_bytes_relayed > 0 || metrics.verified_messages_relayed > 0 {
-        let verified_score = RELAY_WEIGHT * metrics.verified_bytes_relayed as f64
-            + PROPAGATION_WEIGHT * metrics.verified_messages_relayed as f64;
+    let verified_score = RELAY_WEIGHT * metrics.verified_bytes_relayed as f64
+        + PROPAGATION_WEIGHT * metrics.verified_messages_relayed as f64;
 
-        let mint_amount = base_rate as f64 * verified_score;
-        if mint_amount <= 0.0 {
-            return 0;
-        }
-        return mint_amount as u64;
+    if verified_score <= 0.0 {
+        return 0;
     }
 
-    // No receipts yet — fall back to self-reported (solo node).
-    calculate_mint(metrics, base_rate)
+    let mint_amount = base_rate as f64 * verified_score;
+    mint_amount as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::metrics::NodeMetrics;
+
+    #[test]
+    fn receipt_gated_mint_returns_zero_without_verified_metrics() {
+        let metrics = NodeMetrics::new();
+        assert_eq!(calculate_mint_from_receipts(&metrics, 10), 0);
+    }
+
+    #[test]
+    fn receipt_gated_mint_returns_nonzero_with_verified_metrics() {
+        let mut metrics = NodeMetrics::new();
+        metrics.verified_bytes_relayed = 1000;
+        metrics.verified_messages_relayed = 5;
+        assert_eq!(calculate_mint_from_receipts(&metrics, 10), 10050);
+    }
+
+    #[test]
+    fn self_reported_mint_retained_as_scaffolding() {
+        let mut metrics = NodeMetrics::new();
+        metrics.bytes_relayed = 500;
+        assert_eq!(calculate_mint(&metrics, 10), 5000);
+    }
 }

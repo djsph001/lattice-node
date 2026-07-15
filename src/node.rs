@@ -557,6 +557,7 @@ impl LatticeNode {
 
         let envelope = crate::message::types::LatticeMessage::AgentTask(msg);
         let bytes = serde_cbor::to_vec(&envelope)?;
+        self.track_outbound(&bytes);
 
         match self.swarm.behaviour_mut().gossipsub.publish(
             gossipsub::IdentTopic::new(crate::network::protocol::LATTICE_AGENT_TOPIC),
@@ -1114,6 +1115,7 @@ impl LatticeNode {
             .map_err(|e| anyhow::anyhow!("failed to encode transaction message: {e}"))?;
 
         let topic = gossipsub::IdentTopic::new(LATTICE_TX_TOPIC);
+        self.track_outbound(&encoded);
         match self
             .swarm
             .behaviour_mut()
@@ -1263,7 +1265,7 @@ impl LatticeNode {
                     bytes = message.data.len(),
                     "[gossipsub] Message received"
                 );
-                self.handle_gossip_message(&message.data, propagation_source);
+                self.handle_gossip_message(&message.data, propagation_source, message.source);
             }
 
             SwarmEvent::Behaviour(LatticeBehaviourEvent::Rpc(
@@ -1539,6 +1541,7 @@ impl LatticeNode {
         };
 
         let topic = gossipsub::IdentTopic::new(LATTICE_HEARTBEAT_TOPIC);
+        self.track_outbound(&bytes);
         match self
             .swarm
             .behaviour_mut()
@@ -1561,7 +1564,7 @@ impl LatticeNode {
     }
 
     /// Handle an inbound gossip message.
-    fn handle_gossip_message(&mut self, data: &[u8], propagation_source: PeerId) {
+    fn handle_gossip_message(&mut self, data: &[u8], propagation_source: PeerId, message_source: Option<PeerId>) {
         // Track the message hash for receipt validation.
         let message_hash = blake3::hash(data);
         self.recent_message_hashes.insert(*message_hash.as_bytes());
@@ -1810,8 +1813,13 @@ impl LatticeNode {
             }
         }
 
-        // Phase 6: issue a relay receipt to the delivering peer.
-        if propagation_source != self.local_peer_id {
+        // Phase 6: issue a relay receipt to the delivering peer —
+        // but ONLY when the message originated from someone else.
+        // A receipt attests: "you carried someone else's traffic."
+        // If the message originated from the same peer that delivered it,
+        // there's no relay work to attest — they're just talking to us.
+        let is_relay = Self::is_relay_work(message_source, &propagation_source);
+        if is_relay {
             let msg_hash = *message_hash.as_bytes();
             let receipt = RelayReceipt::new(
                 propagation_source,
@@ -1930,6 +1938,25 @@ impl LatticeNode {
                 );
             }
         }
+    }
+
+    /// Track an outbound message hash so receipts for it can be validated.
+    /// Must be called BEFORE each gossipsub publish — the hash must be in
+    /// the set when the relay's receipt arrives referencing it.
+    fn track_outbound(&mut self, data: &[u8]) {
+        let hash = blake3::hash(data);
+        self.recent_message_hashes.insert(*hash.as_bytes());
+    }
+
+    /// Determine whether a message delivery constitutes relay work.
+    ///
+    /// Returns true when the message was originated by someone other than
+    /// the peer that delivered it — i.e., the deliverer carried someone
+    /// else's traffic.  At n=2 (every message is directly from its origin),
+    /// this always returns false.  At n≥3, a node that relays a message
+    /// from a third party earns a receipt.
+    fn is_relay_work(source: Option<PeerId>, propagation_source: &PeerId) -> bool {
+        source.map_or(false, |src| src != *propagation_source)
     }
 
     /// Validate a SignedReceipt and store it for the next epoch.
@@ -2537,6 +2564,7 @@ impl LatticeNode {
         // Re-encode for wire transmission (the raw bytes are the
         // certificate; we publish them directly on the topic).
         let topic = gossipsub::IdentTopic::new(LATTICE_ENCLAVE_CERT_TOPIC);
+        self.track_outbound(&raw);
         match self
             .swarm
             .behaviour_mut()
@@ -2651,6 +2679,7 @@ impl LatticeNode {
 
             let topic =
                 gossipsub::IdentTopic::new(crate::network::protocol::LATTICE_ENCLAVE_CERT_TOPIC);
+            self.track_outbound(&attestation);
             match self.swarm.behaviour_mut().gossipsub.publish(topic, attestation) {
                 Ok(msg_id) => {
                     info!(
@@ -3207,5 +3236,31 @@ mod panel_access_tests {
         let fw2 = crate::ledger::state::floor_weight(1_000_000_000.0);
         let s = 1_000_000_000.0 / 1_000_000.0;
         assert!((fw1 / fw2 - s).abs() < 1e-10, "floor_weight must scale inversely with gauge");
+    }
+
+    // ── Relay origin-check tests ────────────────────────────
+
+    #[test]
+    fn two_nodes_no_relay_source_equals_propagation() {
+        // A sends to B: source = A, propagation = A → not relay
+        let a = PeerId::random();
+        assert!(!LatticeNode::is_relay_work(Some(a), &a));
+    }
+
+    #[test]
+    fn three_nodes_relay_source_differs_from_propagation() {
+        // C sends, A relays to B: source = C, propagation = A → IS relay
+        let a = PeerId::random();
+        let c = PeerId::random();
+        assert!(LatticeNode::is_relay_work(Some(c), &a));
+    }
+
+    #[test]
+    fn no_source_always_blocks_receipt() {
+        // If source is None (corrupted message), never issue receipt
+        let a = PeerId::random();
+        let b = PeerId::random();
+        assert!(!LatticeNode::is_relay_work(None, &a));
+        assert!(!LatticeNode::is_relay_work(None, &b));
     }
 }

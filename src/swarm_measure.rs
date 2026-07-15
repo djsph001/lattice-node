@@ -15,8 +15,11 @@
 
 #[cfg(test)]
 mod swarm_tests {
-    use crate::sortition::{select_weighted_witness_panel, FLOOR_WEIGHT};
+    use crate::ledger::state::floor_weight;
+    use crate::sortition::select_weighted_witness_panel;
     use libp2p::PeerId;
+
+    const FLOOR_WEIGHT: f64 = 0.01; // local const for harness calibration
 
     /// Number of random seeds to draw per configuration.
     const DRAWS: usize = 2000;
@@ -26,6 +29,7 @@ mod swarm_tests {
     fn measure_sybil_share(honest_thickness: f64, sybil_count: usize) -> (f64, f64, f64) {
         let honest = PeerId::random();
         let sybils: Vec<PeerId> = (0..sybil_count).map(|_| PeerId::random()).collect();
+        let fw = floor_weight(crate::ledger::state::THICKNESS_GAUGE);
 
         // Build the weighted pool
         let mut pool: Vec<(PeerId, f64)> = vec![(honest, honest_thickness)];
@@ -47,7 +51,7 @@ mod swarm_tests {
             seed_bytes.extend_from_slice(&(i as u64).to_be_bytes());
             let seed = hex::encode(blake3::hash(&seed_bytes).as_bytes());
 
-            let panel = select_weighted_witness_panel(&seed[..16], &pool, &exclusions);
+            let panel = select_weighted_witness_panel(&seed[..16], &pool, &exclusions, fw);
 
             let sybil_seats = panel.iter().filter(|p| sybils.contains(p)).count();
             total_sybil_seats += sybil_seats;
@@ -193,6 +197,7 @@ mod swarm_tests {
         let per_honest = total_thickness / honest_count as f64;
         let honest: Vec<PeerId> = (0..honest_count).map(|_| PeerId::random()).collect();
         let sybils: Vec<PeerId> = (0..sybil_count).map(|_| PeerId::random()).collect();
+        let fw = floor_weight(crate::ledger::state::THICKNESS_GAUGE);
 
         let mut pool: Vec<(PeerId, f64)> = honest.iter().map(|h| (*h, per_honest)).collect();
         for s in &sybils {
@@ -211,7 +216,7 @@ mod swarm_tests {
             seed_bytes.extend_from_slice(&(i as u64).to_be_bytes());
             let seed = hex::encode(blake3::hash(&seed_bytes).as_bytes());
 
-            let panel = select_weighted_witness_panel(&seed[..16], &pool, &exclusions);
+            let panel = select_weighted_witness_panel(&seed[..16], &pool, &exclusions, fw);
 
             let sybil_seats = panel.iter().filter(|p| sybils.contains(p)).count();
             let honest_seats = panel.iter().filter(|p| honest.contains(p)).count();
@@ -252,6 +257,7 @@ mod swarm_tests {
         let per_honest = total_honest_thickness / honest_count as f64;
         let honest: Vec<PeerId> = (0..honest_count).map(|_| PeerId::random()).collect();
         let sybils: Vec<PeerId> = (0..sybil_count).map(|_| PeerId::random()).collect();
+        let fw = floor_weight(crate::ledger::state::THICKNESS_GAUGE);
 
         let mut pool: Vec<(PeerId, f64)> = honest.iter().map(|h| (*h, per_honest)).collect();
         for s in &sybils {
@@ -275,7 +281,7 @@ mod swarm_tests {
             seed_bytes.extend_from_slice(&(i as u64).to_be_bytes());
             let seed = hex::encode(blake3::hash(&seed_bytes).as_bytes());
 
-            let panel = select_weighted_witness_panel(&seed[..16], &pool, &exclusions);
+            let panel = select_weighted_witness_panel(&seed[..16], &pool, &exclusions, fw);
 
             // Build a lookup: PeerId → raw thickness (before floor-clamp)
             let raw_weights: std::collections::HashMap<PeerId, f64> = pool

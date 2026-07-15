@@ -233,6 +233,7 @@ pub struct LatticeNode {
     /// honest_T must exceed N_eligible × floor_weight × margin before
     /// witness panels can form.
     density_margin: f64,
+    thickness_gauge: f64,
     /// Phase 9: model execution bridge (Ollama).
     executor: crate::agent::executor::OllamaExecutor,
     /// Phase 9: channel sender for background execution results.
@@ -265,6 +266,7 @@ impl LatticeNode {
         no_economics: bool,
         floor_weight: f64,
         density_margin: f64,
+    thickness_gauge: f64,
     ) -> Result<Self> {
         let key_path = resolve_identity_path(identity_dir)?;
         let local_key = load_or_generate_identity(&key_path, fresh_identity)?;
@@ -476,6 +478,7 @@ impl LatticeNode {
             no_economics,
             floor_weight,
             density_margin,
+            thickness_gauge,
             executor: crate::agent::executor::OllamaExecutor::new(),
             exec_tx: None,
         })
@@ -2595,10 +2598,10 @@ impl LatticeNode {
 
         // ── Panel-access invariant guard ──────────────────────
         // Conservative: count ALL pool members as potentially Sybil.
-        if !check_panel_access_density(&weighted_pool, self.density_margin) {
+        if !check_panel_access_density(&weighted_pool, self.density_margin, self.floor_weight) {
             warn!(
                 n_eligible = weighted_pool.len(),
-                floor_weight = crate::sortition::FLOOR_WEIGHT,
+                floor_weight = self.floor_weight,
                 margin = self.density_margin,
                 "[governance] Panel REFUSED — insufficient trust density. Mesh stays participation-only."
             );
@@ -2610,6 +2613,7 @@ impl LatticeNode {
             &cert.witness_seed,
             &weighted_pool,
             &self.escalation_exclusions,
+            self.floor_weight,
         );
 
         if crate::sortition::is_local_witness(&panel, &self.local_peer_id) {
@@ -3003,17 +3007,17 @@ impl LatticeNode {
 /// Threshold = N_eligible × FLOOR_WEIGHT × density_margin.
 ///
 /// Returns true if the panel can safely form, false if it should be refused.
-fn check_panel_access_density(pool: &[(PeerId, f64)], density_margin: f64) -> bool {
+fn check_panel_access_density(pool: &[(PeerId, f64)], density_margin: f64, floor_weight: f64) -> bool {
     let honest_t: f64 = pool
         .iter()
         .map(|(_, w)| *w)
-        .filter(|w| *w > crate::sortition::FLOOR_WEIGHT)
+        .filter(|w| *w > floor_weight)
         .sum();
     let n_eligible = pool.len();
     if n_eligible == 0 {
         return false;
     }
-    let sybil_floor_total = n_eligible as f64 * crate::sortition::FLOOR_WEIGHT;
+    let sybil_floor_total = n_eligible as f64 * floor_weight;
     let threshold = sybil_floor_total * density_margin;
     honest_t >= threshold
 }
@@ -3109,7 +3113,7 @@ mod panel_access_tests {
         let pool: Vec<(PeerId, f64)> = (0..10)
             .map(|_| (PeerId::random(), 0.0))
             .collect();
-        assert!(!check_panel_access_density(&pool, 2.0));
+        assert!(!check_panel_access_density(&pool, 2.0, 0.01));
     }
 
     #[test]
@@ -3121,7 +3125,7 @@ mod panel_access_tests {
         for _ in 0..9 {
             pool.push((PeerId::random(), 0.0));
         }
-        assert!(check_panel_access_density(&pool, 2.0));
+        assert!(check_panel_access_density(&pool, 2.0, 0.01));
     }
 
     #[test]
@@ -3132,19 +3136,19 @@ mod panel_access_tests {
             .collect();
 
         // Sparse: N=5, threshold = 5 × 0.01 × 2.0 = 0.10, honest_T=0 → REFUSE
-        assert!(!check_panel_access_density(&pool, 2.0));
+        assert!(!check_panel_access_density(&pool, 2.0, 0.01));
 
         // Add honest node with T=50
         pool.push((PeerId::random(), 50.0));
 
         // Dense: N=6, threshold = 6 × 0.01 × 2.0 = 0.12, honest_T=50 → PERMIT
-        assert!(check_panel_access_density(&pool, 2.0));
+        assert!(check_panel_access_density(&pool, 2.0, 0.01));
     }
 
     #[test]
     fn empty_pool_refuses() {
         let pool: Vec<(PeerId, f64)> = vec![];
-        assert!(!check_panel_access_density(&pool, 2.0));
+        assert!(!check_panel_access_density(&pool, 2.0, 0.01));
     }
 
     #[test]
@@ -3158,7 +3162,7 @@ mod panel_access_tests {
             (PeerId::random(), 0.0),
             (PeerId::random(), 0.0),
         ];
-        assert!(check_panel_access_density(&pool, 2.0));
+        assert!(check_panel_access_density(&pool, 2.0, 0.01));
     }
 
     #[test]
@@ -3172,11 +3176,11 @@ mod panel_access_tests {
             (PeerId::random(), 0.0),
         ];
         // margin 2.0: threshold = 5 × 0.01 × 2.0 = 0.10, honest_T=1.0 → pass
-        assert!(check_panel_access_density(&pool, 2.0));
+        assert!(check_panel_access_density(&pool, 2.0, 0.01));
         // margin 10.0: threshold = 5 × 0.01 × 10.0 = 0.50, honest_T=1.0 → still pass
-        assert!(check_panel_access_density(&pool, 10.0));
+        assert!(check_panel_access_density(&pool, 10.0, 0.01));
         // margin 2000.0: threshold = 5 × 0.01 × 2000 = 100, honest_T=1.0 → FAIL
-        assert!(!check_panel_access_density(&pool, 2000.0));
+        assert!(!check_panel_access_density(&pool, 2000.0, 0.01));
     }
 
     #[test]
@@ -3188,10 +3192,11 @@ mod panel_access_tests {
         // For N_all=10: need honest_T >= 0.20
         // For N_all=100: need honest_T >= 2.00
         for n in &[2u64, 3, 5, 10, 50, 100] {
-            let threshold = *n as f64 * crate::sortition::FLOOR_WEIGHT * 2.0;
+            let floor_weight = 0.01;
+            let threshold = *n as f64 * floor_weight * 2.0;
             eprintln!(
                 "N_all={}: honest_T needed >= {:.4} (conservative, margin=2.0, floor={:.4})",
-                n, threshold, crate::sortition::FLOOR_WEIGHT
+                n, threshold, floor_weight
             );
         }
     }

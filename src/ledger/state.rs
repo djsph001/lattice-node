@@ -7,6 +7,26 @@ use tracing::{debug, info, warn};
 use super::thickness::ThicknessGraph;
 use super::types::{DigitalUtilityUnit, ResourceClaim, Transaction};
 
+/// ── Thickness gauge ─────────────────────────────────────────────────
+///
+/// This is a UNIT DEFINITION, not a measured constant. It determines how
+/// many thickness units one byte of verified storage mints. Changing it
+/// changes every thickness number in the system by the same factor, and
+/// must change NOTHING about system behavior — the system is scale-invariant.
+///
+/// 10 MiB at 1.0 health → ~10.5 thickness. This is an ergonomic choice,
+/// keeping typical thickness values in the human-readable 1–1000 range.
+/// The value 10^6 has no security significance; any power-of-ten divisor
+/// produces equivalent behavior as long as all thickness constants are
+/// expressed as ratios to this gauge.
+pub const THICKNESS_GAUGE: f64 = 1_000_000.0;
+
+/// Compute floor weight from the gauge at runtime.
+/// floor = 10_000 / gauge ≈ equivalent of ~10 KiB verified storage.
+pub fn floor_weight(gauge: f64) -> f64 {
+    10_000.0 / gauge
+}
+
 /// How many epochs must pass before a previously-verified claim
 /// is due for re-verification.
 const VERIFICATION_INTERVAL: u64 = 5;
@@ -216,9 +236,9 @@ impl LedgerState {
 
         // Layer 1 thickness: verified storage contribution mints thickness.
         // This is the ONLY source of NEW thickness in the provenance graph.
-        // Amount = size_bytes × tenure_health / 1_000_000, so a 10 MiB
-        // resource at 1.0 health mints ~10.5 thickness units.
-        let thickness_amount = (claim.size_bytes as f64 * claim.tenure_health) / 1_000_000.0;
+        // Amount = size_bytes × tenure_health / THICKNESS_GAUGE.
+        // The gauge is a unit definition, not a security parameter.
+        let thickness_amount = (claim.size_bytes as f64 * claim.tenure_health) / THICKNESS_GAUGE;
         if thickness_amount > 0.0 {
             self.thickness_graph.add_verified_contribution(
                 peer,

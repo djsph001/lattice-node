@@ -103,6 +103,12 @@ struct Cli {
     #[arg(long, default_value_t = 2.0)]
     density_margin: f64,
 
+    /// Thickness gauge — unit definition mapping bytes → thickness.
+    /// The divisor governing the earning rate. Default 1_000_000
+    /// (10 MiB verified → ~10.5 thickness). Runtime-configurable.
+    #[arg(long, default_value_t = 1_000_000.0)]
+    thickness_gauge: f64,
+
     // ── Phase 6: storage verification ──────────────────────
     /// Directory for verified resource storage (blake3-addressed
     /// chunk files).  Defaults to ./lattice-storage.
@@ -253,6 +259,7 @@ async fn main() -> Result<()> {
         no_economics,
         cli.floor_weight,
         cli.density_margin,
+        cli.thickness_gauge,
     )?;
 
     info!(

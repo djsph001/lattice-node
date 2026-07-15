@@ -47,7 +47,6 @@ pub enum ApiRequest {
         claim_type: String,
         bound_commit: String,
         content: String,
-        #[serde(default)]
         evidence: Vec<String>,
         thickness: f64,
     },

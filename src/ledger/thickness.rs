@@ -31,6 +31,26 @@ pub enum ThicknessSource {
         receipt_id: ReceiptId,
     },
 
+    /// Thickness granted at genesis — the explicit trusted-setup exception.
+    /// Honest about its status: this is a trust-granting JUDGMENT act,
+    /// not a trust-earning one. Fires only once, into an empty graph,
+    /// to the operator-designated root of trust. Auditable.
+    ///
+    /// `amortize_over`: if Some(N), the genesis edge self-liquidates over
+    /// N verified contributions — each contribution reduces the edge by
+    /// `amount / N`. None = permanent (no decay). Contribution-denominated,
+    /// rate-independent, timer-independent.
+    ///
+    /// WARNING: choosing None creates a permanent founder floor. As the mesh
+    /// grows in participants, `root_thickness / individual_peer_thickness`
+    /// INCREASES — the founder becomes the single largest individual holder.
+    /// Weighted panel voting is per-capita-among-members, not share-of-total,
+    /// so this floor grants a permanent plurality in every governance panel.
+    /// Prefer Some(N) for any mesh intended to decentralize over time.
+    Genesis {
+        amortize_over: Option<u64>,
+    },
+
     /// Derived via a vouch. Carries the voucher + the vouch nonce so
     /// clawback (Layer 2) can traverse the chain back.
     Vouch {
@@ -71,11 +91,14 @@ pub struct ThicknessGraph {
     /// key = beneficiary PeerId; value = list of edges feeding their thickness.
     edges: HashMap<PeerId, Vec<ThicknessEdge>>,
 
-    /// Thickness encumbered by outgoing vouches. When a node vouches for
-    /// someone, the staked fraction is marked as encumbered — it can't be
-    /// staked again.
+    /// Thickness encumbered by outgoing vouches.
     /// key = voucher PeerId; value = total encumbered thickness.
     encumbered: HashMap<PeerId, f64>,
+
+    /// Genesis guard: true after first genesis mints root thickness.
+    /// Ensures genesis is a one-time trusted-setup act, not an ongoing
+    /// mint-from-nothing backdoor.
+    genesis_used: bool,
 }
 
 impl ThicknessGraph {
@@ -84,6 +107,177 @@ impl ThicknessGraph {
         Self {
             edges: HashMap::new(),
             encumbered: HashMap::new(),
+            genesis_used: false,
+        }
+    }
+
+    /// Mint root thickness at genesis — explicit trusted-setup exception.
+    ///
+    /// This is a JUDGMENT act, not an earned one: the operator designates
+    /// a root of trust by fiat. Fires only once, into an empty graph.
+    /// After genesis, all thickness enters via VerifiedContribution or Vouch.
+    ///
+    /// Returns error if genesis has already been used or if the graph is
+    /// not empty (genesis is a one-time, first-act-only event).
+    /// `amortize_over`: if Some(N), genesis self-liquidates over N contributions.
+    /// None = permanent. Contribution-denominated, rate-independent.
+    pub fn add_genesis_thickness(
+        &mut self,
+        root: &PeerId,
+        amount: f64,
+        amortize_over: Option<u64>,
+    ) -> Result<(), String> {
+        if self.genesis_used {
+            return Err("genesis has already been used — cannot mint twice".into());
+        }
+        if self.edges.len() > 0 || self.peer_count() > 0 {
+            return Err("genesis requires an empty graph".into());
+        }
+        let edge = ThicknessEdge {
+            source: ThicknessSource::Genesis { amortize_over },
+            amount,
+            created: Utc::now(),
+        };
+        self.edges.entry(*root).or_default().push(edge);
+        self.genesis_used = true;
+        Ok(())
+    }
+
+    /// Amortize genesis: each verified contribution reduces the genesis
+    fn amortize_genesis(&mut self, _contribution_amount: f64) {
+        // Collect amortization targets first (avoid borrow conflicts)
+        let mut updates: Vec<(PeerId, usize, f64)> = Vec::new();
+        let mut to_remove: Vec<(PeerId, usize)> = Vec::new();
+
+        for (peer, edges) in self.edges.iter() {
+            for (idx, edge) in edges.iter().enumerate() {
+                if let ThicknessSource::Genesis { amortize_over } = &edge.source {
+                    if let Some(n) = amortize_over {
+                        if *n > 0 {
+                            let decay = edge.amount / *n as f64;
+                            let new_amount = (edge.amount - decay).max(0.0);
+                            updates.push((*peer, idx, new_amount));
+                            if new_amount <= 0.0 || *n <= 1 {
+                                to_remove.push((*peer, idx));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply amount updates (use amortize_over to also decrement remaining)
+        for (peer, idx, new_amount) in &updates {
+            if let Some(edges) = self.edges.get_mut(peer) {
+                if *idx < edges.len() {
+                    edges[*idx].amount = *new_amount;
+                    // Decrement amortize_over
+                    if let ThicknessSource::Genesis { amortize_over: ref mut remain } = &mut edges[*idx].source {
+                        if let Some(n) = remain {
+                            *remain = Some(n.saturating_sub(1));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Remove fully-amortized edges (reverse for index stability)
+        to_remove.sort_by_key(|(p, i)| (*p, *i));
+        to_remove.reverse();
+        for (peer, idx) in to_remove {
+            if let Some(edges) = self.edges.get_mut(&peer) {
+                if idx < edges.len() {
+                    edges.remove(idx);
+                    if edges.is_empty() {
+                        self.edges.remove(&peer);
+                    }
+                }
+            }
+        }
+
+        // Propagate decay through vouchees: for each voucher whose thickness
+        // changed, re-divide all their vouchees proportionally.
+        // Also reduce encumbrance if genesis decay reduced the voucher's total.
+        for (peer, idx, new_amount) in &updates {
+            let total = self.total_thickness(peer);
+            if total > 0.0 {
+                if let Some(enc) = self.encumbered.get_mut(peer) {
+                    *enc = (*enc).min(total);
+                }
+            } else {
+                // Total is zero — release all encumbrance AND remove all
+                // vouchees transitively (recursive: their vouchees go too).
+                self.encumbered.remove(peer);
+                self.remove_vouchees_recursive(peer);
+                continue; // skip re_divide — nothing left to divide
+            }
+            self.re_divide_vouchees(peer);
+        }
+    }
+
+    /// Remove all Vouch edges where this peer is the voucher, recursively
+    /// clearing their vouchees too. Called when a peer's total thickness
+    /// hits zero (genesis fully liquidated).
+    fn remove_vouchees_recursive(&mut self, voucher: &PeerId) {
+        // Collect vouchees of this voucher
+        let mut vouchees: Vec<PeerId> = Vec::new();
+        for (p, edges) in self.edges.iter_mut() {
+            let before = edges.len();
+            edges.retain(|e| {
+                !matches!(&e.source, ThicknessSource::Vouch { voucher: v, .. } if v == voucher)
+            });
+            if edges.len() < before {
+                vouchees.push(*p);
+            }
+        }
+        // Clean empty entries
+        for p in &vouchees {
+            if self.edges.get(p).map_or(true, |e| e.is_empty()) {
+                self.edges.remove(p);
+            }
+        }
+        // Recursively clear their vouchees (transitive propagation)
+        for v in &vouchees {
+            if self.total_thickness(v) == 0.0 {
+                self.encumbered.remove(v);
+                self.remove_vouchees_recursive(v);
+            }
+        }
+    }
+
+    /// Re-divide all vouchees of a voucher proportionally when their
+    /// total thickness changes (genesis amortization, etc.).
+    fn re_divide_vouchees(&mut self, voucher: &PeerId) {
+        let total_enc = self.encumbered.get(voucher).copied().unwrap_or(0.0);
+        if total_enc <= 0.0 {
+            return;
+        }
+
+        // Count active vouchees for this voucher
+        let remaining_count = self
+            .edges
+            .values()
+            .flatten()
+            .filter(|e| {
+                matches!(&e.source, ThicknessSource::Vouch { voucher: v, .. } if v == voucher)
+            })
+            .count();
+
+        if remaining_count == 0 {
+            return;
+        }
+
+        let per_vouchee = total_enc / remaining_count as f64;
+
+        // Re-divide
+        for edges in self.edges.values_mut() {
+            for edge in edges.iter_mut() {
+                if let ThicknessSource::Vouch { voucher: v, .. } = &edge.source {
+                    if v == voucher {
+                        edge.amount = per_vouchee;
+                    }
+                }
+            }
         }
     }
 
@@ -102,14 +296,17 @@ impl ThicknessGraph {
         (total - encumbered).max(0.0)
     }
 
-    /// Mint new thickness from a verified contribution. This is the ONLY
-    /// source of NEW thickness.
+    /// Mint new thickness from a verified contribution. Also amortizes
+    /// genesis edges (contribution-denominated decay).
     pub fn add_verified_contribution(
         &mut self,
         peer: &PeerId,
         receipt_id: ReceiptId,
         amount: f64,
     ) {
+        // Amortize genesis before adding — contribution-denominated.
+        self.amortize_genesis(amount);
+
         let edge = ThicknessEdge {
             source: ThicknessSource::VerifiedContribution { receipt_id },
             amount,
@@ -703,6 +900,181 @@ mod tests {
             "Released stake ({}) must equal Bob's loss ({})",
             stake_to_release,
             bob_loss
+        );
+    }
+
+    // ── Genesis tests ───────────────────────────────────────
+
+    #[test]
+    fn genesis_mints_root_thickness_into_empty_graph() {
+        let mut graph = ThicknessGraph::new();
+        let root = PeerId::random();
+
+        assert!(!graph.genesis_used);
+        graph.add_genesis_thickness(&root, 1000.0, None).unwrap();
+
+        assert!(graph.genesis_used);
+        assert_eq!(graph.total_thickness(&root), 1000.0);
+        assert_eq!(graph.usable_thickness(&root), 1000.0);
+
+        let edges = graph.edges_for(&root);
+        assert_eq!(edges.len(), 1);
+        assert!(matches!(edges[0].source, ThicknessSource::Genesis { .. }));
+    }
+
+    #[test]
+    fn genesis_fails_when_already_used() {
+        let mut graph = ThicknessGraph::new();
+        let root = PeerId::random();
+
+        graph.add_genesis_thickness(&root, 500.0, None).unwrap();
+        let result = graph.add_genesis_thickness(&root, 500.0, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("already been used"));
+    }
+
+    #[test]
+    fn genesis_fails_on_non_empty_graph() {
+        let mut graph = ThicknessGraph::new();
+        let p = PeerId::random();
+
+        // Add a verified contribution first (graph is non-empty)
+        graph.add_verified_contribution(&p, [0xAA; 32], 100.0);
+
+        // Genesis should now fail
+        let result = graph.add_genesis_thickness(&p, 500.0, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty graph"));
+    }
+
+    #[test]
+    fn genesis_then_operator_vouch_provenance_chain() {
+        // The intended flow: Genesis → operator(root) → vouch → Lumen
+        let mut graph = ThicknessGraph::new();
+        let root = PeerId::random();    // Dale (operator)
+        let lumen = PeerId::random();   // Lumen (executor)
+
+        // 1. Genesis mints thickness to operator
+        graph.add_genesis_thickness(&root, 1000.0, None).unwrap();
+        assert_eq!(graph.total_thickness(&root), 1000.0);
+
+        // 2. Operator vouches Lumen with 20% of root thickness
+        graph.stake_vouch(&root, &lumen, 0.20, 1, None).unwrap();
+        assert_eq!(graph.total_thickness(&lumen), 200.0);
+        assert_eq!(graph.encumbered_for(&root), 200.0);
+
+        // 3. Provenance: Lumen's thickness traces to root's Genesis via Vouch edge
+        let lumen_edges = graph.edges_for(&lumen);
+        match &lumen_edges[0].source {
+            ThicknessSource::Vouch { voucher, .. } => {
+                assert_eq!(*voucher, root);
+            }
+            _ => panic!("expected Vouch from root to Lumen"),
+        }
+    }
+
+    #[test]
+    fn genesis_amortizes_over_contributions() {
+        let mut graph = ThicknessGraph::new();
+        let root = PeerId::random();
+        let peer = PeerId::random();
+
+        graph.add_genesis_thickness(&root, 1000.0, Some(100)).unwrap();
+        assert_eq!(graph.total_thickness(&root), 1000.0);
+
+        // Each contribution by PEER (not root) reduces root's genesis by 1000/100=10
+        for i in 1..=100 {
+            let before = graph.total_thickness(&root);
+            graph.add_verified_contribution(&peer, [0xAA; 32], 10.0);
+            let after = graph.total_thickness(&root);
+
+            if i < 100 {
+                assert!(after < before, "root genesis should decay at contribution {}", i);
+            }
+        }
+
+        // After 100 contributions, genesis fully amortized — root has zero
+        assert_eq!(graph.total_thickness(&root), 0.0);
+    }
+
+    #[test]
+    fn genesis_without_amortization_is_permanent() {
+        let mut graph = ThicknessGraph::new();
+        let root = PeerId::random();
+
+        graph.add_genesis_thickness(&root, 1000.0, None).unwrap();
+        let genesis_before = graph.total_thickness(&root);
+
+        // Add many contributions — genesis should be untouched
+        for _ in 0..50 {
+            graph.add_verified_contribution(&root, [0xBB; 32], 10.0);
+        }
+
+        let genesis_after = graph.total_thickness(&root);
+        // root has genesis + earned, so total > genesis_before
+        assert!(genesis_after > genesis_before);
+        // but genesis itself is still intact (present in total)
+        let has_genesis = graph.edges_for(&root).iter().any(|e| {
+            matches!(&e.source, ThicknessSource::Genesis { .. })
+        });
+        assert!(has_genesis, "genesis with amortize_over=None should be permanent");
+    }
+
+    #[test]
+    fn vouched_genesis_decays_with_source() {
+        // Root vouches genesis to Lumen → Lumen's derived thickness
+        // must decay as genesis amortizes. Otherwise root can launder
+        // genesis by vouching it out before decay hits.
+        let mut graph = ThicknessGraph::new();
+        let root = PeerId::random();
+        let lumen = PeerId::random();
+        let peer = PeerId::random(); // earns contributions to drive decay
+
+        // Genesis + vouch at n=0
+        graph.add_genesis_thickness(&root, 1000.0, Some(20)).unwrap();
+        graph.stake_vouch(&root, &lumen, 0.90, 1, None).unwrap();
+        // Lumen gets 900 of genesis-derived thickness
+        assert_eq!(graph.total_thickness(&lumen), 900.0);
+
+        // Advance through all 20 contributions (genesis fully liquidated)
+        for _ in 0..20 {
+            graph.add_verified_contribution(&peer, [0xAA; 32], 10.0);
+        }
+
+        // Genesis is fully amortized — root has zero thickness.
+        assert_eq!(graph.total_thickness(&root), 0.0);
+        // Lumen's genesis-derived thickness must also be gone.
+        assert_eq!(
+            graph.total_thickness(&lumen), 0.0,
+            "Lumen's genesis-derived thickness must decay with its source"
+        );
+    }
+
+    #[test]
+    fn genesis_decay_propagates_transitively() {
+        // Genesis → Root → Lumen → Charlie.
+        // Full liquidation must reach Charlie, not just Lumen.
+        let mut graph = ThicknessGraph::new();
+        let root = PeerId::random();
+        let lumen = PeerId::random();
+        let charlie = PeerId::random();
+        let peer = PeerId::random();
+
+        graph.add_genesis_thickness(&root, 1000.0, Some(10)).unwrap();
+        graph.stake_vouch(&root, &lumen, 0.90, 1, None).unwrap();
+        graph.stake_vouch(&lumen, &charlie, 0.50, 2, None).unwrap();
+
+        assert!(graph.total_thickness(&charlie) > 0.0);
+
+        for _ in 0..10 {
+            graph.add_verified_contribution(&peer, [0xAA; 32], 10.0);
+        }
+
+        assert_eq!(graph.total_thickness(&root), 0.0);
+        assert_eq!(graph.total_thickness(&lumen), 0.0);
+        assert_eq!(
+            graph.total_thickness(&charlie), 0.0,
+            "Charlie must lose genesis-derived thickness — transitive propagation"
         );
     }
 }

@@ -80,29 +80,23 @@ pub fn is_local_witness(panel: &[PeerId], local_id: &PeerId) -> bool {
 /// Select a deterministic 5-person Witness panel, weighted by thickness.
 ///
 /// Each candidate's selection probability is proportional to their weight.
-/// Weights are floor-clamped to `FLOOR_WEIGHT` so new honest nodes retain
+/// Weights are floor-clamped to `floor_weight` so new honest nodes retain
 /// a nonzero chance of selection (the exploration epsilon from the mycelial
 /// routing design).
 ///
 /// # Arguments
-/// * `witness_seed` — The witness_seed from the ImpactCertificate (16 hex chars).
-/// * `peer_pool` — All available peers with their thickness weights.
-/// * `exclusions` — Peers excluded due to recent escalation participation.
 ///
-/// # Returns
-/// Up to 5 PeerIds. Fewer if the pool (after exclusions + zero-weight filter) is smaller.
-pub const FLOOR_WEIGHT: f64 = 0.01;
-
 pub fn select_weighted_witness_panel(
     witness_seed: &str,
     peer_pool: &[(PeerId, f64)],
     exclusions: &[PeerId],
+    floor_weight: f64,
 ) -> Vec<PeerId> {
     // Filter out excluded peers and apply floor weight
     let mut pool: Vec<(PeerId, f64)> = peer_pool
         .iter()
         .filter(|(p, _)| !exclusions.contains(p))
-        .map(|(p, w)| (*p, w.max(FLOOR_WEIGHT)))
+        .map(|(p, w)| (*p, w.max(floor_weight)))
         .collect();
 
     if pool.is_empty() {
@@ -242,8 +236,8 @@ mod tests {
             .collect();
         let exclusions: Vec<PeerId> = vec![];
 
-        let panel_a = select_weighted_witness_panel("b644ae83dae8edc6", &peers, &exclusions);
-        let panel_b = select_weighted_witness_panel("b644ae83dae8edc6", &peers, &exclusions);
+        let panel_a = select_weighted_witness_panel("b644ae83dae8edc6", &peers, &exclusions, 0.01);
+        let panel_b = select_weighted_witness_panel("b644ae83dae8edc6", &peers, &exclusions, 0.01);
 
         assert_eq!(panel_a, panel_b, "Same seed must produce same panel");
         assert_eq!(panel_a.len(), 5, "Must select 5 from sufficient pool");
@@ -260,7 +254,7 @@ mod tests {
         }
         let exclusions: Vec<PeerId> = vec![];
 
-        let panel = select_weighted_witness_panel("b644ae83dae8edc6", &peers, &exclusions);
+        let panel = select_weighted_witness_panel("b644ae83dae8edc6", &peers, &exclusions, 0.01);
         assert_eq!(panel.len(), 5, "Must select 5 from pool of 20");
 
         // The heavy node should appear (it dominates the weight), but it shouldn't
@@ -280,7 +274,7 @@ mod tests {
             .collect();
         let exclusions: Vec<PeerId> = peers.iter().take(10).map(|(p, _)| *p).collect();
 
-        let panel = select_weighted_witness_panel("b644ae83dae8edc6", &peers, &exclusions);
+        let panel = select_weighted_witness_panel("b644ae83dae8edc6", &peers, &exclusions, 0.01);
 
         for excluded in &exclusions {
             assert!(
@@ -295,7 +289,7 @@ mod tests {
         let peers: Vec<(PeerId, f64)> = vec![];
         let exclusions: Vec<PeerId> = vec![];
 
-        let panel = select_weighted_witness_panel("b644ae83dae8edc6", &peers, &exclusions);
+        let panel = select_weighted_witness_panel("b644ae83dae8edc6", &peers, &exclusions, 0.01);
         assert!(panel.is_empty());
     }
 }

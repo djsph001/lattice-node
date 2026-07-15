@@ -1,9 +1,12 @@
-# Claim Report Format v1
+# Claim Report Format v3
 
-**Status:** Interface artifact. This format defines the claim-report structure emitted
-by the executor and consumed by the verifier. It is the machine-readable interface
-between agent and verification layer, and by the taxonomy's own rules, every STATE
-claim in a report is subject to mechanical re-verification and per-claim staking.
+**Status:** Interface artifact. v1 designed 2026-07-14, forward-probated 2026-07-14
+against commit `8c1baeb`. Probation confirmed: (1) STATE claims mechanically verify
+against bound_commit — structure sound; (2) security model (signing, stake, clawback)
+entirely unprobated — signing infra prerequisite; (3) evidence-relevance gap found
+in live use — c9 and c10 both attached true-but-category-mismatched STATE evidence
+to JUDGMENT claims. v3 adds explicit `asserts` relevance-claims to evidence edges
+to make the relevance JUDGMENT visible and auditable. See §6 (Probation Record).
 
 **Depends on:** Taxonomy-v2 for claim types, Layer 2 per-vouch clawback for enforcement.
 
@@ -41,15 +44,29 @@ by timestamp-age checks (same pattern as Transaction timestamp freshness).
 SignedClaim {
   id:            ClaimId      # unique within this report (required, for evidence edges)
   claim:         Claim        # the typed claim, STATE or JUDGMENT (required)
-  evidence:      [ClaimId]    # JUDGMENT only: which STATE claims evidence this (≥1)
+  evidence:      [EvidenceEdge] # JUDGMENT only: STATE claims evidencing this (≥1)
   stake_amount:  f64          # STATE only: thickness staked on truthfulness (≥ type-minimum)
   signature:     Ed25519Sig   # executor's signature over (id || claim || evidence || stake_amount)
 }
+
+EvidenceEdge {
+  claim_id:      ClaimId      # which STATE claim is referenced (required)
+  asserts:       str          # HOW this claim is relevant to the judgment (required, v3)
+                              # e.g. "confirms the griefing-bound test passes,
+                              #        which directly asserts the invariant"
+}
 ```
 
-Identity is RECOVERED from the signature, not asserted as a separate field.
-A separate `staker: PeerId` field would create a forgery seam where asserted
-identity and signing key could disagree. The signature is authoritative.
+The `asserts` field makes the relevance-claim **explicit and auditable.** The executor
+must state the relationship between evidence and judgment in its own words. This
+prevents the category-mismatch smuggle: "docs exist therefore architecture valid"
+must be written, and writing it makes its weakness visible. The human audits the
+stated relevance — a systematically bad `asserts` is a pattern the audit catches.
+
+The evidence `claim_id` must reference a STATE claim within the same report that
+*verified true*. Evidence edges pointing to false or nonexistent claims are flagged
+as malformed. Evidence edges pointing to true-but-irrelevant claims are caught by
+the human audit of the `asserts` field.
 
 ### 1.3 Claim — the typed claim payload
 
@@ -209,7 +226,10 @@ ClaimReport {
       id: "c4"
       claim: { claim_type: "design-complete",
                 fields: { artifact: "Layer 2 bounded clawback" } }
-      evidence: ["c1", "c3"]
+      evidence: [
+        { claim_id: "c1", asserts: "47 tests pass confirms the implementation compiles and runs" },
+        { claim_id: "c3", asserts: "swarm harness measurements confirm the defense holds at measured parameters" }
+      ]
       stake_amount: 0.0       // JUDGMENT — no stake
       signature: <Ed25519 sig>
     }
@@ -221,11 +241,58 @@ Verifier pass:
 1. c1 (test-result): re-run `cargo test --lib` against bound_commit → 47/0 → verified_true, stake 1.5 released.
 2. c2 (build-result): re-run `cargo build --all` against bound_commit → exit 0 → verified_true, stake 1.0 released.
 3. c3 (harness-result): re-run swarm harness against bound_commit → measurements match → verified_true, stake 2.0 released.
-4. c4 (design-complete): evidence c1 + c3 both verified_true → attach verified evidence → route to human.
+4. c4 (design-complete): evidence c1 + c3 both verified_true, `asserts` fields make the
+   relevance-claims explicit → human audits the stated relationships, not the raw evidence.
 
 ---
 
-## 5. Self-assessment
+## 6. Probation Record — v1 forward-probation (2026-07-14)
+
+The format was forward-probated against commit `8c1baeb` with a real 10-claim
+report (7 STATE, 3 JUDGMENT). All 7 STATE claims were mechanically verified
+against the checked-out commit — all verified true.
+
+### Findings
+
+**Finding 1 — Security model entirely unprobated.** Every claim carried
+`<NOT YET SIGNED>` because no signing/identity infrastructure exists. The
+stake/clawback model (the Phase-6-inward point) is structurally specified
+but operationally inert. The mechanical-verifier build has a hard prerequisite:
+signing/identity infra must exist before claims can be attributed, staked, or
+clawed back.
+
+**Finding 2 — Evidence-relevance unenforceable by format alone.** Two JUDGMENT
+claims (c9: design-complete, c10: architecture-valid) attached true-but-category-mismatched
+STATE evidence. c9: "tests pass + build works = design complete" — plausible-looking
+but implementation-evidence ≠ design-completeness. c10: "docs exist = architecture
+valid" — visibly mismatched. Both satisfied the ≥1-STATE-evidence rule while being
+category-mismatched. The evidence was *true* but *irrelevant to the judgment*.
+
+Amendment (v3): evidence edges now carry an explicit `asserts` field where the
+executor states *how* the evidence is relevant. The human audits the stated relevance
+rather than reconstructing it. This makes the category-mismatch visible — writing
+"docs exist, therefore architecture valid" reveals its own weakness.
+
+**Finding 3 — Verbosity.** Five `file-content` claims in one report is structurally
+fine but operationally noisy. Not a format defect; an operational preference for
+fewer, higher-value claims.
+
+### What passed
+
+All STATE claims verified true against bound_commit. JUDGMENT routing correct —
+every claim landed in the right bucket. The format's structural requirements
+(bound_commit, typed values, stake-on-STATE-only) held. No false claims filed.
+
+### V3 amendments
+
+- Evidence edges now carry `asserts: str` (required), making relevance-claims
+  explicit and auditable. The human audits stated relevance, not raw evidence.
+- Identity recovery from signature unchanged (security unprobated until signing
+  infra exists — this is a build prerequisite, not a format change).
+
+---
+
+## 7. Self-assessment
 
 This format is the interface between executor and verifier. It is a design artifact
 ratified by reasoning, not proven by operation. Its security rests on three properties

@@ -308,4 +308,21 @@ mod tests {
         assert_eq!(tree_before, tree_after,
             "verify_build must not change the working tree's HEAD");
     }
+
+    #[test]
+    fn bound_commit_verified_not_head() {
+        if !fixture_available() {
+            eprintln!("SKIP: fixture commits not available");
+            return;
+        }
+        let key = test_key();
+        // FIXTURE_PASSING is a foreign repo (tiny 3-line main.rs).
+        // If the node signs this claim, it correctly built the fixture
+        // at bound_commit rather than lattice-node's HEAD.
+        let resp = handle_state_claim(&key, "c8", "build-result", FIXTURE_PASSING);
+        assert!(
+            matches!(&resp, ApiResponse::ClaimSigned { .. }),
+            "Must verify at bound_commit, not HEAD. Got: {:?}", resp
+        );
+    }
 }

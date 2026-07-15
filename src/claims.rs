@@ -15,6 +15,10 @@
 use hex;
 use libp2p::identity;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static WORKTREE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 use crate::api::ApiResponse;
 
 /// Verify and sign a STATE claim. Never signs unconfirmed claims.
@@ -47,28 +51,59 @@ pub fn handle_state_claim(
     }
 }
 
-/// Verify a build-result claim by checking out bound_commit and building.
+/// Verify a build-result claim by checking out bound_commit in a temporary
+/// git worktree. Uses `git worktree` to avoid touching the working tree.
 fn verify_build(
     local_key: &identity::Keypair,
     claim_id: &str,
     claim_type: &str,
     bound_commit: &str,
 ) -> ApiResponse {
+    // Unique temp dir — commit hash prefix + random suffix for concurrency safety
+    let hash_prefix = &bound_commit[..8.min(bound_commit.len())];
+    let ctr = WORKTREE_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let temp_dir = std::env::temp_dir()
+        .join(format!("lattice-verify-{}-{}-{}", hash_prefix, std::process::id(), ctr));
+    let temp_path = temp_dir.to_str().unwrap_or("");
+
+    // git worktree add <tempdir> <commit>
+    let add = std::process::Command::new("git")
+        .args(["worktree", "add", "--detach", temp_path, bound_commit])
+        .output();
+
+    let build = match add {
+        Ok(ref o) if o.status.success() => {
+            std::process::Command::new("cargo")
+                .args(["build", "--workspace"])
+                .current_dir(&temp_dir)
+                .output()
+        }
+        Ok(_) => {
+            // worktree add failed — clean up and return uncheckable
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return ApiResponse::ClaimRefused {
+                claim_id: claim_id.into(),
+                reason: format!("uncheckable: cannot create worktree for {}", bound_commit),
+                refused_because: "uncheckable".into(),
+            };
+        }
+        Err(e) => {
+            return ApiResponse::ClaimRefused {
+                claim_id: claim_id.into(),
+                reason: format!("uncheckable: {}", e),
+                refused_because: "uncheckable".into(),
+            };
+        }
+    };
+
+    // Teardown: remove worktree + prune stale metadata
     let _ = std::process::Command::new("git")
-        .args(["stash", "push", "--include-untracked", "-m", "verify-before-sign"])
+        .args(["worktree", "remove", "--force", temp_path])
         .output();
     let _ = std::process::Command::new("git")
-        .args(["checkout", bound_commit])
+        .args(["worktree", "prune"])
         .output();
-    let build = std::process::Command::new("cargo")
-        .args(["build", "--workspace"])
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["checkout", "-"])
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["stash", "pop"])
-        .output();
+    let _ = std::fs::remove_dir_all(&temp_dir);
 
     match build {
         Ok(o) if o.status.success() => {
@@ -188,5 +223,89 @@ mod tests {
             }
             other => panic!("Expected ClaimSigned, got {:?}", other),
         }
+    }
+
+    // ── Oracle discriminator tests ────────────────────────────
+    // Fixture commits from /tmp/claim-fixture:
+    //   PASSING: 0404ff6baf6b6f1b047db663cd9f9f52fbeab672 (builds)
+    //   FAILING: 311806f7c0383a94fa6a20d4fe0891d622cba3ea (compile_error!)
+    const FIXTURE_PASSING: &str = "0404ff6baf6b6f1b047db663cd9f9f52fbeab672";
+    const FIXTURE_FAILING: &str = "311806f7c0383a94fa6a20d4fe0891d622cba3ea";
+
+    fn fixture_available() -> bool {
+        std::process::Command::new("git")
+            .args(["cat-file", "-e", FIXTURE_FAILING])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn false_build_claim_is_refused() {
+        if !fixture_available() {
+            eprintln!("SKIP: fixture commits not available — run: git fetch /tmp/claim-fixture master");
+            return;
+        }
+        let key = test_key();
+        // Submit build-result at the FAILING commit — build genuinely fails
+        let resp = handle_state_claim(&key, "c5", "build-result", FIXTURE_FAILING);
+        match &resp {
+            ApiResponse::ClaimRefused { refused_because, claim_id, .. } => {
+                assert_eq!(refused_because, "false",
+                    "ORACLE DETECTED: node signed a claim it proved false");
+                assert_eq!(claim_id, "c5");
+            }
+            ApiResponse::ClaimSigned { .. } => {
+                panic!("ORACLE: node signed a claim it just proved false!")
+            }
+            other => panic!("Expected ClaimRefused(false), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn passing_claim_at_passing_commit_signed() {
+        if !fixture_available() {
+            eprintln!("SKIP: fixture commits not available");
+            return;
+        }
+        let key = test_key();
+        let resp = handle_state_claim(&key, "c6", "build-result", FIXTURE_PASSING);
+        match &resp {
+            ApiResponse::ClaimSigned { signature, .. } => {
+                assert!(!signature.is_empty());
+            }
+            other => panic!("Expected ClaimSigned at passing commit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn verification_does_not_touch_working_tree() {
+        if !fixture_available() {
+            eprintln!("SKIP: fixture commits not available");
+            return;
+        }
+        let key = test_key();
+        let tree_before = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        assert!(!tree_before.is_empty());
+
+        // Verify a claim at a DIFFERENT repo's commit
+        let resp = handle_state_claim(&key, "c7", "build-result", FIXTURE_PASSING);
+        assert!(
+            matches!(&resp, ApiResponse::ClaimSigned { .. }),
+            "Expected ClaimSigned, got {:?}", resp
+        );
+
+        // Working tree must still be at the original HEAD
+        let tree_after = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        assert_eq!(tree_before, tree_after,
+            "verify_build must not change the working tree's HEAD");
     }
 }

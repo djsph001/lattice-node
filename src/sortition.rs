@@ -287,9 +287,27 @@ mod tests {
     #[test]
     fn test_weighted_empty_pool() {
         let peers: Vec<(PeerId, f64)> = vec![];
-        let exclusions: Vec<PeerId> = vec![];
-
-        let panel = select_weighted_witness_panel("b644ae83dae8edc6", &peers, &exclusions, 0.01);
+        let panel = select_weighted_witness_panel("42", &peers, &[], 0.01);
         assert!(panel.is_empty());
     }
+
+    #[test]
+    fn small_pool_includes_local_peer() {
+        // The discriminating case: pool ≤ 5 returns ALL peers including
+        // the local one. is_local_witness MUST return true when the local
+        // peer is in the returned panel.
+        let local = PeerId::random();
+        let a = PeerId::random();
+        let b = PeerId::random();
+
+        let pool = vec![(a, 1.0), (b, 1.0), (local, 1.0)];
+        let panel = select_weighted_witness_panel("test-seed", &pool, &[], 0.01);
+
+        assert_eq!(panel.len(), 3, "small pool must return all 3 peers");
+        assert!(
+            is_local_witness(&panel, &local),
+            "is_local_witness MUST return true when local peer is in the pool"
+        );
+    }
 }
+

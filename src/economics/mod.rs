@@ -97,6 +97,26 @@ impl EconomicEngine {
             agent_tasks_active: self.metrics.agent_tasks_active,
         };
 
+        // Detect counter wraps: if any current metric is smaller than
+        // the previous epoch's snapshot, a u64 counter wrapped between
+        // epochs.  saturating_sub correctly pins the delta to 0, but
+        // the wrap itself is worth logging — silently earning 0 would
+        // look like a bug rather than a correct guard.
+        if self.metrics.bytes_relayed < self.epoch_metrics.bytes_relayed
+            || self.metrics.verified_bytes_relayed < self.epoch_metrics.verified_bytes_relayed
+            || self.metrics.messages_propagated < self.epoch_metrics.messages_propagated
+        {
+            tracing::warn!(
+                epoch = self.epoch_count,
+                bytes = self.metrics.bytes_relayed,
+                prev_bytes = self.epoch_metrics.bytes_relayed,
+                verified = self.metrics.verified_bytes_relayed,
+                prev_verified = self.epoch_metrics.verified_bytes_relayed,
+                "u64 counter wrap detected — epoch delta pinned to 0. \
+                 If this recurs, consider wider counters or per-epoch reset."
+            );
+        }
+
         tracing::debug!(
             epoch = self.epoch_count,
             bytes_relayed = epoch_delta.bytes_relayed,

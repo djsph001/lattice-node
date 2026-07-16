@@ -9,3 +9,4 @@
 *.swp
 .DS_Store
 lattice-simulation/
+lattice-storage/

@@ -349,4 +349,81 @@ mod tests {
         assert!(validate_and_apply(&signed, &mut state, &mut nonces).is_ok());
         assert_eq!(state.balance_of(&recipient_id), DigitalUtilityUnit(500));
     }
+
+    // ── Genesis validation tests ────────────────────────────
+
+    #[test]
+    fn genesis_received_from_non_root_is_rejected() {
+        let root = PeerId::random();
+        let imposter_key = identity::Keypair::generate_ed25519();
+        let imposter = PeerId::from(imposter_key.public());
+        let mut state = LedgerState::new();
+        let mut nonces = HashMap::new();
+
+        let tx = Transaction::Genesis {
+            root: imposter.to_string(),
+            thickness_grant: 1000.0,
+            declared_operator_keys: vec![],
+            nonce: 0,
+            timestamp: chrono::Utc::now(),
+        };
+        let signed = sign_transaction(&tx, &imposter_key);
+
+        let result = validate_and_apply_with_genesis_root(
+            &signed, &mut state, &mut nonces, Some(&root),
+        );
+        assert!(result.is_err(), "non-root genesis must be rejected");
+        assert!(
+            result.unwrap_err().to_string().contains("is not the configured root"),
+            "error should name the mismatch"
+        );
+    }
+
+    #[test]
+    fn genesis_received_without_config_is_rejected() {
+        let key = identity::Keypair::generate_ed25519();
+        let signer = PeerId::from(key.public());
+        let mut state = LedgerState::new();
+        let mut nonces = HashMap::new();
+
+        let tx = Transaction::Genesis {
+            root: signer.to_string(),
+            thickness_grant: 1000.0,
+            declared_operator_keys: vec![],
+            nonce: 0,
+            timestamp: chrono::Utc::now(),
+        };
+        let signed = sign_transaction(&tx, &key);
+
+        let result = validate_and_apply_with_genesis_root(
+            &signed, &mut state, &mut nonces, None,
+        );
+        assert!(result.is_err(), "genesis without trust anchor must be rejected");
+        assert!(
+            result.unwrap_err().to_string().contains("genesis-root not configured"),
+            "error should name the missing config"
+        );
+    }
+
+    #[test]
+    fn valid_root_genesis_is_accepted() {
+        let root_key = identity::Keypair::generate_ed25519();
+        let root = PeerId::from(root_key.public());
+        let mut state = LedgerState::new();
+        let mut nonces = HashMap::new();
+
+        let tx = Transaction::Genesis {
+            root: root.to_string(),
+            thickness_grant: 1000.0,
+            declared_operator_keys: vec![root.to_string()],
+            nonce: 0,
+            timestamp: chrono::Utc::now(),
+        };
+        let signed = sign_transaction(&tx, &root_key);
+
+        let result = validate_and_apply_with_genesis_root(
+            &signed, &mut state, &mut nonces, Some(&root),
+        );
+        assert!(result.is_ok(), "valid root genesis must be accepted");
+    }
 }

@@ -169,20 +169,25 @@ fn check_timestamp(tx: &SignedTransaction) -> Result<()> {
     Ok(())
 }
 
-/// Replay protection: the nonce must be strictly greater than any
-/// previously-seen nonce from this signer.
+/// Gap-free nonce enforcement: the nonce must be exactly predecessor+1.
+///
+/// `>` (monotonic) permits gaps, and gaps cause divergence — two nodes
+/// that accept nonces 4 → 6 and 4 → 5 → 6 derive different state for the
+/// same signer.  Requiring `== last + 1` ensures every node's state is a
+/// valid prefix of that signer's sequence.  Nodes may be at different
+/// prefixes (behind) but nobody is wrong.
 fn check_nonce(
     signer: &PeerId,
     nonce: u64,
     seen_nonces: &HashMap<PeerId, u64>,
 ) -> Result<()> {
     if let Some(&last_nonce) = seen_nonces.get(signer) {
-        if nonce <= last_nonce {
+        if nonce != last_nonce + 1 {
             bail!(
-                "replayed or out-of-order nonce {} from {} (last seen: {})",
+                "gapped nonce {} from {} (expected {}): out-of-order or replayed",
                 nonce,
                 signer,
-                last_nonce
+                last_nonce + 1
             );
         }
     }
@@ -294,6 +299,44 @@ mod tests {
         let result = validate_and_apply(&signed2, &mut state, &mut nonces);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("replayed"));
+    }
+
+    #[test]
+    fn gapped_nonce_rejected_exact_next_accepted() {
+        // Discriminator: the rule must accept exact-next nonces and
+        // reject gaps — otherwise "no gapped nonces" could be
+        // implemented as "reject everything."
+        let alice = make_keypair();
+        let bob = make_keypair();
+        let alice_id = PeerId::from(alice.public());
+        let bob_id = PeerId::from(bob.public());
+
+        let mut state = LedgerState::new();
+        let mut nonces = HashMap::new();
+
+        state.set_balance(&alice_id, DigitalUtilityUnit(1000));
+
+        let mk_tx = |nonce: u64| -> SignedTransaction {
+            let tx = Transaction::Transfer {
+                from: alice_id.to_string(),
+                to: bob_id.to_string(),
+                amount: DigitalUtilityUnit(100),
+                nonce,
+                timestamp: Utc::now(),
+            };
+            sign_transaction(&tx, &alice)
+        };
+
+        // nonce 1: first tx, no predecessor needed
+        assert!(validate_and_apply(&mk_tx(1), &mut state, &mut nonces).is_ok());
+
+        // nonce 3: gap (missing 2) → rejected
+        let result = validate_and_apply(&mk_tx(3), &mut state, &mut nonces);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("expected 2"));
+
+        // nonce 2: exact next → accepted (proves the rule isn't too broad)
+        assert!(validate_and_apply(&mk_tx(2), &mut state, &mut nonces).is_ok());
     }
 
     #[test]

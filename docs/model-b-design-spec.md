@@ -160,10 +160,115 @@ solved consequence.
 - No tactical opening: don't build panel enforcement at n=3 where it's vacuous.
 - Canonical encoding: sorted signatures, fixed field order, hash over canonical bytes.
 
+## State Mutation Classification (2026-07-17 code pass)
+
+Every state mutation in the economic layer, classified by whether its effect
+depends on prior state a concurrent block could modify:
+
+1. MINT (balances.add)              → COMMUTATIVE
+2. TRANSFER (debit + credit)        → CAUSAL (balance check on sender)
+3. GENESIS (add_genesis_thickness)  → CAUSAL (one-shot, first-write-wins)
+4. CONTRIBUTION (add_verified_contribution) → CAUSAL (triggers amortize_genesis)
+5. VOUCH (stake_vouch)              → CAUSAL (read-modify-write on encumbrance + re-division)
+6. EPOCH EXPIRATION (process_epoch) → CAUSAL (removal depends on prior insertion)
+7. EVICTION (record_verification_failure) → CAUSAL (threshold + removal)
+
+Score: 1 commutative, 6 causal. The economic layer is a provenance graph
+with lineage, not an accumulator. DAG-without-total-order is dead at the
+state layer.
+
+Attempted recovery: per-entity serial order. Broken by finding #4 —
+contribution triggers amortize_genesis, which cascades through re_divide_vouchees
+and remove_vouchees_recursive. There is no entity partition. Every contribution
+mutates the whole graph.
+
+## CRITICAL WIRE: Genesis Amortization Unreachable from Production
+
+`Transaction::Genesis` (types.rs:154-165) has NO `amortize_over` field.
+The production genesis path (state.rs:155) calls:
+
+    add_genesis_thickness(&root_peer, *thickness_grant, None)
+
+Hardcoded `None`. Permanent genesis. The self-liquidating genesis — designed
+deliberately, tested thoroughly, the contribution-denominated decay the sweep
+proved was the meaningful axis — is unreachable from any transaction the
+system can produce.
+
+The `Some(N)` path exists only on the internal `ThicknessGraph::add_genesis_thickness`
+method and is exercised only in tests (lines 977+, 1029+, 1058+). Four tests
+pass. None of them run against anything the transaction layer can reach.
+
+The code's own warning (thickness.rs:37-49) describes the exact configuration
+the mesh runs in: "choosing None creates a permanent founder floor...
+Prefer Some(N) for any mesh intended to decentralize over time."
+
+This is the ninth instance of the name-asserts-property pattern.
+
+## The Incompatibility: Self-Liquidation Requires Total Order
+
+Self-liquidating genesis (Some(N)) is in genuine tension with no-proposer
+ordering. Traced specifically:
+
+After k contributions with amortize_over=N:
+  genesis_amount = A * (N-k) / N
+
+This part IS commutative — a pure function of the count, which converges
+without ordering.
+
+BUT the cascade is NOT a function of count alone. It depends on ORDER:
+
+  amortize_over=3, root vouches for Lumen at 90%, someone vouches for Lumen.
+
+  Order A: contribution×3 → cascade (root→0, Lumen→0, vouchees removed)
+           → new vouch to Lumen
+  Order B: new vouch to Lumen → contribution×3 → cascade (root→0, but
+           Lumen has the new vouch as buffer, Lumen≠0, no recursive removal)
+
+  Same count (3). Same vouch set. Different cascade outcome. Different graph.
+
+The cascade is a function of order, not of state. Self-liquidating genesis
+requires total order. The no-proposer design cannot provide total order.
+
+Path A (keep None): buys tractable ordering at the cost of permanent founder
+floor = autocracy-by-arithmetic. Not viable. The code's warning is our own
+conclusion quoted back.
+
+## Open Question 3: Derivation Instead of Mutation?
+
+The count converges. The genesis amount is a pure function of the count.
+What breaks is the CASCADE — the recursive mutation that fires when
+thickness hits zero.
+
+Proposal to investigate (NOT decided): compute genesis-derived thickness at
+READ TIME from lineage + contribution count, rather than MUTATING it on each
+contribution event.
+
+If genesis thickness is derived:
+  - No amortize_genesis() call on each contribution
+  - No re_divide_vouchees cascade
+  - No remove_vouchees_recursive
+  - A vouchee's genesis-derived share computes to zero naturally when the
+    source liquidates — the cascade becomes implicit in the derivation
+  - Same economic property, no mutation, no order dependence
+
+This is the floor_weight(gauge) move: stop mutating, start deriving.
+It killed a coupling once already.
+
+CANNOT ANSWER TONIGHT:
+  - Does derivation preserve all four properties of self-liquidating genesis?
+  - Does derived thickness interact correctly with encumbrance/vouch mechanics?
+  - Is the computation tractable at read time (graph traversal cost)?
+  - Does this actually eliminate the ordering requirement, or just move it?
+
+Take to a fresh head. Do not decide tonight.
+
 ## Build Scope (not a one-liner, not a raft import)
 
-1. Restructure commit path: split accumulate→commit into accumulate→broadcast + receive→commit
-2. Implement canonical certificate serialization (sorted sigs, fixed fields)
-3. Add certificate-receipt handler (validate quorum, verify all sigs, commit)
-4. Resolve block ordering question (see Open Question 1)
-5. Panel membership validation — ONLY when sortition path actually engages (n>5)
+1. Resolve genesis self-liquidation formulation (derivation vs mutation — see Open Question 3)
+   This determines whether the ordering problem is per-entity (tractable)
+   or global (total order required, no-proposer in tension).
+2. Restructure commit path: split accumulate→commit into accumulate→broadcast + receive→commit
+3. Implement canonical certificate serialization (sorted sigs, fixed fields)
+4. Add certificate-receipt handler (validate quorum, verify all sigs, commit)
+5. Resolve block ordering question (see Open Question 1)
+6. Panel membership validation — ONLY when sortition path actually engages (n>5)

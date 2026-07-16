@@ -187,6 +187,107 @@ impl CommitManager {
 
         Ok(block_hash)
     }
+
+    /// Commit a root-authorized block (era one only).
+    /// This is how Genesis and BootstrapEnded are written to the chain.
+    /// After BootstrapEnded, this method returns an error — era two blocks
+    /// must be committed via `commit()` with witness signatures.
+    pub fn commit_root_block(
+        &mut self,
+        data: &[u8],
+        proposal_id: &str,
+        root_signature: &[u8],
+    ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+        use std::io::Write;
+
+        // Build block hash from root sig
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.last_block_hash);
+        hasher.update(proposal_id.as_bytes());
+        hasher.update(root_signature);
+        let block_hash: [u8; 32] = hasher.finalize().into();
+
+        if let Some(parent) = self.ledger_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.ledger_path)?;
+
+        file.write_all(&self.block_height.to_be_bytes())?;
+        file.write_all(&self.last_block_hash)?;
+        file.write_all(&block_hash)?;
+        file.write_all(&(data.len() as u32).to_be_bytes())?;
+        file.write_all(data)?;
+        file.write_all(&1u16.to_be_bytes())?;  // sig_count = 1
+        file.write_all(&(root_signature.len() as u16).to_be_bytes())?;
+        file.write_all(root_signature)?;
+        file.sync_all()?;
+
+        self.last_block_hash = block_hash;
+        self.block_height += 1;
+        self.committed.insert(proposal_id.to_string());
+
+        info!(
+            height = self.block_height,
+            hash = %hex::encode(block_hash),
+            "[commit] Root-authorized block written to chain"
+        );
+
+        Ok(block_hash)
+    }
+
+    /// Check whether BootstrapEnded has occurred by scanning the chain.
+    /// Returns true if a BootstrapEnded transaction exists in the ledger.
+    /// This is the era marker — derived from chain contents, not stored as state.
+    pub fn is_bootstrap_ended(&self) -> bool {
+        let mut file = match File::open(&self.ledger_path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let mut buffer = Vec::new();
+        if file.read_to_end(&mut buffer).is_err() {
+            return false;
+        }
+
+        // Walk blocks looking for a BootstrapEnded transaction.
+        let mut offset: usize = 0;
+        loop {
+            if offset + 76 > buffer.len() {
+                break;
+            }
+            let _height = u64::from_be_bytes([
+                buffer[offset], buffer[offset+1], buffer[offset+2], buffer[offset+3],
+                buffer[offset+4], buffer[offset+5], buffer[offset+6], buffer[offset+7],
+            ]);
+            // Skip prev_hash (32B) + block_hash (32B)
+            offset += 72;
+            if offset + 4 > buffer.len() { break; }
+            let cert_len = u32::from_be_bytes([
+                buffer[offset], buffer[offset+1], buffer[offset+2], buffer[offset+3],
+            ]) as usize;
+            offset += 4;
+            if offset + cert_len > buffer.len() { break; }
+            // Check if this is a SignedTransaction containing BootstrapEnded.
+            if let Ok(stx) = serde_cbor::from_slice::<crate::ledger::types::SignedTransaction>(&buffer[offset..offset + cert_len]) {
+                if matches!(stx.transaction, crate::ledger::types::Transaction::BootstrapEnded { .. }) {
+                    return true;
+                }
+            }
+            offset += cert_len;
+            if offset + 2 > buffer.len() { break; }
+            let sig_count = u16::from_be_bytes([buffer[offset], buffer[offset+1]]) as usize;
+            offset += 2;
+            for _ in 0..sig_count {
+                if offset + 2 > buffer.len() { break; }
+                let sig_len = u16::from_be_bytes([buffer[offset], buffer[offset+1]]) as usize;
+                offset += 2 + sig_len;
+            }
+        }
+        false
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────

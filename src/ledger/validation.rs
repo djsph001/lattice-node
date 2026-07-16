@@ -127,6 +127,8 @@ fn check_timestamp(tx: &SignedTransaction) -> Result<()> {
         Transaction::Transfer { timestamp, .. } => timestamp,
         Transaction::Mint { timestamp, .. } => timestamp,
         Transaction::Vouch { timestamp, .. } => timestamp,
+        Transaction::Genesis { timestamp, .. } => timestamp,
+        Transaction::BootstrapEnded { timestamp, .. } => timestamp,
     };
 
     let now = chrono::Utc::now();

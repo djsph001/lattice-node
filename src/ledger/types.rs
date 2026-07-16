@@ -148,6 +148,32 @@ pub enum Transaction {
         /// When the vouch was created.
         timestamp: DateTime<Utc>,
     },
+    /// BootstrapGenesis seeds the mesh with root thickness and declares
+    /// which keys belong to the root operator. Accepted exactly once, at
+    /// chain height 0, root-signed. Era one begins with this block.
+    Genesis {
+        /// The root operator's PeerId.
+        root: String,
+        /// Initial thickness grant in gauge-scaled units.
+        thickness_grant: f64,
+        /// Keys declared as belonging to the same operator as root.
+        /// Certificates from panels composed entirely of declared keys
+        /// are structurally self-certifications — auditable, not forbidden.
+        declared_operator_keys: Vec<String>,
+        nonce: u64,
+        timestamp: DateTime<Utc>,
+    },
+    /// BootstrapEnded is the one-way transition from era one (root-authorized)
+    /// to era two (quorum-certified). Signed by root, accepted exactly once.
+    /// Its presence in the chain is the era marker — derived, not stored.
+    BootstrapEnded {
+        /// Who declared the end of bootstrap.
+        declared_by: String,
+        /// Human-readable reason for the transition.
+        reason: String,
+        nonce: u64,
+        timestamp: DateTime<Utc>,
+    },
 }
 
 impl Transaction {
@@ -157,21 +183,31 @@ impl Transaction {
             Transaction::Transfer { from, .. } => from,
             Transaction::Mint { authority, .. } => authority,
             Transaction::Vouch { voucher, .. } => voucher,
+            Transaction::Genesis { root, .. } => root,
+            Transaction::BootstrapEnded { declared_by, .. } => declared_by,
         }
     }
 
-    /// The nonce for replay protection.
     pub fn nonce(&self) -> u64 {
         match self {
             Transaction::Transfer { nonce, .. } => *nonce,
             Transaction::Mint { nonce, .. } => *nonce,
             Transaction::Vouch { nonce, .. } => *nonce,
+            Transaction::Genesis { nonce, .. } => *nonce,
+            Transaction::BootstrapEnded { nonce, .. } => *nonce,
         }
     }
 
-    /// Whether this is a mint operation (no sender balance check needed).
     pub fn is_mint(&self) -> bool {
         matches!(self, Transaction::Mint { .. })
+    }
+
+    /// Whether this transaction alters thickness in any way.
+    pub fn affects_thickness(&self) -> bool {
+        matches!(
+            self,
+            Transaction::Genesis { .. } | Transaction::Vouch { .. }
+        )
     }
 }
 

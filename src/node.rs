@@ -3072,6 +3072,8 @@ fn set_transaction_nonce(tx: &mut Transaction, nonce: u64) {
         Transaction::Transfer { nonce: ref mut n, .. } => *n = nonce,
         Transaction::Mint { nonce: ref mut n, .. } => *n = nonce,
         Transaction::Vouch { nonce: ref mut n, .. } => *n = nonce,
+        Transaction::Genesis { nonce: ref mut n, .. } => *n = nonce,
+        Transaction::BootstrapEnded { nonce: ref mut n, .. } => *n = nonce,
     }
 }
 

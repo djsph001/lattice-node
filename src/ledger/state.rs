@@ -142,6 +142,27 @@ impl LedgerState {
                     "Vouch applied — derived thickness granted"
                 );
             }
+            Transaction::Genesis {
+                root,
+                thickness_grant,
+                ..
+            } => {
+                let root_peer: PeerId = root
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("invalid root PeerId in genesis: {e}"))?;
+                // Seed thickness into the provenance graph.
+                self.thickness_graph
+                    .add_genesis_thickness(&root_peer, *thickness_grant, None);
+                info!(
+                    root = %root,
+                    thickness_grant = format!("{:.2}", thickness_grant),
+                    "Genesis thickness seeded"
+                );
+            }
+            Transaction::BootstrapEnded { .. } => {
+                // BootstrapEnded is a marker, not a state mutation.
+                // Its presence in the chain is the era partition — derived, not stored.
+            }
         }
         Ok(())
     }

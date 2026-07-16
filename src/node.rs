@@ -872,8 +872,8 @@ impl LatticeNode {
             .map(|r| r.receipt.bytes)
             .sum();
         let verified_msgs = self.receipt_store.len() as u64;
-        self.economic_engine.metrics.verified_bytes_relayed = verified_bytes;
-        self.economic_engine.metrics.verified_messages_relayed = verified_msgs;
+        self.economic_engine.metrics.verified_bytes_relayed += verified_bytes;
+        self.economic_engine.metrics.verified_messages_relayed += verified_msgs;
 
         if verified_msgs > 0 {
             info!(

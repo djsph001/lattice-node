@@ -99,4 +99,26 @@ mod tests {
         metrics.bytes_relayed = 500;
         assert_eq!(calculate_mint(&metrics, 10), 5000);
     }
+
+    #[test]
+    fn base_rate_is_gauge_scale_invariant() {
+        // If base_rate is truly a gauge (unit definition), doubling it
+        // should double all mint amounts and leave ratios unchanged.
+        let mut metrics = NodeMetrics::new();
+        metrics.verified_bytes_relayed = 1000;
+        metrics.verified_messages_relayed = 5;
+
+        let mint_1 = calculate_mint_from_receipts(&metrics, 1);
+        let mint_1000 = calculate_mint_from_receipts(&metrics, 1000);
+
+        // Absolute amounts scale linearly.
+        assert_eq!(mint_1000, mint_1 * 1000,
+            "base_rate gauge violation: mint does not scale linearly with base_rate");
+
+        // Zero verified input produces zero at any rate.
+        let empty = NodeMetrics::new();
+        assert_eq!(calculate_mint_from_receipts(&empty, 1), 0);
+        assert_eq!(calculate_mint_from_receipts(&empty, 1000), 0);
+        assert_eq!(calculate_mint_from_receipts(&empty, 1_000_000), 0);
+    }
 }

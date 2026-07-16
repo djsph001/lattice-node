@@ -198,6 +198,10 @@ impl CommitManager {
         proposal_id: &str,
         root_signature: &[u8],
     ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+        // Era guard: after BootstrapEnded, root-authorized blocks are rejected.
+        if self.is_bootstrap_ended() {
+            return Err("era two: root-authorized blocks rejected — use certificate-gated commit()".into());
+        }
         use std::io::Write;
 
         // Build block hash from root sig
@@ -431,5 +435,123 @@ mod tests {
         // (the caller should check is_committed first)
         mgr.commit(cert, "prop-001", &sigs).unwrap();
         assert_eq!(mgr.height(), 2);
+    }
+
+    // ── Era derivation tests ────────────────────────────────
+
+    #[test]
+    fn fresh_chain_not_bootstrap_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = CommitManager::open(&dir.path().to_path_buf());
+        assert!(!mgr.is_bootstrap_ended());
+    }
+
+    #[test]
+    fn bootstrap_ended_recoverable_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().to_path_buf();
+
+        // Era one: commit a root block (genesis)
+        let genesis = crate::ledger::types::Transaction::Genesis {
+            root: "12D3KooWQw6".to_string(),
+            thickness_grant: 1000.0,
+            declared_operator_keys: vec!["12D3KooWBoVfr".to_string(), "12D3KooWQw6".to_string()],
+            nonce: 0,
+            timestamp: chrono::Utc::now(),
+        };
+        let stx = crate::ledger::types::SignedTransaction {
+            transaction: genesis,
+            signer_public_key: vec![1, 2, 3],
+            signature: vec![4, 5, 6],
+        };
+        let data = serde_cbor::to_vec(&stx).unwrap();
+
+        let mut mgr = CommitManager::open(&storage);
+        assert!(!mgr.is_bootstrap_ended(), "Era should be one before BootstrapEnded");
+
+        // Commit BootstrapEnded
+        let ended = crate::ledger::types::Transaction::BootstrapEnded {
+            declared_by: "12D3KooWQw6".to_string(),
+            reason: "three independent peers now running.".to_string(),
+            nonce: 1,
+            timestamp: chrono::Utc::now(),
+        };
+        let stx2 = crate::ledger::types::SignedTransaction {
+            transaction: ended,
+            signer_public_key: vec![1, 2, 3],
+            signature: vec![7, 8, 9],
+        };
+        let data2 = serde_cbor::to_vec(&stx2).unwrap();
+        mgr.commit_root_block(&data, "genesis", &stx.signature).unwrap();
+        mgr.commit_root_block(&data2, "bootstrap-ended", &stx2.signature).unwrap();
+        assert!(mgr.is_bootstrap_ended(), "Era should be two after BootstrapEnded");
+
+        // Drop and recover — era must survive restart
+        drop(mgr);
+        let mgr2 = CommitManager::open(&storage);
+        assert!(mgr2.is_bootstrap_ended(), "Era must survive restart — derived, not cached");
+    }
+
+    #[test]
+    fn only_bootstrap_ended_ends_era() {
+        // Genesis alone does not end bootstrap.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().to_path_buf();
+        let genesis = crate::ledger::types::Transaction::Genesis {
+            root: "12D3KooWQw6".to_string(),
+            thickness_grant: 1000.0,
+            declared_operator_keys: vec![],
+            nonce: 0,
+            timestamp: chrono::Utc::now(),
+        };
+        let stx = crate::ledger::types::SignedTransaction {
+            transaction: genesis,
+            signer_public_key: vec![1, 2, 3],
+            signature: vec![4, 5, 6],
+        };
+        let data = serde_cbor::to_vec(&stx).unwrap();
+
+        let mut mgr = CommitManager::open(&storage);
+        mgr.commit_root_block(&data, "genesis", &stx.signature).unwrap();
+        assert!(!mgr.is_bootstrap_ended(), "Genesis should not end bootstrap — only BootstrapEnded does");
+    }
+
+    #[test]
+    fn root_block_rejected_after_bootstrap_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().to_path_buf();
+
+        let ended = crate::ledger::types::Transaction::BootstrapEnded {
+            declared_by: "12D3KooWQw6".to_string(),
+            reason: "era two.".to_string(),
+            nonce: 0,
+            timestamp: chrono::Utc::now(),
+        };
+        let stx = crate::ledger::types::SignedTransaction {
+            transaction: ended,
+            signer_public_key: vec![1, 2, 3],
+            signature: vec![4, 5, 6],
+        };
+        let data = serde_cbor::to_vec(&stx).unwrap();
+
+        let mut mgr = CommitManager::open(&storage);
+        mgr.commit_root_block(&data, "bootstrap-ended", &stx.signature).unwrap();
+        assert!(mgr.is_bootstrap_ended());
+
+        // Try another root block — must be rejected.
+        let second = crate::ledger::types::Transaction::BootstrapEnded {
+            declared_by: "12D3KooWQw6".to_string(),
+            reason: "trying to end again.".to_string(),
+            nonce: 1,
+            timestamp: chrono::Utc::now(),
+        };
+        let stx2 = crate::ledger::types::SignedTransaction {
+            transaction: second,
+            signer_public_key: vec![1, 2, 3],
+            signature: vec![7, 8, 9],
+        };
+        let data2 = serde_cbor::to_vec(&stx2).unwrap();
+        let result = mgr.commit_root_block(&data2, "second", &stx2.signature);
+        assert!(result.is_err(), "Root blocks must be rejected after BootstrapEnded");
     }
 }

@@ -20,10 +20,38 @@ pub fn validate_and_apply(
     state: &mut LedgerState,
     seen_nonces: &mut HashMap<PeerId, u64>,
 ) -> Result<()> {
+    validate_and_apply_with_genesis_root(tx, state, seen_nonces, None)
+}
+
+/// Full validation with genesis-root gate.
+pub fn validate_and_apply_with_genesis_root(
+    tx: &SignedTransaction,
+    state: &mut LedgerState,
+    seen_nonces: &mut HashMap<PeerId, u64>,
+    genesis_root: Option<&PeerId>,
+) -> Result<()> {
     // 1. Verify the signature
     verify_signature(tx)?;
 
-    // 2. Check timestamp freshness
+    // 2. Genesis gate: only the configured root may submit Genesis.
+    // Genesis mints thickness from nothing — the strictest gate.
+    if matches!(tx.transaction, Transaction::Genesis { .. }) {
+        let signer: PeerId = tx.transaction.signer().parse()
+            .map_err(|e| anyhow::anyhow!("invalid genesis signer PeerId: {e}"))?;
+        match genesis_root {
+            Some(root) if signer == *root => { /* ok */ }
+            Some(root) => bail!(
+                "genesis rejected: signer {} is not the configured root {}",
+                signer, root
+            ),
+            None => bail!(
+                "genesis rejected: --genesis-root not configured — \
+                 this node cannot validate the trust anchor"
+            ),
+        }
+    }
+
+    // 3. Extract signer and nonce
     check_timestamp(tx)?;
 
     let signer: PeerId = tx

@@ -134,13 +134,16 @@ pub enum Transaction {
     /// derived thickness. Part of the Sybil-resistance mechanism: stake
     /// scales with the voucher's capacity, and per-vouchee influence is
     /// inversely proportional to swarm size.
+    ///
+    /// stake_bps is integer basis points (0–10_000) — exact, order-independent.
+    /// No f64 touches the vouch path.
     Vouch {
         /// The node staking their thickness (PeerId string form).
         voucher: String,
         /// The node receiving derived thickness (PeerId string form).
         vouchee: String,
-        /// Fraction of the voucher's own unencumbered thickness to stake [0.0, 1.0].
-        staked_fraction: f64,
+        /// Basis points of voucher's thickness to stake [0, 10_000]. Integer, exact.
+        stake_bps: u32,
         /// Epoch after which this vouch expires. None = permanent (until clawback).
         expiration_epoch: Option<u64>,
         /// Monotonic nonce from the voucher, preventing replay.

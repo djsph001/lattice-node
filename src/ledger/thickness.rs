@@ -5,18 +5,19 @@
 // from the graph topology + a contribution count. Every call to
 // total_thickness() walks the edge graph and computes values on the fly.
 //
-// Key change from mutation model: Vouch edges store a stake_fraction (the
-// ratio the voucher committed), not an absolute amount. The amount is
-// computed as voucher_total × stake_fraction. When the source liquidates,
-// the derived amount drops to zero through multiplication — no cascade,
-// no traversal, no recursive mutation. Laundering is closed at any depth.
+// Key change from mutation model: Vouch edges store a stake_bps (the
+// integer basis points the voucher committed), not an absolute amount.
+// The amount is computed as voucher_total × stake_bps / 10_000.
+// When the source liquidates, the derived amount drops to zero through
+// multiplication — no cascade, no traversal, no recursive mutation.
+// Laundering is closed at any depth.
 //
 // Three sources of thickness:
 //   VerifiedContribution — minted by real work. Fixed amount, stored.
 //   Genesis              — trusted-setup. Original amount + amortize_over.
 //                          Derived as original × (N-k)/N.
-//   Vouch               — derived from voucher's total × stake_fraction.
-//                          Immutable fraction. Never stores an amount.
+//   Vouch               — derived from voucher's total × stake_bps / 10_000.
+//                          Integer basis points. Never stores an amount.
 
 use std::collections::{HashMap, HashSet};
 
@@ -48,11 +49,13 @@ pub enum ThicknessSource {
     },
 
     /// Derived via a vouch. The amount is NEVER stored — it is computed
-    /// at read time as total_thickness(voucher) × stake_fraction.
+    /// at read time as total_thickness(voucher) × stake_bps / 10_000.
+    /// stake_bps is integer basis points (0–10_000) so sums are exact and
+    /// order-independent across nodes.
     Vouch {
         voucher: PeerId,
         vouch_nonce: u64,
-        stake_fraction: f64,
+        stake_bps: u32,
         expiration_epoch: Option<u64>,
     },
 }
@@ -69,7 +72,7 @@ pub struct ThicknessEdge {
 /// Invariants:
 /// - Only VerifiedContribution mints new thickness. Vouches redistribute.
 /// - A node's total thickness = sum of derived_amount(edge) for all incoming.
-/// - usable = total × (1 - sum_of_active_stake_fractions).
+/// - usable = total × (1 - active_bps / 10_000).
 /// - Genesis amount is a pure function of contribution_count — order-free.
 /// - Laundering is closed: genesis-derived share derives to zero at any
 ///   depth when the source liquidates, through multiplication.
@@ -128,18 +131,18 @@ impl ThicknessGraph {
             .count() as u64
     }
 
-    /// Sum of active (non-expired) stake_fractions where this peer is the
-    /// voucher. Used for encumbrance derivation.
-    fn active_stake_fractions(&self, voucher: &PeerId) -> f64 {
+    /// Sum of active (non-expired) stake_bps where this peer is the voucher.
+    /// Returns integer basis points — exact, order-independent.
+    pub(crate) fn active_stake_bps(&self, voucher: &PeerId) -> u32 {
         self.edges
             .values()
             .flatten()
             .filter_map(|e| match &e.source {
                 ThicknessSource::Vouch {
                     voucher: v,
-                    stake_fraction,
+                    stake_bps,
                     ..
-                } if v == voucher => Some(*stake_fraction),
+                } if v == voucher => Some(*stake_bps),
                 _ => None,
             })
             .sum()
@@ -184,9 +187,9 @@ impl ThicknessGraph {
                         }
                         ThicknessSource::Vouch {
                             voucher,
-                            stake_fraction,
+                            stake_bps,
                             ..
-                        } => self.total_thickness_inner(voucher, visited) * stake_fraction,
+                        } => self.total_thickness_inner(voucher, visited) * *stake_bps as f64 / 10_000.0,
                     })
                     .sum()
             })
@@ -195,19 +198,19 @@ impl ThicknessGraph {
         result
     }
 
-    /// Usable (unencumbered) thickness: total × (1 - sum_of_stake_fractions).
+    /// Usable (unencumbered) thickness: total × (1 - bps/10_000).
     pub fn usable_thickness(&self, peer: &PeerId) -> f64 {
         let total = self.total_thickness(peer);
-        let staked = self.active_stake_fractions(peer);
-        (total * (1.0 - staked)).max(0.0)
+        let bps = self.active_stake_bps(peer);
+        total * (10_000 - bps) as f64 / 10_000.0
     }
 
-    /// Total encumbered thickness: total × sum_of_stake_fractions.
-    /// Derived, not stored.
+    /// Total encumbered thickness: total × bps/10_000.
+    /// Derived from integer bps — exact sum, order-independent.
     pub fn encumbered_for(&self, peer: &PeerId) -> f64 {
         let total = self.total_thickness(peer);
-        let staked = self.active_stake_fractions(peer);
-        total * staked
+        let bps = self.active_stake_bps(peer);
+        total * bps as f64 / 10_000.0
     }
 
     // ── Mutations ──────────────────────────────────────────
@@ -227,28 +230,30 @@ impl ThicknessGraph {
         self.edges.entry(*peer).or_default().push(edge);
     }
 
-    /// Stake thickness by vouching. Stores the stake_fraction (immutable).
-    /// Validates: sum of fractions ≤ 1.0 (can't over-extend).
+    /// Stake thickness by vouching. Stores stake_bps (integer, immutable).
+    /// Validates: current_bps + new_bps ≤ 10_000 — exact integer, no epsilon.
     ///
-    /// Returns the derived amount (voucher_total × stake_fraction).
+    /// Returns the derived amount (voucher_total × stake_bps / 10_000).
     pub fn stake_vouch(
         &mut self,
         voucher: &PeerId,
         vouchee: &PeerId,
-        staked_fraction: f64,
+        stake_bps: u32,
         vouch_nonce: u64,
         expiration_epoch: Option<u64>,
     ) -> Result<f64, String> {
+        if stake_bps > 10_000 {
+            return Err(format!("stake_bps {stake_bps} exceeds 10_000 maximum"));
+        }
         let voucher_total = self.total_thickness(voucher);
         if voucher_total <= 0.0 {
             return Err("voucher has no thickness to stake".into());
         }
 
-        let current_fractions = self.active_stake_fractions(voucher);
-        if current_fractions + staked_fraction > 1.0 {
+        let current_bps = self.active_stake_bps(voucher);
+        if current_bps + stake_bps > 10_000 {
             return Err(format!(
-                "insufficient unencumbered thickness: staked {:.4} + new {:.4} > 1.0",
-                current_fractions, staked_fraction
+                "insufficient unencumbered thickness: {current_bps}bps + {stake_bps}bps > 10_000bps"
             ));
         }
 
@@ -256,14 +261,14 @@ impl ThicknessGraph {
             source: ThicknessSource::Vouch {
                 voucher: *voucher,
                 vouch_nonce,
-                stake_fraction: staked_fraction,
+                stake_bps,
                 expiration_epoch,
             },
             created: Utc::now(),
         };
         self.edges.entry(*vouchee).or_default().push(edge);
 
-        Ok(voucher_total * staked_fraction)
+        Ok(voucher_total * stake_bps as f64 / 10_000.0)
     }
 
     /// Process epoch tick: remove all expired vouch edges.
@@ -414,7 +419,7 @@ mod tests {
 
         graph.add_verified_contribution(&alice, [0xAA; 32], 1000.0);
 
-        let result = graph.stake_vouch(&alice, &bob, 0.10, 1, None);
+        let result = graph.stake_vouch(&alice, &bob, 1000, 1, None);
         assert!(result.is_ok());
         let per_vouchee = result.unwrap();
 
@@ -438,10 +443,10 @@ mod tests {
 
         graph.add_verified_contribution(&alice, [0xAA; 32], 1000.0);
 
-        graph.stake_vouch(&alice, &bob, 0.20, 1, None).unwrap();
+        graph.stake_vouch(&alice, &bob, 2000, 1, None).unwrap();
         assert_eq!(graph.total_thickness(&bob), 200.0);
 
-        graph.stake_vouch(&alice, &carol, 0.20, 2, None).unwrap();
+        graph.stake_vouch(&alice, &carol, 2000, 2, None).unwrap();
         assert_eq!(graph.total_thickness(&bob), 200.0);
         assert_eq!(graph.total_thickness(&carol), 200.0);
         assert_eq!(graph.encumbered_for(&alice), 400.0);
@@ -453,7 +458,7 @@ mod tests {
         let alice = PeerId::random();
         let bob = PeerId::random();
 
-        let result = graph.stake_vouch(&alice, &bob, 0.10, 1, None);
+        let result = graph.stake_vouch(&alice, &bob, 1000, 1, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no thickness to stake"));
     }
@@ -467,9 +472,9 @@ mod tests {
 
         graph.add_verified_contribution(&alice, [0xAA; 32], 100.0);
 
-        graph.stake_vouch(&alice, &bob, 0.60, 1, None).unwrap();
+        graph.stake_vouch(&alice, &bob, 6000, 1, None).unwrap();
 
-        let result = graph.stake_vouch(&alice, &carol, 0.60, 2, None);
+        let result = graph.stake_vouch(&alice, &carol, 6000, 2, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("insufficient unencumbered"));
     }
@@ -481,7 +486,7 @@ mod tests {
         let bob = PeerId::random();
 
         graph.add_verified_contribution(&alice, [0xAA; 32], 500.0);
-        graph.stake_vouch(&alice, &bob, 0.30, 42, None).unwrap();
+        graph.stake_vouch(&alice, &bob, 3000, 42, None).unwrap();
 
         let bobs_edges = graph.edges_for(&bob);
         assert_eq!(bobs_edges.len(), 1);
@@ -489,12 +494,12 @@ mod tests {
             ThicknessSource::Vouch {
                 voucher,
                 vouch_nonce,
-                stake_fraction,
+                stake_bps,
                 expiration_epoch,
             } => {
                 assert_eq!(*voucher, alice);
                 assert_eq!(*vouch_nonce, 42);
-                assert_eq!(*stake_fraction, 0.30);
+                assert_eq!(*stake_bps, 3000);
                 assert_eq!(*expiration_epoch, None);
             }
             _ => panic!("expected Vouch source"),
@@ -510,7 +515,7 @@ mod tests {
         let bob = PeerId::random();
 
         graph.add_verified_contribution(&alice, [0xAA; 32], 1000.0);
-        graph.stake_vouch(&alice, &bob, 0.20, 1, Some(10)).unwrap();
+        graph.stake_vouch(&alice, &bob, 2000, 1, Some(10)).unwrap();
         assert_eq!(graph.total_thickness(&bob), 200.0);
         assert_eq!(graph.encumbered_for(&alice), 200.0);
 
@@ -534,8 +539,8 @@ mod tests {
         let carol = PeerId::random();
 
         graph.add_verified_contribution(&alice, [0xAA; 32], 1000.0);
-        graph.stake_vouch(&alice, &bob, 0.20, 1, Some(10)).unwrap();
-        graph.stake_vouch(&alice, &carol, 0.20, 2, None).unwrap();
+        graph.stake_vouch(&alice, &bob, 2000, 1, Some(10)).unwrap();
+        graph.stake_vouch(&alice, &carol, 2000, 2, None).unwrap();
 
         assert_eq!(graph.total_thickness(&bob), 200.0);
         assert_eq!(graph.total_thickness(&carol), 200.0);
@@ -557,7 +562,7 @@ mod tests {
         let bob = PeerId::random();
 
         graph.add_verified_contribution(&alice, [0xAA; 32], 1000.0);
-        graph.stake_vouch(&alice, &bob, 0.20, 1, None).unwrap();
+        graph.stake_vouch(&alice, &bob, 2000, 1, None).unwrap();
 
         let unwound = graph.process_epoch_expiration(100);
         assert_eq!(unwound, 0);
@@ -573,8 +578,8 @@ mod tests {
         let carol = PeerId::random();
 
         graph.add_verified_contribution(&alice, [0xAA; 32], 500.0);
-        graph.stake_vouch(&alice, &bob, 0.10, 1, Some(5)).unwrap();
-        graph.stake_vouch(&alice, &carol, 0.10, 2, Some(5)).unwrap();
+        graph.stake_vouch(&alice, &bob, 1000, 1, Some(5)).unwrap();
+        graph.stake_vouch(&alice, &carol, 1000, 2, Some(5)).unwrap();
 
         assert_eq!(graph.encumbered_for(&alice), 100.0);
         assert_eq!(graph.total_thickness(&bob), 50.0);
@@ -599,7 +604,7 @@ mod tests {
 
         for (i, node) in nodes.iter().enumerate() {
             let exp = if i == 0 { Some(10u64) } else { None };
-            graph.stake_vouch(&alice, node, 0.10, i as u64 + 1, exp).unwrap();
+            graph.stake_vouch(&alice, node, 1000, i as u64 + 1, exp).unwrap();
         }
 
         for node in &nodes {
@@ -628,7 +633,7 @@ mod tests {
         let bob = PeerId::random();
 
         graph.add_verified_contribution(&alice, [0xAA; 32], 100.0);
-        graph.stake_vouch(&alice, &bob, 0.50, 7, Some(42)).unwrap();
+        graph.stake_vouch(&alice, &bob, 5000, 7, Some(42)).unwrap();
 
         let edges = graph.edges_for(&bob);
         match &edges[0].source {
@@ -651,10 +656,10 @@ mod tests {
         let charlie = PeerId::random();
 
         graph.add_verified_contribution(&alice, [0xAA; 32], 1000.0);
-        graph.stake_vouch(&alice, &bob, 0.20, 1, None).unwrap();
+        graph.stake_vouch(&alice, &bob, 2000, 1, None).unwrap();
         let alice_enc_before = graph.encumbered_for(&alice);
 
-        graph.stake_vouch(&bob, &charlie, 0.50, 2, None).unwrap();
+        graph.stake_vouch(&bob, &charlie, 5000, 2, None).unwrap();
         let bob_enc_before = graph.encumbered_for(&bob);
 
         // Clawback: remove Charlie's vouch edge from Bob
@@ -726,7 +731,7 @@ mod tests {
         let lumen = PeerId::random();
 
         graph.add_genesis_thickness(&root, 1000.0, None).unwrap();
-        graph.stake_vouch(&root, &lumen, 0.50, 1, None).unwrap();
+        graph.stake_vouch(&root, &lumen, 5000, 1, None).unwrap();
 
         assert_eq!(graph.total_thickness(&root), 1000.0);
         assert_eq!(graph.total_thickness(&lumen), 500.0);
@@ -790,7 +795,7 @@ mod tests {
         let peer = PeerId::random();
 
         graph.add_genesis_thickness(&root, 1000.0, Some(20)).unwrap();
-        graph.stake_vouch(&root, &lumen, 0.90, 1, None).unwrap();
+        graph.stake_vouch(&root, &lumen, 9000, 1, None).unwrap();
         assert_eq!(graph.total_thickness(&lumen), 900.0);
 
         for _ in 0..20 {
@@ -814,8 +819,8 @@ mod tests {
         let peer = PeerId::random();
 
         graph.add_genesis_thickness(&root, 1000.0, Some(10)).unwrap();
-        graph.stake_vouch(&root, &lumen, 0.90, 1, None).unwrap();
-        graph.stake_vouch(&lumen, &charlie, 0.50, 2, None).unwrap();
+        graph.stake_vouch(&root, &lumen, 9000, 1, None).unwrap();
+        graph.stake_vouch(&lumen, &charlie, 5000, 2, None).unwrap();
 
         assert!(graph.total_thickness(&charlie) > 0.0);
 
@@ -852,9 +857,9 @@ mod tests {
         let peer = PeerId::random();
 
         graph.add_genesis_thickness(&root, 1000.0, Some(10)).unwrap();
-        graph.stake_vouch(&root, &b, 1.0, 1, None).unwrap();
+        graph.stake_vouch(&root, &b, 10000, 1, None).unwrap();
         graph.add_verified_contribution(&b, [0xAA; 32], 10.0);
-        graph.stake_vouch(&b, &c, 0.90, 2, None).unwrap();
+        graph.stake_vouch(&b, &c, 9000, 2, None).unwrap();
 
         for _ in 0..9 {
             graph.add_verified_contribution(&peer, [0xBB; 32], 10.0);
@@ -879,9 +884,9 @@ mod tests {
         let peer = PeerId::random();
 
         graph.add_genesis_thickness(&root, 1000.0, Some(10)).unwrap();
-        graph.stake_vouch(&root, &b, 1.0, 1, None).unwrap();
+        graph.stake_vouch(&root, &b, 10000, 1, None).unwrap();
         graph.add_verified_contribution(&b, [0xAA; 32], 10.0);
-        graph.stake_vouch(&b, &c, 0.90, 2, None).unwrap();
+        graph.stake_vouch(&b, &c, 9000, 2, None).unwrap();
 
         for _ in 0..9 {
             graph.add_verified_contribution(&peer, [0xBB; 32], 10.0);
@@ -908,10 +913,10 @@ mod tests {
         let peer = PeerId::random();
 
         graph.add_genesis_thickness(&root, 1000.0, Some(10)).unwrap();
-        graph.stake_vouch(&root, &b, 1.0, 1, None).unwrap();
+        graph.stake_vouch(&root, &b, 10000, 1, None).unwrap();
         graph.add_verified_contribution(&b, [0xAA; 32], 10.0);
-        graph.stake_vouch(&b, &c, 0.80, 2, None).unwrap();
-        graph.stake_vouch(&c, &d, 0.50, 3, None).unwrap();
+        graph.stake_vouch(&b, &c, 8000, 2, None).unwrap();
+        graph.stake_vouch(&c, &d, 5000, 3, None).unwrap();
 
         for _ in 0..9 {
             graph.add_verified_contribution(&peer, [0xBB; 32], 10.0);

@@ -115,7 +115,7 @@ impl LedgerState {
             Transaction::Vouch {
                 voucher,
                 vouchee,
-                staked_fraction,
+                stake_bps,
                 expiration_epoch,
                 nonce,
                 ..
@@ -131,12 +131,13 @@ impl LedgerState {
                 // Here we just apply the graph mutation.
                 let per_vouchee = self
                     .thickness_graph
-                    .stake_vouch(&voucher_peer, &vouchee_peer, *staked_fraction, *nonce, *expiration_epoch)
+                    .stake_vouch(&voucher_peer, &vouchee_peer, *stake_bps, *nonce, *expiration_epoch)
                     .map_err(|e| anyhow::anyhow!("vouch failed: {e}"))?;
 
                 info!(
                     voucher = %voucher,
                     vouchee = %vouchee,
+                    stake_bps = *stake_bps,
                     per_vouchee = format!("{:.4}", per_vouchee),
                     expires = ?expiration_epoch,
                     "Vouch applied — derived thickness granted"

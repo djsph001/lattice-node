@@ -79,10 +79,10 @@ pub fn validate_and_apply_with_genesis_root(
         }
     }
 
-    // 4b. For vouches, check sufficient unencumbered thickness
+    // 4b. For vouches, check sufficient unencumbered thickness (exact integer bps)
     if let Transaction::Vouch {
         voucher,
-        staked_fraction,
+        stake_bps,
         ..
     } = &tx.transaction
     {
@@ -96,14 +96,11 @@ pub fn validate_and_apply_with_genesis_root(
                 voucher
             );
         }
-        let stake = voucher_total * *staked_fraction;
-        let usable = state.thickness_graph.usable_thickness(&voucher_peer);
-        if stake > usable {
+        let current_bps = state.thickness_graph.active_stake_bps(&voucher_peer);
+        if current_bps + stake_bps > 10_000 {
             bail!(
-                "insufficient unencumbered thickness: {} needs {:.4}, has {:.4} usable",
+                "insufficient unencumbered thickness: {} has {current_bps}bps staked, cannot add {stake_bps}bps (max 10_000)",
                 voucher,
-                stake,
-                usable
             );
         }
     }

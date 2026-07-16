@@ -80,8 +80,10 @@ struct Cli {
     epoch_interval: u64,
 
     /// Base mint rate — units minted per epoch at a contribution
-    /// score of 1.0.  Higher values make contribution more rewarding.
-    #[arg(long, default_value_t = 10)]
+    /// score of 1.0. Higher values make contribution more rewarding.
+    /// This is a gauge (unit definition, scale-invariant): changing it
+    /// scales all DUU amounts equally without altering relative economics.
+    #[arg(long, default_value_t = 1)]
     base_mint_rate: u64,
 
     /// Base tax rate in percent of balance per epoch (at contribution

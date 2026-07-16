@@ -75,23 +75,25 @@ impl EconomicEngine {
         self.epoch_count += 1;
 
         // ── Calculate per-epoch deltas ────────────────────
+        // Use saturating_sub to prevent underflow: when a u64 counter
+        // wraps, the delta must go to 0, not u64::MAX.
         let epoch_delta = NodeMetrics {
-            bytes_relayed: self.metrics.bytes_relayed - self.epoch_metrics.bytes_relayed,
+            bytes_relayed: self.metrics.bytes_relayed.saturating_sub(self.epoch_metrics.bytes_relayed),
             messages_propagated: self.metrics.messages_propagated
-                - self.epoch_metrics.messages_propagated,
+                .saturating_sub(self.epoch_metrics.messages_propagated),
             dht_records_stored: self.metrics.dht_records_stored
-                - self.epoch_metrics.dht_records_stored,
-            heartbeats_sent: self.metrics.heartbeats_sent - self.epoch_metrics.heartbeats_sent,
+                .saturating_sub(self.epoch_metrics.dht_records_stored),
+            heartbeats_sent: self.metrics.heartbeats_sent.saturating_sub(self.epoch_metrics.heartbeats_sent),
             transactions_relayed: self.metrics.transactions_relayed
-                - self.epoch_metrics.transactions_relayed,
-            bytes_consumed: self.metrics.bytes_consumed - self.epoch_metrics.bytes_consumed,
-            queries_issued: self.metrics.queries_issued - self.epoch_metrics.queries_issued,
+                .saturating_sub(self.epoch_metrics.transactions_relayed),
+            bytes_consumed: self.metrics.bytes_consumed.saturating_sub(self.epoch_metrics.bytes_consumed),
+            queries_issued: self.metrics.queries_issued.saturating_sub(self.epoch_metrics.queries_issued),
             transactions_submitted: self.metrics.transactions_submitted
-                - self.epoch_metrics.transactions_submitted,
+                .saturating_sub(self.epoch_metrics.transactions_submitted),
             verified_bytes_relayed: self.metrics.verified_bytes_relayed
-                - self.epoch_metrics.verified_bytes_relayed,
+                .saturating_sub(self.epoch_metrics.verified_bytes_relayed),
             verified_messages_relayed: self.metrics.verified_messages_relayed
-                - self.epoch_metrics.verified_messages_relayed,
+                .saturating_sub(self.epoch_metrics.verified_messages_relayed),
             agent_tasks_active: self.metrics.agent_tasks_active,
         };
 

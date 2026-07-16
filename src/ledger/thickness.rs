@@ -1077,4 +1077,164 @@ mod tests {
             "Charlie must lose genesis-derived thickness — transitive propagation"
         );
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // LAUNDERING VECTOR TESTS — derivation model specification
+    // ═══════════════════════════════════════════════════════════════════
+    //
+    // The existing tests (vouched_genesis_decays_with_source,
+    // genesis_decay_propagates_transitively) test the case where the
+    // intermediate node has NO honest thickness — so total hits zero and
+    // remove_vouchees_recursive completes.
+    //
+    // These tests add the missing case: the intermediate node has an honest
+    // verified contribution. Under the mutation model, remove_vouchees_recursive
+    // stops at that node (total ≠ 0), and the vouchee downstream retains
+    // genesis-laundered thickness as a permanent Vouch edge.
+    //
+    // The derivation model must close this at any depth — genesis-derived
+    // share computes to zero when the source liquidates, regardless of
+    // honest contributions in between.
+    //
+    // These tests are the SPEC for the derivation model. They are RED
+    // against the current mutation model. They go GREEN when genesis-derived
+    // thickness is computed at read time from lineage + contribution count
+    // instead of mutated on events.
+
+    #[test]
+    fn laundering_vector_live_through_honest_contribution() {
+        // PROOF TEST: documents that the laundering vector exists in the
+        // current mutation model. PASSES against current code — proving
+        // the bug. C should have 9.0 but has 819.0.
+        //
+        // Vector: root vouches genesis to B, B earns honest contribution,
+        // B vouches to C. Genesis liquidates. B survives (honest work),
+        // recursion stops, C keeps genesis-laundered thickness.
+
+        let mut graph = ThicknessGraph::new();
+        let root = PeerId::random();
+        let b = PeerId::random();
+        let c = PeerId::random();
+        let peer = PeerId::random();
+
+        // 1. Self-liquidating genesis over 10 contributions
+        graph.add_genesis_thickness(&root, 1000.0, Some(10)).unwrap();
+
+        // 2. Root vouches 100% to B at t=0
+        graph.stake_vouch(&root, &b, 1.0, 1, None).unwrap();
+
+        // 3. B earns honest verified contribution (10 thickness)
+        graph.add_verified_contribution(&b, [0xAA; 32], 10.0);
+
+        // 4. B vouches 90% to C
+        graph.stake_vouch(&b, &c, 0.90, 2, None).unwrap();
+
+        // 5. Drive genesis to full liquidation (9 more contributions)
+        for _ in 0..9 {
+            graph.add_verified_contribution(&peer, [0xBB; 32], 10.0);
+        }
+
+        // Current mutation model produces these values:
+        assert_eq!(graph.total_thickness(&root), 0.0,
+            "root fully liquidated");
+        assert_eq!(graph.total_thickness(&b), 10.0,
+            "B retains honest contribution only");
+        // THE BUG: C has 819 (genesis-laundered), should have 9 (honest-derived)
+        assert_eq!(graph.total_thickness(&c), 819.0,
+            "CURRENT BEHAVIOR (bug): C retains genesis-laundered thickness \
+             through intermediate node with honest contribution. \
+             remove_vouchees_recursive stopped because B ≠ 0.");
+    }
+
+    #[test]
+    fn derivation_closes_laundering_through_honest_contribution() {
+        // SPEC TEST: specifies what the derivation model must achieve.
+        // RED against current mutation model. GREEN when genesis-derived
+        // thickness is derived at read time from lineage + contribution count.
+        //
+        // Same setup as the proof test, but asserts CORRECT behavior.
+        // C must have only B's honest-derived thickness (10 * 0.90 = 9),
+        // NOT the genesis-laundered amount (819).
+
+        let mut graph = ThicknessGraph::new();
+        let root = PeerId::random();
+        let b = PeerId::random();
+        let c = PeerId::random();
+        let peer = PeerId::random();
+
+        graph.add_genesis_thickness(&root, 1000.0, Some(10)).unwrap();
+        graph.stake_vouch(&root, &b, 1.0, 1, None).unwrap();
+        graph.add_verified_contribution(&b, [0xAA; 32], 10.0);
+        graph.stake_vouch(&b, &c, 0.90, 2, None).unwrap();
+
+        for _ in 0..9 {
+            graph.add_verified_contribution(&peer, [0xBB; 32], 10.0);
+        }
+
+        assert_eq!(graph.total_thickness(&root), 0.0,
+            "root fully liquidated");
+
+        assert_eq!(graph.total_thickness(&b), 10.0,
+            "B retains only honest contribution");
+
+        // THE SPEC: C must have only B's honest-derived thickness.
+        // Genesis-derived share must derive to zero at this depth
+        // without recursive traversal.
+        assert_eq!(graph.total_thickness(&c), 9.0,
+            "DERIVATION SPEC: C must only have B's honest-derived thickness \
+             (10 * 0.90 = 9). Genesis-derived share derives to zero when \
+             source liquidates, at any depth, without traversal.");
+    }
+
+    #[test]
+    fn derivation_closes_laundering_at_arbitrary_depth() {
+        // SPEC TEST: deeper chain — root → B → C → D.
+        // B has honest contribution. Genesis liquidates.
+        // D must have only honest-derived thickness propagated through
+        // the chain, not genesis-laundered.
+        //
+        // RED against current mutation model.
+
+        let mut graph = ThicknessGraph::new();
+        let root = PeerId::random();
+        let b = PeerId::random();
+        let c = PeerId::random();
+        let d = PeerId::random();
+        let peer = PeerId::random();
+
+        graph.add_genesis_thickness(&root, 1000.0, Some(10)).unwrap();
+
+        // root → B (100%)
+        graph.stake_vouch(&root, &b, 1.0, 1, None).unwrap();
+
+        // B earns honest contribution
+        graph.add_verified_contribution(&b, [0xAA; 32], 10.0);
+
+        // B → C (80%)
+        graph.stake_vouch(&b, &c, 0.80, 2, None).unwrap();
+
+        // C → D (50%)
+        graph.stake_vouch(&c, &d, 0.50, 3, None).unwrap();
+
+        // Drive liquidation
+        for _ in 0..9 {
+            graph.add_verified_contribution(&peer, [0xBB; 32], 10.0);
+        }
+
+        assert_eq!(graph.total_thickness(&root), 0.0,
+            "root fully liquidated");
+
+        assert_eq!(graph.total_thickness(&b), 10.0,
+            "B retains only honest contribution");
+
+        // C gets 80% of B's honest 10 = 8
+        assert_eq!(graph.total_thickness(&c), 8.0,
+            "DERIVATION SPEC: C has only B's honest-derived thickness (10 * 0.80)");
+
+        // D gets 50% of C's honest-derived 8 = 4
+        assert_eq!(graph.total_thickness(&d), 4.0,
+            "DERIVATION SPEC: D has only honest-derived thickness propagated \
+             through the chain (10 * 0.80 * 0.50). Genesis-derived share \
+             derives to zero at arbitrary depth without traversal.");
+    }
 }

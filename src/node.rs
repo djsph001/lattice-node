@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use libp2p::{
     futures::StreamExt,
     gossipsub, identify, identity, kad, mdns, noise, relay, request_response,
@@ -491,6 +491,89 @@ impl LatticeNode {
     /// The node's public peer ID.
     pub fn peer_id(&self) -> &PeerId {
         &self.local_peer_id
+    }
+
+    /// Submit a Genesis transaction. The node signs ONLY if its own
+    /// identity matches the configured genesis_root — the strictest gate
+    /// in the system, because Genesis mints thickness from nothing.
+    pub fn submit_genesis(&mut self, thickness_grant: f64) -> Result<()> {
+        let root = match &self.genesis_root {
+            Some(r) => r.clone(),
+            None => bail!("--genesis-root is required to submit genesis"),
+        };
+        if self.local_peer_id != root {
+            bail!(
+                "this node ({}) is not the configured genesis root ({}) — \
+                 genesis must be submitted by the root identity itself",
+                self.local_peer_id, root
+            );
+        }
+        if self.commit_manager.is_bootstrap_ended() {
+            bail!("BootstrapEnded has already occurred — genesis cannot be submitted");
+        }
+        if self.commit_manager.height() > 0 {
+            bail!("chain already has {} blocks — genesis must be block 0", self.commit_manager.height());
+        }
+
+        let tx = crate::ledger::types::Transaction::Genesis {
+            root: self.local_peer_id.to_string(),
+            thickness_grant,
+            declared_operator_keys: vec![self.local_peer_id.to_string()],
+            nonce: 0,
+            timestamp: chrono::Utc::now(),
+        };
+        let data = serde_cbor::to_vec(&tx)?;
+        let signature = self.local_key.sign(&data)?;
+
+        self.commit_manager.commit_root_block(&data, "genesis", &signature)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        self.ledger.apply_transaction(&tx)?;
+
+        info!(
+            root = %self.local_peer_id,
+            thickness = format!("{:.2}", thickness_grant),
+            "Genesis committed — era one begins"
+        );
+        Ok(())
+    }
+
+    /// Submit a BootstrapEnded declaration. One-way: after this block,
+    /// root-authorized blocks are rejected. The node must be the
+    /// configured genesis_root (only the root can end bootstrap).
+    pub fn submit_bootstrap_ended(&mut self) -> Result<()> {
+        let root = match &self.genesis_root {
+            Some(r) => r.clone(),
+            None => bail!("--genesis-root is required to end bootstrap"),
+        };
+        if self.local_peer_id != root {
+            bail!(
+                "this node ({}) is not the configured genesis root ({}) — \
+                 only the root can declare BootstrapEnded",
+                self.local_peer_id, root
+            );
+        }
+        if self.commit_manager.is_bootstrap_ended() {
+            bail!("BootstrapEnded has already occurred");
+        }
+
+        let tx = crate::ledger::types::Transaction::BootstrapEnded {
+            declared_by: self.local_peer_id.to_string(),
+            reason: "declared by root operator.".to_string(),
+            nonce: 1,
+            timestamp: chrono::Utc::now(),
+        };
+        let data = serde_cbor::to_vec(&tx)?;
+        let signature = self.local_key.sign(&data)?;
+
+        self.commit_manager.commit_root_block(&data, "bootstrap-ended", &signature)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        self.ledger.apply_transaction(&tx)?;
+
+        info!(
+            declared_by = %self.local_peer_id,
+            "BootstrapEnded committed — era two begins. Root-authorized blocks are now rejected."
+        );
+        Ok(())
     }
 
     /// Submit an agent task to the mesh and store it in the local registry.
@@ -1975,6 +2058,16 @@ impl LatticeNode {
         source.map_or(false, |src| src != *propagation_source)
     }
 
+    /// Check whether this peer is authorized as the genesis root.
+    /// Genesis mints thickness from nothing — only the configured root
+    /// identity may submit it.
+    pub fn is_genesis_root(&self) -> bool {
+        match &self.genesis_root {
+            Some(root) => self.local_peer_id == *root,
+            None => false,
+        }
+    }
+
     /// Validate a SignedReceipt and store it for the next epoch.
     ///
     /// Returns true if the receipt was valid and stored.
@@ -3281,4 +3374,9 @@ mod panel_access_tests {
         assert!(!LatticeNode::is_relay_work(None, &a));
         assert!(!LatticeNode::is_relay_work(None, &b));
     }
+
+    // NOTE: the discriminating genesis-root test requires a tokio runtime
+    // (LatticeNode::new() initializes a libp2p swarm). The guard logic is:
+    //   if self.local_peer_id != root { bail!("is not the configured genesis root") }
+    // Tested manually via: --submit-genesis on a non-root node → error.
 }

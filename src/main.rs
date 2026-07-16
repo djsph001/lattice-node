@@ -119,6 +119,23 @@ struct Cli {
     #[arg(long)]
     genesis_root: Option<String>,
 
+    /// Submit a Genesis transaction from this node. The node MUST be
+    /// the genesis_root — it signs only if its own identity matches
+    /// the configured root. Seeds thickness and declares operator keys.
+    #[arg(long, requires = "genesis_root")]
+    submit_genesis: bool,
+
+    /// Initial thickness grant for genesis (gauge-scaled).
+    #[arg(long, default_value_t = 1000.0)]
+    genesis_thickness: f64,
+
+    /// Submit a BootstrapEnded declaration from this node. One-way:
+    /// after this block, root-authorized blocks are rejected and only
+    /// certificate-gated commits are accepted. Requires genesis_root
+    /// (the node must be the root to end bootstrap).
+    #[arg(long, requires = "genesis_root")]
+    submit_bootstrap_ended: bool,
+
     // ── Phase 6: storage verification ──────────────────────
     /// Directory for verified resource storage (blake3-addressed
     /// chunk files).  Defaults to ./lattice-storage.
@@ -282,6 +299,15 @@ async fn main() -> Result<()> {
     // Phase 6 verifies that this does NOT increase verified minting.
     if let Some(fake_bytes) = cli.fake_relay_bytes {
         node.inflate_self_reported_relay(fake_bytes);
+    }
+
+    // Submit Genesis if requested — node signs only if its identity
+    // is the configured genesis_root.
+    if cli.submit_genesis {
+        node.submit_genesis(cli.genesis_thickness)?;
+    }
+    if cli.submit_bootstrap_ended {
+        node.submit_bootstrap_ended()?;
     }
 
     // Run the event loop — this is where the node lives

@@ -259,6 +259,22 @@ CANNOT ANSWER TONIGHT:
   - Does derived thickness interact correctly with encumbrance/vouch mechanics?
   - Is the computation tractable at read time (graph traversal cost)?
   - Does this actually eliminate the ordering requirement, or just move it?
+    SHARPENED: derivation eliminates the GLOBAL ordering requirement (no
+    cascade, no cross-entity mutation) but does NOT eliminate per-voucher
+    ordering — stake_vouch still read-modify-writes on encumbrance and
+    re-divides existing vouchees. Two concurrent vouches from the same
+    voucher still diverge. So derivation converts global → per-entity, which
+    is tractable. But it's a REDUCTION, not an ELIMINATION. Spec must not
+    claim more than this.
+  - Does derivation survive the laundering test? The transitive propagation
+    fix (remove_vouchees_recursive) exists because a root could vouch its
+    entire genesis stake to a second identity at t=0, let genesis liquidate,
+    and thickness survives in the vouchee sourced from Vouch rather than
+    Genesis. Derivation SHOULD close this at any depth — if vouchee's
+    genesis-derived share is computed from lineage, it derives to zero when
+    the source does, no traversal needed. But this is a CLAIM that needs the
+    same red-then-green test the mutation version got. The one that came
+    back RED first time.
 
 Take to a fresh head. Do not decide tonight.
 

@@ -7,6 +7,38 @@ use tracing::warn;
 use super::state::LedgerState;
 use super::types::{DigitalUtilityUnit, SignedTransaction, Transaction};
 
+/// Structured error from transaction validation.
+/// Callers can match on `GappedNonce` to trigger a fetch protocol.
+/// All other validation failures are opaque `Other` variants.
+#[derive(Debug)]
+pub enum ValidationError {
+    /// A transaction arrived with a nonce that skips one or more
+    /// predecessors.  `expected` is the lowest nonce that would
+    /// close the gap; `got` is the nonce that was rejected.
+    GappedNonce { signer: PeerId, expected: u64, got: u64 },
+    /// Any other validation failure (balance, signature, timestamp, …).
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GappedNonce { signer, expected, got } => {
+                write!(f, "gapped nonce {got} from {signer} (expected {expected})")
+            }
+            Self::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for ValidationError {}
+
+impl From<anyhow::Error> for ValidationError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Other(e)
+    }
+}
+
 /// Maximum age for a transaction before it's considered stale.
 /// Prevents replay of old transactions from before a node's memory.
 const MAX_TX_AGE_SECS: i64 = 300; // 5 minutes
@@ -14,12 +46,12 @@ const MAX_TX_AGE_SECS: i64 = 300; // 5 minutes
 /// Validate and apply a signed transaction to the local ledger state.
 ///
 /// Returns `Ok(())` if the transaction is valid and was applied,
-/// or an error describing why it was rejected.
+/// or a `ValidationError` describing why it was rejected.
 pub fn validate_and_apply(
     tx: &SignedTransaction,
     state: &mut LedgerState,
     seen_nonces: &mut HashMap<PeerId, u64>,
-) -> Result<()> {
+) -> Result<(), ValidationError> {
     validate_and_apply_with_genesis_root(tx, state, seen_nonces, None)
 }
 
@@ -29,7 +61,7 @@ pub fn validate_and_apply_with_genesis_root(
     state: &mut LedgerState,
     seen_nonces: &mut HashMap<PeerId, u64>,
     genesis_root: Option<&PeerId>,
-) -> Result<()> {
+) -> Result<(), ValidationError> {
     // 1. Verify the signature
     verify_signature(tx)?;
 
@@ -40,14 +72,14 @@ pub fn validate_and_apply_with_genesis_root(
             .map_err(|e| anyhow::anyhow!("invalid genesis signer PeerId: {e}"))?;
         match genesis_root {
             Some(root) if signer == *root => { /* ok */ }
-            Some(root) => bail!(
+            Some(root) => return Err(ValidationError::Other(anyhow::anyhow!(
                 "genesis rejected: signer {} is not the configured root {}",
                 signer, root
-            ),
-            None => bail!(
+            ))),
+            None => return Err(ValidationError::Other(anyhow::anyhow!(
                 "genesis rejected: --genesis-root not configured — \
                  this node cannot validate the trust anchor"
-            ),
+            ))),
         }
     }
 
@@ -70,12 +102,12 @@ pub fn validate_and_apply_with_genesis_root(
             .map_err(|e| anyhow::anyhow!("invalid from PeerId: {e}"))?;
         let balance = state.balance_of(&from_peer);
         if balance < *amount {
-            bail!(
+            return Err(ValidationError::Other(anyhow::anyhow!(
                 "insufficient balance: {} has {}, needs {}",
                 from,
                 balance,
                 amount
-            );
+            )));
         }
     }
 
@@ -91,17 +123,17 @@ pub fn validate_and_apply_with_genesis_root(
             .map_err(|e| anyhow::anyhow!("invalid voucher PeerId: {e}"))?;
         let voucher_total = state.thickness_graph.total_thickness(&voucher_peer);
         if voucher_total <= 0.0 {
-            bail!(
+            return Err(ValidationError::Other(anyhow::anyhow!(
                 "insufficient thickness: {} has no thickness to stake",
                 voucher
-            );
+            )));
         }
         let current_bps = state.thickness_graph.active_stake_bps(&voucher_peer);
         if current_bps + stake_bps > 10_000 {
-            bail!(
+            return Err(ValidationError::Other(anyhow::anyhow!(
                 "insufficient unencumbered thickness: {} has {current_bps}bps staked, cannot add {stake_bps}bps (max 10_000)",
                 voucher,
-            );
+            )));
         }
     }
 
@@ -180,15 +212,14 @@ fn check_nonce(
     signer: &PeerId,
     nonce: u64,
     seen_nonces: &HashMap<PeerId, u64>,
-) -> Result<()> {
+) -> Result<(), ValidationError> {
     if let Some(&last_nonce) = seen_nonces.get(signer) {
         if nonce != last_nonce + 1 {
-            bail!(
-                "gapped nonce {} from {} (expected {}): out-of-order or replayed",
-                nonce,
-                signer,
-                last_nonce + 1
-            );
+            return Err(ValidationError::GappedNonce {
+                signer: *signer,
+                expected: last_nonce + 1,
+                got: nonce,
+            });
         }
     }
     Ok(())
@@ -294,11 +325,11 @@ mod tests {
         // First time: OK
         assert!(validate_and_apply(&signed, &mut state, &mut nonces).is_ok());
 
-        // Second time: replay rejected
+        // Second time: replay rejected (now a gap since nonce 1 == last_nonce + 0)
         let signed2 = sign_transaction(&tx, &alice);
         let result = validate_and_apply(&signed2, &mut state, &mut nonces);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("replayed"));
+        assert!(result.unwrap_err().to_string().contains("gapped nonce"));
     }
 
     #[test]

@@ -233,50 +233,55 @@ Path A (keep None): buys tractable ordering at the cost of permanent founder
 floor = autocracy-by-arithmetic. Not viable. The code's warning is our own
 conclusion quoted back.
 
-## Open Question 3: Derivation Instead of Mutation?
+## Open Question 3: Derivation — STATUS UPDATE
 
-The count converges. The genesis amount is a pure function of the count.
-What breaks is the CASCADE — the recursive mutation that fires when
-thickness hits zero.
+### RESOLVED: Laundering closed
 
-Proposal to investigate (NOT decided): compute genesis-derived thickness at
-READ TIME from lineage + contribution count, rather than MUTATING it on each
-contribution event.
+Derivation model implemented and tested. Both RED tests GREEN at predicted
+values (9.0 and 8.0/4.0). Laundering vector closed at any depth through
+multiplication. No traversal needed.
 
-If genesis thickness is derived:
-  - No amortize_genesis() call on each contribution
-  - No re_divide_vouchees cascade
-  - No remove_vouchees_recursive
-  - A vouchee's genesis-derived share computes to zero naturally when the
-    source liquidates — the cascade becomes implicit in the derivation
-  - Same economic property, no mutation, no order dependence
+### OPEN: Dilution vs Ordering Tradeoff
 
-This is the floor_weight(gauge) move: stop mutating, start deriving.
-It killed a coupling once already.
+The fraction model eliminated the per-voucher ordering requirement — the
+last ordering dependency in the vouch path. But it also eliminated the
+pooling/dilution invariant that was a deliberate Sybil defense.
 
-CANNOT ANSWER TONIGHT:
-  - Does derivation preserve all four properties of self-liquidating genesis?
-  - Does derived thickness interact correctly with encumbrance/vouch mechanics?
-  - Is the computation tractable at read time (graph traversal cost)?
-  - Does this actually eliminate the ordering requirement, or just move it?
-    SHARPENED: derivation eliminates the GLOBAL ordering requirement (no
-    cascade, no cross-entity mutation) but does NOT eliminate per-voucher
-    ordering — stake_vouch still read-modify-writes on encumbrance and
-    re-divides existing vouchees. Two concurrent vouches from the same
-    voucher still diverge. So derivation converts global → per-entity, which
-    is tractable. But it's a REDUCTION, not an ELIMINATION. Spec must not
-    claim more than this.
-  - Does derivation survive the laundering test? The transitive propagation
-    fix (remove_vouchees_recursive) exists because a root could vouch its
-    entire genesis stake to a second identity at t=0, let genesis liquidate,
-    and thickness survives in the vouchee sourced from Vouch rather than
-    Genesis. Derivation SHOULD close this at any depth — if vouchee's
-    genesis-derived share is computed from lineage, it derives to zero when
-    the source does, no traversal needed. But this is a CLAIM that needs the
-    same red-then-green test the mutation version got. The one that came
-    back RED first time.
+Pooling model (deleted):
+  - per_vouchee = encumbered/count
+  - 100 sock puppets each get 1/100th of stake
+  - Breadth visibly costs weight — endorsement is a finite pool
+  - Requires re-division = read-modify-write = per-voucher ordering
 
-Take to a fresh head. Do not decide tonight.
+Fraction model (built):
+  - Each vouchee gets their stated fraction, no dilution
+  - 100 vouchees at 1% each = full cap, all full-strength
+  - Encumbrance cap bounds total but not per-leg value
+  - No ordering dependency — fractions are immutable
+
+CANNOT HAVE BOTH. This is a design fork:
+  - Pooling = honest Sybil defense + ordering requirement
+  - Fractions = order-free + weaker Sybil defense (cap-only)
+
+The fraction model's order-freedom is its main argument, and it has
+nothing to do with which economics is "more correct." It's about whether
+the no-proposer architecture can accommodate the vouch path at all.
+
+DECISION NEEDED: Dale + collaborators.
+
+### OPEN: Float Precision at Breadth 3
+
+0.10 + 0.10 + 0.10 = 0.30000000000000004 in IEEE 754. Not depth —
+breadth three. The encumbrance check `sum + new ≤ 1.0` uses this
+arithmetic. Two nodes summing the same fractions in different orders
+get different last bits. A `>` comparison turns that into divergence.
+
+This is the consistency problem arriving through arithmetic. Not a test-
+tolerance issue.
+
+Likely fix: store stake_fraction as integer basis points (u32, 0-10000).
+0.10 → 1000. Sum is exact, order-independent. Convert to f64 only at
+derivation time. But this is a design decision, not yet built.
 
 ## Build Scope (not a one-liner, not a raft import)
 

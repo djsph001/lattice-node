@@ -5,8 +5,9 @@ use libp2p::{gossipsub, identify, kad, mdns, relay, request_response, swarm::Net
 use libp2p::swarm::behaviour::toggle::Toggle;
 
 use crate::message::codec::rpc::{BalanceCodec, LatticeCodec};
-use crate::message::codec::rpc::VerifyCodec;
+use crate::message::codec::rpc::{TransactionCodec, VerifyCodec};
 use crate::message::types::{BalanceRequest, BalanceResponse, StatusRequest, StatusResponse};
+use crate::message::types::{TransactionRequest, TransactionResponse};
 use crate::message::types::{VerifyRequest, VerifyResponse};
 use crate::agent::codec::{AgentStateCodec, AGENT_STATE_PROTOCOL};
 use crate::agent::state::{AgentStateQuery, AgentStateReply};
@@ -63,6 +64,9 @@ pub struct LatticeBehaviour {
     pub identify: identify::Behaviour,
     /// Phase 8: agent state query RPC.
     pub agent_rpc: request_response::Behaviour<AgentStateCodec>,
+    /// Phase 4: transaction fetch RPC — request missing transactions
+    /// by (signer, nonce) coordinate to close gaps.
+    pub tx_rpc: request_response::Behaviour<TransactionCodec>,
 }
 
 impl LatticeBehaviour {
@@ -77,6 +81,7 @@ impl LatticeBehaviour {
         relay_server: Toggle<relay::Behaviour>,
         identify: identify::Behaviour,
         agent_rpc: request_response::Behaviour<AgentStateCodec>,
+        tx_rpc: request_response::Behaviour<TransactionCodec>,
     ) -> Self {
         Self {
             mdns,
@@ -89,6 +94,7 @@ impl LatticeBehaviour {
             relay_server,
             identify,
             agent_rpc,
+            tx_rpc,
         }
     }
 }
@@ -112,6 +118,8 @@ pub enum LatticeBehaviourEvent {
     Identify(identify::Event),
     /// Phase 8: agent state query events.
     AgentRpc(request_response::Event<AgentStateQuery, AgentStateReply>),
+    /// Phase 4: transaction fetch RPC events.
+    TxRpc(request_response::Event<TransactionRequest, TransactionResponse>),
 }
 
 impl From<mdns::Event> for LatticeBehaviourEvent {
@@ -187,5 +195,15 @@ impl From<request_response::Event<VerifyRequest, VerifyResponse>>
         event: request_response::Event<VerifyRequest, VerifyResponse>,
     ) -> Self {
         LatticeBehaviourEvent::VerifyRpc(event)
+    }
+}
+
+impl From<request_response::Event<TransactionRequest, TransactionResponse>>
+    for LatticeBehaviourEvent
+{
+    fn from(
+        event: request_response::Event<TransactionRequest, TransactionResponse>,
+    ) -> Self {
+        LatticeBehaviourEvent::TxRpc(event)
     }
 }

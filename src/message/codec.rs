@@ -32,6 +32,7 @@ pub mod rpc {
     use libp2p::request_response;
 
     use crate::message::types::{BalanceRequest, BalanceResponse, StatusRequest, StatusResponse};
+    use crate::message::types::{TransactionRequest, TransactionResponse};
     use crate::message::types::{VerifyRequest, VerifyResponse};
 
     /// Maximum frame size (1 MiB) — guards against a malicious or buggy peer
@@ -233,6 +234,77 @@ pub mod rpc {
         type Protocol = VerifyProtocol;
         type Request = VerifyRequest;
         type Response = VerifyResponse;
+
+        async fn read_request<T>(
+            &mut self,
+            _: &Self::Protocol,
+            io: &mut T,
+        ) -> io::Result<Self::Request>
+        where
+            T: AsyncRead + Unpin + Send,
+        {
+            let data = read_frame(io).await?;
+            super::decode(&data).map_err(to_io)
+        }
+
+        async fn read_response<T>(
+            &mut self,
+            _: &Self::Protocol,
+            io: &mut T,
+        ) -> io::Result<Self::Response>
+        where
+            T: AsyncRead + Unpin + Send,
+        {
+            let data = read_frame(io).await?;
+            super::decode(&data).map_err(to_io)
+        }
+
+        async fn write_request<T>(
+            &mut self,
+            _: &Self::Protocol,
+            io: &mut T,
+            req: Self::Request,
+        ) -> io::Result<()>
+        where
+            T: AsyncWrite + Unpin + Send,
+        {
+            let data = super::encode(&req).map_err(to_io)?;
+            write_frame(io, &data).await
+        }
+
+        async fn write_response<T>(
+            &mut self,
+            _: &Self::Protocol,
+            io: &mut T,
+            res: Self::Response,
+        ) -> io::Result<()>
+        where
+            T: AsyncWrite + Unpin + Send,
+        {
+            let data = super::encode(&res).map_err(to_io)?;
+            write_frame(io, &data).await
+        }
+    }
+
+    /// Protocol identifier for the transaction fetch RPC channel.
+    #[derive(Debug, Clone)]
+    pub struct TransactionProtocol;
+
+    impl AsRef<str> for TransactionProtocol {
+        fn as_ref(&self) -> &str {
+            "/lattice/tx-fetch/v1"
+        }
+    }
+
+    /// CBOR + length-prefix codec for TransactionRequest/TransactionResponse.
+    #[derive(Debug, Clone, Default)]
+    pub struct TransactionCodec;
+
+    #[async_trait]
+    impl request_response::Codec for TransactionCodec {
+        type Protocol = TransactionProtocol;
+        type Request = TransactionRequest;
+        type Response = TransactionResponse;
 
         async fn read_request<T>(
             &mut self,

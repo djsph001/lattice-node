@@ -21,10 +21,11 @@ use crate::ledger::state::LedgerState;
 use crate::ledger::types::{DigitalUtilityUnit, SignedTransaction, Transaction};
 use crate::ledger::validation;
 use crate::message::codec::rpc::{BalanceCodec, BalanceProtocol, LatticeCodec, LatticeProtocol};
-use crate::message::codec::rpc::VerifyProtocol;
+use crate::message::codec::rpc::{TransactionCodec, TransactionProtocol, VerifyProtocol};
 use crate::message::types::{
     BalanceRequest, BalanceResponse, Heartbeat, LatticeMessage, StatusRequest, StatusResponse,
 };
+use crate::message::types::{TransactionRequest, TransactionResponse};
 use crate::message::types::{VerifyRequest, VerifyResponse};
 use crate::network::protocol::{
     LatticeBehaviour, LatticeBehaviourEvent, LATTICE_HEARTBEAT_TOPIC, LATTICE_KAD_PROTOCOL,
@@ -414,6 +415,12 @@ impl LatticeNode {
                     ),
                 );
 
+                // Transaction fetch RPC channel (Phase 4).
+                let tx_rpc = request_response::Behaviour::new(
+                    [(TransactionProtocol, request_response::ProtocolSupport::Full)],
+                    request_response::Config::default(),
+                );
+
                 Ok(LatticeBehaviour::new(
                     mdns,
                     gossipsub,
@@ -425,6 +432,7 @@ impl LatticeNode {
                     relay_server,
                     identify,
                     agent_rpc,
+                    tx_rpc,
                 ))
             })?
             .with_swarm_config(|c| {
@@ -1419,6 +1427,58 @@ impl LatticeNode {
                 request_response::Event::OutboundFailure { peer, error, .. },
             )) => {
                 debug!(peer = %peer, error = ?error, "Storage verification challenge failed");
+            }
+
+            // ── Phase 4: transaction fetch ──────────────────────
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::TxRpc(
+                request_response::Event::Message { peer, message },
+            )) => {
+                match message {
+                    request_response::Message::Request { request, channel, .. } => {
+                        // Incoming fetch request: look up transactions by (signer, nonce range)
+                        // and respond. Responder logic is minimal — query the applied-tx store.
+                        debug!(
+                            from = %peer,
+                            signer = %request.signer,
+                            range = %format!("{}-{}", request.from_nonce, request.to_nonce),
+                            "[tx-fetch] Incoming transaction request"
+                        );
+                        // TODO: look up from applied transaction store and respond
+                        let _ = self.swarm.behaviour_mut().tx_rpc.send_response(
+                            channel,
+                            TransactionResponse { transactions: vec![] },
+                        );
+                    }
+                    request_response::Message::Response { response, .. } => {
+                        // Fetch response received. Apply each valid transaction.
+                        let count = response.transactions.len();
+                        for tx in &response.transactions {
+                            if let Err(e) = validation::validate_and_apply(
+                                tx,
+                                &mut self.ledger,
+                                &mut self.seen_nonces,
+                            ) {
+                                warn!(
+                                    error = %e,
+                                    signer = %tx.transaction.signer(),
+                                    nonce = tx.transaction.nonce(),
+                                    "[tx-fetch] Fetched transaction rejected"
+                                );
+                            }
+                        }
+                        debug!(
+                            from = %peer,
+                            count = count,
+                            "[tx-fetch] Applied {} fetched transactions",
+                            count,
+                        );
+                    }
+                }
+            }
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::TxRpc(
+                request_response::Event::OutboundFailure { peer, error, .. },
+            )) => {
+                debug!(peer = %peer, error = ?error, "[tx-fetch] Request failed");
             }
 
             // ── Kademlia events ──────────────────────────────

@@ -165,6 +165,27 @@ pub struct BalanceResponse {
 
 // ── Phase 6: storage verification ──────────────────────────
 
+/// Request a specific transaction by signer and nonce coordinate.
+/// Used by the fetch protocol to close gaps.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransactionRequest {
+    /// The signer whose transaction is being requested.
+    pub signer: String,
+    /// First nonce in the requested range (inclusive).
+    pub from_nonce: u64,
+    /// Last nonce in the requested range (inclusive).
+    /// Set equal to `from_nonce` for a single-transaction request.
+    pub to_nonce: u64,
+}
+
+/// Response to a TransactionRequest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransactionResponse {
+    /// Transactions matching the requested range, in nonce order.
+    /// May be empty or partial if the responder doesn't have all of them.
+    pub transactions: Vec<SignedTransaction>,
+}
+
 /// Challenge a peer to prove possession of a specific chunk within a
 /// resource.  Deterministic per (resource_id, epoch) so that every
 /// validator arrives at the same challenge for a given target — proofs

@@ -482,7 +482,17 @@ impl LatticeNode {
             floor_weight,
             density_margin,
             thickness_gauge,
-            genesis_root: genesis_root.and_then(|s| s.parse().ok()),
+            genesis_root: {
+                let parsed = genesis_root.and_then(|s| s.parse().ok());
+                if parsed.is_none() {
+                    tracing::warn!(
+                        "--genesis-root not set — this node cannot validate genesis. \
+                         Economic participation (panels, certificates, thickness) \
+                         requires a configured trust anchor. Relay and gossip still work."
+                    );
+                }
+                parsed
+            },
             executor: crate::agent::executor::OllamaExecutor::new(),
             exec_tx: None,
         })

@@ -111,6 +111,14 @@ struct Cli {
     #[arg(long, default_value_t = 1_000_000.0)]
     thickness_gauge: f64,
 
+    // ── Consensus bootstrap ────────────────────────────────
+    /// Expected root PeerId for Genesis validation.
+    /// Only blocks signed by this identity are accepted as the
+    /// chain's genesis — the out-of-band trust anchor, honestly
+    /// confessed. Required for economic participation.
+    #[arg(long)]
+    genesis_root: Option<String>,
+
     // ── Phase 6: storage verification ──────────────────────
     /// Directory for verified resource storage (blake3-addressed
     /// chunk files).  Defaults to ./lattice-storage.
@@ -262,6 +270,7 @@ async fn main() -> Result<()> {
         cli.floor_weight,
         cli.density_margin,
         cli.thickness_gauge,
+        cli.genesis_root,
     )?;
 
     info!(

@@ -234,6 +234,8 @@ pub struct LatticeNode {
     /// witness panels can form.
     density_margin: f64,
     thickness_gauge: f64,
+    /// Expected root PeerId for genesis validation (out-of-band trust anchor).
+    genesis_root: Option<PeerId>,
     /// Phase 9: model execution bridge (Ollama).
     executor: crate::agent::executor::OllamaExecutor,
     /// Phase 9: channel sender for background execution results.
@@ -266,7 +268,8 @@ impl LatticeNode {
         no_economics: bool,
         floor_weight: f64,
         density_margin: f64,
-    thickness_gauge: f64,
+        thickness_gauge: f64,
+        genesis_root: Option<String>,
     ) -> Result<Self> {
         let key_path = resolve_identity_path(identity_dir)?;
         let local_key = load_or_generate_identity(&key_path, fresh_identity)?;
@@ -479,6 +482,7 @@ impl LatticeNode {
             floor_weight,
             density_margin,
             thickness_gauge,
+            genesis_root: genesis_root.and_then(|s| s.parse().ok()),
             executor: crate::agent::executor::OllamaExecutor::new(),
             exec_tx: None,
         })

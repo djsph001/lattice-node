@@ -43,6 +43,10 @@ const PROTOCOL_VERSION: u32 = 1;
 /// Gossipsub topic for economic transaction propagation.
 pub const LATTICE_TX_TOPIC: &str = "lattice/tx/v1";
 
+/// How long to wait for a fetch response before considering it failed.
+/// On a 3-node LAN mesh, round-trips are sub-second — 5s is generous.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
 // ── Phase 6: storage verification types ────────────────────
 
 /// Tracks the context of an outbound storage challenge so the
@@ -137,6 +141,10 @@ pub struct LatticeNode {
     /// ordered by nonce.  Drained in nonce order when the gap fills.
     /// Bounded at MAX_PENDING_PER_PEER entries per signer.
     pending: HashMap<PeerId, BTreeMap<u64, SignedTransaction>>,
+    /// Outstanding fetch requests keyed by (signer, expected_nonce).
+    /// Inserted on gap detection, removed on matching response, evicted
+    /// on timeout (lazy — checked on next insert for same signer).
+    outstanding_fetches: HashMap<(PeerId, u64), Instant>,
     /// Amount to mint at startup (test bootstrapping).
     mint_on_start: Option<u64>,
     /// One-shot transfer on startup: (to_peer_id, amount).
@@ -469,6 +477,7 @@ impl LatticeNode {
             tx_nonce: 0,
             tx_store: HashMap::new(),
             pending: HashMap::new(),
+            outstanding_fetches: HashMap::new(),
             mint_on_start,
             transfer_on_start,
             economic_engine: EconomicEngine::new(),
@@ -1470,6 +1479,13 @@ impl LatticeNode {
                                 &mut self.seen_nonces,
                             ) {
                                 Ok(()) => {
+                                    let applied_signer: PeerId = match tx.transaction.signer().parse() {
+                                        Ok(p) => p,
+                                        Err(_) => return,
+                                    };
+                                    let applied_nonce = tx.transaction.nonce();
+                                    // Remove the outstanding fetch mark for this gap.
+                                    self.outstanding_fetches.remove(&(applied_signer, applied_nonce));
                                     self.on_transaction_applied(tx);
                                 }
                                 Err(e) => {
@@ -1945,15 +1961,26 @@ impl LatticeNode {
                                     }
                                 }
                             }
-                            // Emit fetch request to propagation source.
-                            self.swarm.behaviour_mut().tx_rpc.send_request(
-                                &propagation_source,
-                                TransactionRequest {
-                                    signer: signer.to_string(),
-                                    from_nonce: expected,
-                                    to_nonce: got - 1,
-                                },
-                            );
+                            // Dedup: skip if we already have an outstanding fetch
+                            // for this gap (lazy timeout — sweep expired on next hit).
+                            let fetch_key = (signer, expected);
+                            if !self.outstanding_fetches.contains_key(&fetch_key) {
+                                // Lazy eviction: sweep expired entries for this signer.
+                                let now = Instant::now();
+                                self.outstanding_fetches.retain(|(s, _), ts| {
+                                    s != &signer || *ts + FETCH_TIMEOUT > now
+                                });
+                                // Emit fetch request to propagation source.
+                                self.outstanding_fetches.insert(fetch_key, now);
+                                self.swarm.behaviour_mut().tx_rpc.send_request(
+                                    &propagation_source,
+                                    TransactionRequest {
+                                        signer: signer.to_string(),
+                                        from_nonce: expected,
+                                        to_nonce: got - 1,
+                                    },
+                                );
+                            }
                         }
                         Err(e) => {
                             warn!(error = %e, "Transaction validation failed");

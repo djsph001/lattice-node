@@ -577,6 +577,14 @@ impl LatticeNode {
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         self.ledger.apply_transaction(&tx)?;
 
+        // Persist to WAL for crash recovery
+        let stx = crate::ledger::types::SignedTransaction {
+            transaction: tx,
+            signer_public_key: self.local_key.public().encode_protobuf(),
+            signature,
+        };
+        self.on_transaction_applied(&stx);
+
         info!(
             root = %self.local_peer_id,
             thickness = format!("{:.2}", thickness_grant),
@@ -616,6 +624,14 @@ impl LatticeNode {
         self.commit_manager.commit_root_block(&data, "bootstrap-ended", &signature, &self.local_peer_id)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         self.ledger.apply_transaction(&tx)?;
+
+        // Persist to WAL for crash recovery
+        let stx = crate::ledger::types::SignedTransaction {
+            transaction: tx,
+            signer_public_key: self.local_key.public().encode_protobuf(),
+            signature,
+        };
+        self.on_transaction_applied(&stx);
 
         info!(
             declared_by = %self.local_peer_id,

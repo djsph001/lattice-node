@@ -208,6 +208,10 @@ struct Cli {
     /// Automatically set when --relay-server is active.
     #[arg(long, default_value_t = false)]
     no_economics: bool,
+    /// Enable transaction persistence (WAL + snapshot) for crash
+    /// recovery.  Stores state in <storage-dir>/persistence/.
+    #[arg(long, default_value_t = false)]
+    persistence: bool,
 }
 
 #[tokio::main]
@@ -261,6 +265,7 @@ async fn main() -> Result<()> {
     };
     // Phase 10b: public relays are pure infrastructure — no economic participation.
     let no_economics = cli.no_economics || cli.relay_server;
+    let storage_dir = cli.storage_dir.clone();
 
     let mut node = LatticeNode::new(
         cli.port,
@@ -294,6 +299,13 @@ async fn main() -> Result<()> {
         peer_id = %node.peer_id(),
         "Node identity established"
     );
+
+    // Enable persistence if requested
+    if cli.persistence {
+        let dir = storage_dir.unwrap_or_else(|| std::path::PathBuf::from("./lattice-storage"));
+        node.enable_persistence(&dir)?;
+        info!("Persistence enabled — WAL + snapshot active");
+    }
 
     // Debug: inflate self-reported relay metrics (test-only).
     // Phase 6 verifies that this does NOT increase verified minting.

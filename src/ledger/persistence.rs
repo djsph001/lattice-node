@@ -95,7 +95,9 @@ impl WalStateStore {
     }
 
     fn should_fsync(&self) -> bool {
-        self.fsync_counter >= self.config.fsync_batch_size
+        // First transaction always flushes; subsequent ones batch.
+        self.fsync_counter == 1
+            || self.fsync_counter >= self.config.fsync_batch_size
             || self.last_fsync.elapsed() >= self.config.fsync_interval
     }
 

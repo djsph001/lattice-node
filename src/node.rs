@@ -1326,6 +1326,20 @@ impl LatticeNode {
         {
             Ok(_) => {
                 debug!(nonce = signed.transaction.nonce(), "Transaction broadcast");
+                // Gossipsub deduplicates by message ID, so we will never see
+                // our own transaction echoed back.  Remove from outbound
+                // queue on successful publish instead.
+                if let Ok(signer) = signed.transaction.signer().parse::<PeerId>() {
+                    if signer == self.local_peer_id {
+                        let nonce = signed.transaction.nonce();
+                        if let Some(queue) = self.outbound.get_mut(&signer) {
+                            queue.remove(&nonce);
+                            if queue.is_empty() {
+                                self.outbound.remove(&signer);
+                            }
+                        }
+                    }
+                }
             }
             Err(gossipsub::PublishError::InsufficientPeers) => {
                 info!("Transaction broadcast skipped: no peers yet");

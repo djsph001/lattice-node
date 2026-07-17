@@ -1328,7 +1328,7 @@ impl LatticeNode {
                 debug!(nonce = signed.transaction.nonce(), "Transaction broadcast");
             }
             Err(gossipsub::PublishError::InsufficientPeers) => {
-                debug!("Transaction broadcast skipped: no peers yet");
+                info!("Transaction broadcast skipped: no peers yet");
             }
             Err(e) => {
                 return Err(anyhow::anyhow!("failed to broadcast transaction: {e}"));

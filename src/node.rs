@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -130,6 +130,13 @@ pub struct LatticeNode {
     seen_nonces: HashMap<PeerId, u64>,
     /// Monotonically increasing nonce for our own outbound transactions.
     tx_nonce: u64,
+    /// Applied transaction store — keyed by (signer, nonce) for serving
+    /// fetch requests.  Bounded at LAST_NONCES_PER_PEER entries per signer.
+    tx_store: HashMap<(PeerId, u64), SignedTransaction>,
+    /// Pending transactions that arrived out of order — keyed by signer,
+    /// ordered by nonce.  Drained in nonce order when the gap fills.
+    /// Bounded at MAX_PENDING_PER_PEER entries per signer.
+    pending: HashMap<PeerId, BTreeMap<u64, SignedTransaction>>,
     /// Amount to mint at startup (test bootstrapping).
     mint_on_start: Option<u64>,
     /// One-shot transfer on startup: (to_peer_id, amount).
@@ -460,6 +467,8 @@ impl LatticeNode {
             ledger: LedgerState::new(),
             seen_nonces: HashMap::new(),
             tx_nonce: 0,
+            tx_store: HashMap::new(),
+            pending: HashMap::new(),
             mint_on_start,
             transfer_on_start,
             economic_engine: EconomicEngine::new(),
@@ -1435,35 +1444,42 @@ impl LatticeNode {
             )) => {
                 match message {
                     request_response::Message::Request { request, channel, .. } => {
-                        // Incoming fetch request: look up transactions by (signer, nonce range)
-                        // and respond. Responder logic is minimal — query the applied-tx store.
-                        debug!(
-                            from = %peer,
-                            signer = %request.signer,
-                            range = %format!("{}-{}", request.from_nonce, request.to_nonce),
-                            "[tx-fetch] Incoming transaction request"
-                        );
-                        // TODO: look up from applied transaction store and respond
+                        // Incoming fetch request: look up transactions by (signer, nonce range).
+                        let signer_pid: PeerId = match request.signer.parse() {
+                            Ok(p) => p,
+                            Err(_) => return,
+                        };
+                        let mut txs = Vec::new();
+                        for nonce in request.from_nonce..=request.to_nonce {
+                            if let Some(tx) = self.tx_store.get(&(signer_pid, nonce)) {
+                                txs.push(tx.clone());
+                            }
+                        }
                         let _ = self.swarm.behaviour_mut().tx_rpc.send_response(
                             channel,
-                            TransactionResponse { transactions: vec![] },
+                            TransactionResponse { transactions: txs },
                         );
                     }
                     request_response::Message::Response { response, .. } => {
                         // Fetch response received. Apply each valid transaction.
                         let count = response.transactions.len();
                         for tx in &response.transactions {
-                            if let Err(e) = validation::validate_and_apply(
+                            match validation::validate_and_apply(
                                 tx,
                                 &mut self.ledger,
                                 &mut self.seen_nonces,
                             ) {
-                                warn!(
-                                    error = %e,
-                                    signer = %tx.transaction.signer(),
-                                    nonce = tx.transaction.nonce(),
-                                    "[tx-fetch] Fetched transaction rejected"
-                                );
+                                Ok(()) => {
+                                    self.on_transaction_applied(tx);
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        signer = %tx.transaction.signer(),
+                                        nonce = tx.transaction.nonce(),
+                                        "[tx-fetch] Fetched transaction rejected"
+                                    );
+                                }
                             }
                         }
                         debug!(
@@ -1732,6 +1748,61 @@ impl LatticeNode {
         }
     }
 
+    /// Record a successfully-applied transaction: insert into tx_store,
+    /// prune old entries, and drain any pending transactions whose gap
+    /// just closed.
+    fn on_transaction_applied(&mut self, tx: &SignedTransaction) {
+        let signer: PeerId = match tx.transaction.signer().parse() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let nonce = tx.transaction.nonce();
+
+        self.tx_store.insert((signer, nonce), tx.clone());
+
+        // Prune store: keep only last 100 nonces for this signer.
+        const MAX_NONCES: u64 = 100;
+        if nonce > MAX_NONCES {
+            let prune_before = nonce - MAX_NONCES;
+            self.tx_store
+                .retain(|(s, n), _| s != &signer || *n > prune_before);
+        }
+
+        // Drain pending transactions whose nonce is now applyable.
+        if let Some(pending_map) = self.pending.get_mut(&signer) {
+            let mut applied = 0u64;
+            let mut next_nonce = nonce + 1;
+            while let Some(ptx) = pending_map.remove(&next_nonce) {
+                if let Err(e) =
+                    validation::validate_and_apply(&ptx, &mut self.ledger, &mut self.seen_nonces)
+                {
+                    warn!(
+                        error = %e,
+                        signer = %signer,
+                        nonce = next_nonce,
+                        "[pending] Pre-validated pending tx re-failed — gap may have shifted"
+                    );
+                    break;
+                }
+                self.tx_store.insert((signer, next_nonce), ptx);
+                applied = next_nonce;
+                next_nonce += 1;
+            }
+            if applied > 0 {
+                debug!(
+                    signer = %signer,
+                    from = nonce + 1,
+                    to = applied,
+                    "[pending] Drained {} pending transactions",
+                    applied - nonce,
+                );
+            }
+            if pending_map.is_empty() {
+                self.pending.remove(&signer);
+            }
+        }
+    }
+
     /// Handle an inbound gossip message.
     fn handle_gossip_message(&mut self, data: &[u8], propagation_source: PeerId, message_source: Option<PeerId>) {
         // Track the message hash for receipt validation.
@@ -1837,11 +1908,51 @@ impl LatticeNode {
                     ) {
                         Ok(()) => {
                             let signer: PeerId = signed.transaction.signer().parse().unwrap();
+                            let nonce = signed.transaction.nonce();
+                            self.on_transaction_applied(&signed);
                             let balance = self.ledger.balance_of(&signer);
                             info!(
                                 signer = %signer,
                                 balance = %balance,
                                 "Transaction applied to local ledger"
+                            );
+                        }
+                        Err(validation::ValidationError::GappedNonce { signer, expected, got }) => {
+                            // Pre-validated (signature, cap, balance all OK) — just gapped.
+                            // Park in pending, then ask the propagation source for the gap.
+                            debug!(
+                                signer = %signer,
+                                expected = expected,
+                                got = got,
+                                "[fetch] Gapped transaction from propagation source — parking in pending"
+                            );
+                            self.pending
+                                .entry(signer)
+                                .or_default()
+                                .insert(got, signed.clone());
+                            // Bound pending: drop entries beyond the 100th per signer.
+                            const MAX_PENDING_PER_SIGNER: usize = 100;
+                            if let Some(pmap) = self.pending.get(&signer) {
+                                if pmap.len() > MAX_PENDING_PER_SIGNER {
+                                    // Drop the highest nonces (they're least likely to close).
+                                    let surplus = pmap.len() - MAX_PENDING_PER_SIGNER;
+                                    let high_keys: Vec<u64> =
+                                        pmap.keys().rev().copied().take(surplus).collect();
+                                    if let Some(pmap) = self.pending.get_mut(&signer) {
+                                        for k in high_keys {
+                                            pmap.remove(&k);
+                                        }
+                                    }
+                                }
+                            }
+                            // Emit fetch request to propagation source.
+                            self.swarm.behaviour_mut().tx_rpc.send_request(
+                                &propagation_source,
+                                TransactionRequest {
+                                    signer: signer.to_string(),
+                                    from_nonce: expected,
+                                    to_nonce: got - 1,
+                                },
                             );
                         }
                         Err(e) => {

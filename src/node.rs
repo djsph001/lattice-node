@@ -946,6 +946,35 @@ impl LatticeNode {
                 }
                 _ = heartbeat_timer.tick() => {
                     self.broadcast_heartbeat().await;
+                    // ── Metrics ────────────────────────────────────
+                    // Instrumentation for soak test: outstanding_fetches
+                    // is the leak canary (entries > 10×FETCH_TIMEOUT ≈ 50s
+                    // are "aged" — should stay near zero).  outbound queues
+                    // drain on gossip echo; any non-empty entry is a
+                    // sender-side signal.  Both are sampled every heartbeat
+                    // interval (typically 30s).
+                    let fetch_total = self.outstanding_fetches.len();
+                    let fetch_aged = self.outstanding_fetches
+                        .values()
+                        .filter(|t| t.elapsed() > FETCH_TIMEOUT * 10)
+                        .count();
+                    let queues: Vec<String> = self.outbound
+                        .iter()
+                        .filter(|(_, q)| !q.is_empty())
+                        .map(|(peer, q)| {
+                            // 8-char prefix is enough to disambiguate in a
+                            // 3-node mesh; avoids 52-char base58 noise.
+                            let short = peer.to_base58();
+                            let short = &short[..short.len().min(8)];
+                            format!("{}={}", short, q.len())
+                        })
+                        .collect();
+                    info!(
+                        "metrics: outstanding_fetches={} aged={} outbound_queues=[{}]",
+                        fetch_total,
+                        fetch_aged,
+                        queues.join(" ")
+                    );
                 }
                 _ = epoch_timer.tick() => {
                     // Phase 11: unwind expired vouches before economic cycle

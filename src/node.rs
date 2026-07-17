@@ -1326,23 +1326,32 @@ impl LatticeNode {
         {
             Ok(_) => {
                 debug!(nonce = signed.transaction.nonce(), "Transaction broadcast");
-                // Gossipsub deduplicates by message ID, so we will never see
-                // our own transaction echoed back.  Remove from outbound
-                // queue on successful publish instead.
-                if let Ok(signer) = signed.transaction.signer().parse::<PeerId>() {
-                    if signer == self.local_peer_id {
-                        let nonce = signed.transaction.nonce();
-                        if let Some(queue) = self.outbound.get_mut(&signer) {
-                            queue.remove(&nonce);
-                            if queue.is_empty() {
-                                self.outbound.remove(&signer);
+                // Remove from outbound queue only if at least one other peer
+                // is in the topic mesh — gossipsub Ok means handoff, not delivery,
+                // but with ≥1 peer the odds of delivery are high enough that
+                // keeping the entry creates unbounded queue growth without
+                // improving reliability.  On a healthy 3-node mesh this fires
+                // immediately; on an isolated node the entry stays for retry.
+                let topic_hash = gossipsub::IdentTopic::new(LATTICE_TX_TOPIC).hash();
+                let in_mesh = self.swarm.behaviour().gossipsub
+                    .mesh_peers(&topic_hash)
+                    .count();
+                if in_mesh >= 1 {
+                    if let Ok(signer) = signed.transaction.signer().parse::<PeerId>() {
+                        if signer == self.local_peer_id {
+                            let nonce = signed.transaction.nonce();
+                            if let Some(queue) = self.outbound.get_mut(&signer) {
+                                queue.remove(&nonce);
+                                if queue.is_empty() {
+                                    self.outbound.remove(&signer);
+                                }
                             }
                         }
                     }
                 }
             }
             Err(gossipsub::PublishError::InsufficientPeers) => {
-                info!("Transaction broadcast skipped: no peers yet");
+                debug!("Transaction broadcast skipped: no peers yet");
             }
             Err(e) => {
                 return Err(anyhow::anyhow!("failed to broadcast transaction: {e}"));

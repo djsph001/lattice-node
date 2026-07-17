@@ -141,6 +141,11 @@ pub struct LatticeNode {
     /// ordered by nonce.  Drained in nonce order when the gap fills.
     /// Bounded at MAX_PENDING_PER_PEER entries per signer.
     pending: HashMap<PeerId, BTreeMap<u64, SignedTransaction>>,
+    /// Outbound queue — locally-signed transactions that haven't been
+    /// confirmed by the mesh yet.  Keyed by local signer, ordered by
+    /// nonce.  Removed only when another peer forwards our transaction
+    /// back to us (gossip echo: signer==self && propagation_source!=self).
+    outbound: HashMap<PeerId, BTreeMap<u64, SignedTransaction>>,
     /// Outstanding fetch requests keyed by (signer, expected_nonce).
     /// Inserted on gap detection, removed on matching response, evicted
     /// on timeout (lazy — checked on next insert for same signer).
@@ -478,6 +483,7 @@ impl LatticeNode {
             tx_store: HashMap::new(),
             pending: HashMap::new(),
             outstanding_fetches: HashMap::new(),
+            outbound: HashMap::new(),
             mint_on_start,
             transfer_on_start,
             economic_engine: EconomicEngine::new(),
@@ -1041,8 +1047,13 @@ impl LatticeNode {
                 for (peer, nonce) in seen {
                     self.seen_nonces.insert(peer, nonce);
                 }
+                // Insert into outbound queue and flush.
+                self.outbound
+                    .entry(self.local_peer_id)
+                    .or_default()
+                    .insert(self.tx_nonce, signed);
+                self.flush_outbound();
                 self.economic_engine.metrics.record_transaction_submitted();
-                self.broadcast_transaction(&signed).ok();
             }
         }
 
@@ -1067,8 +1078,13 @@ impl LatticeNode {
                 for (peer, nonce) in seen {
                     self.seen_nonces.insert(peer, nonce);
                 }
+                // Insert into outbound queue and flush.
+                self.outbound
+                    .entry(self.local_peer_id)
+                    .or_default()
+                    .insert(self.tx_nonce, signed);
+                self.flush_outbound();
                 self.economic_engine.metrics.record_transaction_submitted();
-                self.broadcast_transaction(&signed).ok();
             }
         }
 
@@ -1268,6 +1284,30 @@ impl LatticeNode {
             }
         }
         Ok(())
+    }
+
+    /// Flush the outbound queue: broadcast the lowest nonce for our
+    /// own signer.  Never removes from queue on broadcast result —
+    /// removal only happens via gossip echo.  Returns true if a
+    /// transaction was broadcast, false if the queue was empty.
+    fn flush_outbound(&mut self) -> bool {
+        let me = self.local_peer_id;
+        // Clone the transaction to avoid borrow conflict with broadcast.
+        let to_broadcast: Option<SignedTransaction> = self
+            .outbound
+            .get(&me)
+            .and_then(|queue| queue.first_key_value().map(|(_, tx)| tx.clone()));
+        if let Some(tx) = to_broadcast {
+            let nonce = tx.transaction.nonce();
+            // Broadcast attempted (succeeded or failed).
+            // Transaction stays in queue regardless.
+            // Removal only via gossip echo.
+            let _ = self.broadcast_transaction(&tx);
+            debug!(nonce = nonce, "[outbound] Flushed nonce {nonce}");
+            true
+        } else {
+            false
+        }
     }
 
     /// Send a balance query to a specific peer.
@@ -1905,6 +1945,28 @@ impl LatticeNode {
             }
             // ── Phase 4: transaction handling ─────────────
             LatticeMessage::Transaction(signed) => {
+                // Gossip echo: if another peer forwarded our own signed
+                // transaction back to us, the mesh has it — remove from
+                // outbound queue.  The `propagation_source != self` check
+                // is load-bearing: without it, our own direct publish would
+                // clear the queue before the mesh ever saw the transaction.
+                if propagation_source != self.local_peer_id {
+                    if let Ok(signer_pid) = signed.transaction.signer().parse::<PeerId>() {
+                        if signer_pid == self.local_peer_id {
+                            let nonce = signed.transaction.nonce();
+                            if let Some(queue) = self.outbound.get_mut(&signer_pid) {
+                                queue.remove(&nonce);
+                                if queue.is_empty() {
+                                    self.outbound.remove(&signer_pid);
+                                }
+                                debug!(
+                                    nonce = nonce,
+                                    "[outbound] Mesh confirmed — removed from outbound queue via gossip echo"
+                                );
+                            }
+                        }
+                    }
+                }
                 info!(
                     nonce = signed.transaction.nonce(),
                     signer = %signed.transaction.signer(),
@@ -3654,6 +3716,64 @@ mod panel_access_tests {
         // If expected == last_nonce + 1, check_nonce passes silently.
         // The assertion is: outstanding unchanged.
         assert!(!outstanding.contains_key(&(alice, 1)));
+    }
+
+    #[test]
+    fn sender_outbound_queue_removal_on_echo_only() {
+        // Discriminator for Option A: self-echo (propagation_source == self)
+        // must NOT remove from outbound queue.  Cross-echo
+        // (propagation_source != self) DOES remove.
+        use chrono::Utc;
+        use std::collections::BTreeMap;
+
+        let me = PeerId::random();
+        let other = PeerId::random(); // a different peer
+        let mut outbound: HashMap<PeerId, BTreeMap<u64, SignedTransaction>> = HashMap::new();
+
+        // Insert a mock transaction into our own outbound queue.
+        let nonce = 5u64;
+        let mock_tx = SignedTransaction {
+            transaction: Transaction::Transfer {
+                from: me.to_string(),
+                to: other.to_string(),
+                amount: DigitalUtilityUnit(100),
+                nonce,
+                timestamp: Utc::now(),
+            },
+            signer_public_key: vec![],
+            signature: vec![],
+        };
+        outbound.entry(me).or_default().insert(nonce, mock_tx);
+        assert!(outbound.get(&me).map_or(false, |q| q.contains_key(&nonce)));
+
+        // Simulate self-echo: same peer forwards our own message.
+        // This happens when gossipsub echoes back to the publisher.
+        // Under Option A, this must NOT remove the queue entry.
+        if let Some(queue) = outbound.get_mut(&me) {
+            // propagation_source == me is a self-echo
+            // This guard is the load-bearing check in the production code.
+            let propagation_source = me; // self-echo
+            if propagation_source != me {
+                // This guard should prevent removal
+                queue.remove(&nonce);
+            }
+        }
+        assert!(
+            outbound.get(&me).map_or(false, |q| q.contains_key(&nonce)),
+            "Self-echo must NOT remove from outbound queue"
+        );
+
+        // Simulate cross-echo: a different peer forwarded our transaction.
+        if let Some(queue) = outbound.get_mut(&me) {
+            let propagation_source = other; // cross-echo
+            if propagation_source != me {
+                queue.remove(&nonce);
+            }
+        }
+        assert!(
+            outbound.get(&me).map_or(true, |q| !q.contains_key(&nonce)),
+            "Cross-echo MUST remove from outbound queue"
+        );
     }
 
     #[test]

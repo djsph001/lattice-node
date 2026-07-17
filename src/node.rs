@@ -573,7 +573,7 @@ impl LatticeNode {
         let data = serde_cbor::to_vec(&tx)?;
         let signature = self.local_key.sign(&data)?;
 
-        self.commit_manager.commit_root_block(&data, "genesis", &signature)
+        self.commit_manager.commit_root_block(&data, "genesis", &signature, &self.local_peer_id)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         self.ledger.apply_transaction(&tx)?;
 
@@ -613,7 +613,7 @@ impl LatticeNode {
         let data = serde_cbor::to_vec(&tx)?;
         let signature = self.local_key.sign(&data)?;
 
-        self.commit_manager.commit_root_block(&data, "bootstrap-ended", &signature)
+        self.commit_manager.commit_root_block(&data, "bootstrap-ended", &signature, &self.local_peer_id)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         self.ledger.apply_transaction(&tx)?;
 

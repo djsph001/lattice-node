@@ -573,6 +573,15 @@ impl CommitManager {
         hash
     }
 
+    /// Remove proposal IDs from the in-memory committed set.
+    /// Used after adopting a winning fork so losing-fork proposals
+    /// can be re-submitted without being rejected as duplicates.
+    pub fn remove_committed_proposals(&mut self, ids: &[String]) {
+        for id in ids {
+            self.committed.remove(id);
+        }
+    }
+
     /// Extract proposal IDs from a fork segment (for the losing-fork event).
     pub fn extract_proposal_ids(&self, fork: &[BlockFrame]) -> Vec<String> {
         fork.iter().filter_map(|block| {

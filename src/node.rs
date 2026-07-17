@@ -257,6 +257,11 @@ pub struct LatticeNode {
     thickness_gauge: f64,
     /// Expected root PeerId for genesis validation (out-of-band trust anchor).
     genesis_root: Option<PeerId>,
+    /// Transaction persistence layer (WAL + snapshot).  When set,
+    /// every validated and applied transaction is recorded in the WAL
+    /// and nonces are snapshotted for crash recovery.  Optional so
+    /// that nodes without a data directory skip disk I/O entirely.
+    state_store: Option<Box<dyn crate::ledger::persistence::StateStore>>,
     /// Phase 9: model execution bridge (Ollama).
     executor: crate::agent::executor::OllamaExecutor,
     /// Phase 9: channel sender for background execution results.
@@ -525,6 +530,7 @@ impl LatticeNode {
                 }
                 parsed
             },
+            state_store: None,
             executor: crate::agent::executor::OllamaExecutor::new(),
             exec_tx: None,
         })
@@ -1310,6 +1316,38 @@ impl LatticeNode {
         }
     }
 
+    /// Enable persistence with a WAL + snapshot store in the given
+    /// data directory.  Called once during startup.  Recovers the
+    /// node's seen_nonces from the snapshot, so transactions that
+    /// were applied before a restart are not re-processed.
+    pub fn enable_persistence(&mut self, data_dir: &std::path::Path) -> Result<()> {
+        use crate::ledger::persistence::{StateStore, WalStateStore, WalStateStoreConfig};
+        let config = WalStateStoreConfig {
+            data_dir: data_dir.join("persistence"),
+            fsync_batch_size: 100,
+            fsync_interval: Duration::from_millis(100),
+        };
+        let mut store = WalStateStore::new(config)?;
+        let state = store.recover()?;
+        let recovered = state.export_nonces();
+        // Merge recovered nonces into current seen_nonces — the
+        // recovered values are higher (they survive restart), and
+        // the current values are 0 (fresh start).
+        for (peer, nonce) in recovered {
+            let entry = self.seen_nonces.entry(peer).or_insert(0);
+            if nonce > *entry {
+                *entry = nonce;
+            }
+        }
+        info!(
+            count = self.seen_nonces.len(),
+            "Recovered {} peer nonces from persistence",
+            self.seen_nonces.len()
+        );
+        self.state_store = Some(Box::new(store));
+        Ok(())
+    }
+
     /// Send a balance query to a specific peer.
     fn send_balance_query(&mut self, query_peer: PeerId, target: PeerId) {
         self.query_nonce += 1;
@@ -1805,9 +1843,14 @@ impl LatticeNode {
     }
 
     /// Record a successfully-applied transaction: insert into tx_store,
-    /// prune old entries, and drain any pending transactions whose gap
-    /// just closed.
+    /// prune old entries, drain pending, and persist to WAL.
     fn on_transaction_applied(&mut self, tx: &SignedTransaction) {
+        // Persist to WAL if persistence is enabled.
+        if let Some(store) = self.state_store.as_mut() {
+            if let Err(e) = store.persist(tx) {
+                warn!(error = %e, nonce = tx.transaction.nonce(), "Failed to persist transaction");
+            }
+        }
         let signer: PeerId = match tx.transaction.signer().parse() {
             Ok(p) => p,
             Err(_) => return,

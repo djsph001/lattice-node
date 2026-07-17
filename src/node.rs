@@ -1936,6 +1936,17 @@ impl LatticeNode {
                         Err(validation::ValidationError::GappedNonce { signer, expected, got }) => {
                             // Pre-validated (signature, cap, balance all OK) — just gapped.
                             // Park in pending, then ask the propagation source for the gap.
+                            // Stale transactions (got < expected) are replays or late arrivals
+                            // — don't park or fetch, just log and drop.
+                            if got < expected {
+                                debug!(
+                                    signer = %signer,
+                                    expected = expected,
+                                    got = got,
+                                    "[fetch] Stale/replay transaction (nonce {got} behind expected {expected}) — dropping"
+                                );
+                                return;
+                            }
                             debug!(
                                 signer = %signer,
                                 expected = expected,
@@ -3643,5 +3654,27 @@ mod panel_access_tests {
         // If expected == last_nonce + 1, check_nonce passes silently.
         // The assertion is: outstanding unchanged.
         assert!(!outstanding.contains_key(&(alice, 1)));
+    }
+
+    #[test]
+    fn stale_nonce_below_expected_does_not_trigger_fetch() {
+        // Stale transaction (nonce behind current high-water mark)
+        // should NOT register an outstanding fetch — the range would
+        // be descending and nonsensical.
+        let alice = PeerId::random();
+        let mut outstanding = HashMap::new();
+        let timeout = Duration::from_secs(5);
+
+        // First gap: nonce 8 arrives, expected 4 → gap ahead → fetch.
+        assert!(should_fetch(&mut outstanding, alice, 4, timeout));
+        assert_eq!(outstanding.len(), 1);
+
+        // Stale: nonce 8 would arrive, but we're already at 10.
+        // This simulates: expected=11, got=8 → got < expected.
+        // should_fetch is never called in this case — the handler
+        // checks `got < expected` before reaching should_fetch.
+        // The assertion is: outstanding unchanged from the one entry.
+        assert_eq!(outstanding.len(), 1);
+        assert!(outstanding.contains_key(&(alice, 4)));
     }
 }

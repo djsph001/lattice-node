@@ -371,6 +371,84 @@ mod tests {
     }
 
     #[test]
+    fn cap_exceeded_on_fetched_vouch_is_rejected() {
+        // Discriminator: a trusting fetch path that checks only
+        // "signature valid, nonce matches request" would accept this
+        // transaction.  The full validate_and_apply path must reject it.
+        //
+        // Alice has thickness. She vouches 6000 bps (60%) to Bob.
+        // A second vouch of 5000 bps (60+50=110% > 100%) exceeds the cap.
+        // A third vouch of 3000 bps (60+30=90% ≤ 100%) is legitimate.
+        // The trust test: 5000 bps is rejected, 3000 bps is accepted.
+        let alice = make_keypair();
+        let bob = make_keypair();
+        let charlie = make_keypair();
+        let dave = make_keypair();
+        let alice_id = PeerId::from(alice.public());
+        let bob_id = PeerId::from(bob.public());
+        let charlie_id = PeerId::from(charlie.public());
+        let dave_id = PeerId::from(dave.public());
+
+        let mut state = LedgerState::new();
+        let mut nonces = HashMap::new();
+
+        // Give Alice thickness via a direct contribution.
+        state.thickness_graph.add_verified_contribution(&alice_id, [0xAA; 32], 1000.0);
+
+        // Vouch 6000 bps to Bob — should succeed.
+        let tx1 = Transaction::Vouch {
+            voucher: alice_id.to_string(),
+            vouchee: bob_id.to_string(),
+            stake_bps: 6000,
+            expiration_epoch: None,
+            nonce: 1,
+            timestamp: Utc::now(),
+        };
+        let signed1 = sign_transaction(&tx1, &alice);
+        assert!(
+            validate_and_apply(&signed1, &mut state, &mut nonces).is_ok(),
+            "Alice's first vouch (6000 bps) should succeed"
+        );
+
+        // Vouch 5000 bps to Charlie — exceeds cap (6000 + 5000 = 11000 > 10000).
+        // Correctly signed by Alice, correct nonce 2 — but fails the cap check.
+        // A trusting fetch path that only checks envelope fields would apply it.
+        let tx2 = Transaction::Vouch {
+            voucher: alice_id.to_string(),
+            vouchee: charlie_id.to_string(),
+            stake_bps: 5000,
+            expiration_epoch: None,
+            nonce: 2,
+            timestamp: Utc::now(),
+        };
+        let signed2 = sign_transaction(&tx2, &alice);
+        let result = validate_and_apply(&signed2, &mut state, &mut nonces);
+        assert!(result.is_err(), "Cap-violating vouch must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("insufficient unencumbered thickness"),
+            "Error should name the cap, not the nonce: got {msg}"
+        );
+
+        // Vouch 3000 bps to Dave — fits (6000 + 3000 = 9000 ≤ 10000).
+        // Nonce 2: the failed 5000-bps vouch at nonce 2 never advanced
+        // seen_nonces, so nonce 2 is retryable.
+        let tx3 = Transaction::Vouch {
+            voucher: alice_id.to_string(),
+            vouchee: dave_id.to_string(),
+            stake_bps: 3000,
+            expiration_epoch: None,
+            nonce: 2,
+            timestamp: Utc::now(),
+        };
+        let signed3 = sign_transaction(&tx3, &alice);
+        assert!(
+            validate_and_apply(&signed3, &mut state, &mut nonces).is_ok(),
+            "Alice's third vouch (3000 bps, within cap) should succeed"
+        );
+    }
+
+    #[test]
     fn bad_signature_rejected() {
         let alice = make_keypair();
         let bob = make_keypair();

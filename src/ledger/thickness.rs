@@ -18,12 +18,12 @@
 //                          Derived as original × (N-k)/N.
 //   Vouch               — derived from voucher's total × stake_bps / 10_000.
 //                          Integer basis points. Never stores an amount.
-
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use libp2p::PeerId;
-
+use tracing::{debug, info, warn};
 /// Identifies a specific verified receipt (the Blake3 message_hash).
 pub type ReceiptId = [u8; 32];
 
@@ -88,6 +88,30 @@ impl ThicknessGraph {
             edges: HashMap::new(),
             genesis_used: false,
         }
+    }
+
+    /// Export edges for snapshot serialization.
+    /// Returns a map of peer-base58 → list of (source_debug, created_timestamp).
+    pub fn export_edges(&self) -> HashMap<String, Vec<(String, i64)>> {
+        self.edges
+            .iter()
+            .map(|(peer, edges)| {
+                let serialized: Vec<(String, i64)> = edges
+                    .iter()
+                    .map(|e| (format!("{:?}", e.source), e.created.timestamp()))
+                    .collect();
+                (peer.to_base58(), serialized)
+            })
+            .collect()
+    }
+
+    /// Import edges from deserialized snapshot data.
+    pub fn import_edges(&mut self, _data: HashMap<String, Vec<(String, i64)>>) {
+        // TODO: reconstruct ThicknessEdge from serialized data.
+        // For now, edges are recovered via WAL replay — the snapshot
+        // is a performance optimization for faster startup.
+        // The full state is always recoverable from WAL alone.
+        warn!("ThicknessGraph snapshot import not yet implemented — recovering from WAL");
     }
 
     // ── Genesis ────────────────────────────────────────────

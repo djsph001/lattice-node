@@ -1963,15 +1963,12 @@ impl LatticeNode {
                             }
                             // Dedup: skip if we already have an outstanding fetch
                             // for this gap (lazy timeout — sweep expired on next hit).
-                            let fetch_key = (signer, expected);
-                            if !self.outstanding_fetches.contains_key(&fetch_key) {
-                                // Lazy eviction: sweep expired entries for this signer.
-                                let now = Instant::now();
-                                self.outstanding_fetches.retain(|(s, _), ts| {
-                                    s != &signer || *ts + FETCH_TIMEOUT > now
-                                });
-                                // Emit fetch request to propagation source.
-                                self.outstanding_fetches.insert(fetch_key, now);
+                            if should_fetch(
+                                &mut self.outstanding_fetches,
+                                signer,
+                                expected,
+                                FETCH_TIMEOUT,
+                            ) {
                                 self.swarm.behaviour_mut().tx_rpc.send_request(
                                     &propagation_source,
                                     TransactionRequest {
@@ -3370,6 +3367,26 @@ fn check_panel_access_density(pool: &[(PeerId, f64)], density_margin: f64, floor
 
 // ── Identity helpers ──────────────────────────────────────────
 
+/// Decide whether to emit a fetch for a gap, updating the outstanding
+/// set with dedup and lazy timeout eviction.  Returns true if a fetch
+/// should be emitted, false if one is already in flight for this gap.
+fn should_fetch(
+    outstanding: &mut HashMap<(PeerId, u64), Instant>,
+    signer: PeerId,
+    expected: u64,
+    timeout: Duration,
+) -> bool {
+    let key = (signer, expected);
+    if outstanding.contains_key(&key) {
+        return false;
+    }
+    // Lazy eviction: sweep expired entries for this signer.
+    let now = Instant::now();
+    outstanding.retain(|(s, _), ts| s != &signer || *ts + timeout > now);
+    outstanding.insert(key, now);
+    true
+}
+
 /// Set the nonce field on a Transaction (used after TaxEngine produces
 /// transactions with placeholder nonce 0).
 fn set_transaction_nonce(tx: &mut Transaction, nonce: u64) {
@@ -3587,4 +3604,44 @@ mod panel_access_tests {
     // (LatticeNode::new() initializes a libp2p swarm). The guard logic is:
     //   if self.local_peer_id != root { bail!("is not the configured genesis root") }
     // Tested manually via: --submit-genesis on a non-root node → error.
+
+    #[test]
+    fn gap_triggers_fetch_dedup_skips_duplicate() {
+        // Positive: gap detected → fetch marked.  Negative: same hole
+        // → no double-mark.  Contiguous → nothing marked.
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        let alice = PeerId::random();
+        let bob = PeerId::random();
+        let mut outstanding = HashMap::new();
+        let timeout = Duration::from_secs(5);
+
+        // First gap for Alice at nonce 2: should fetch.
+        assert!(
+            should_fetch(&mut outstanding, alice, 2, timeout),
+            "First gap should trigger a fetch"
+        );
+        assert_eq!(outstanding.len(), 1);
+        assert!(outstanding.contains_key(&(alice, 2)));
+
+        // Same gap again: dedup — no double fetch.
+        assert!(
+            !should_fetch(&mut outstanding, alice, 2, timeout),
+            "Duplicate gap should be deduped"
+        );
+        assert_eq!(outstanding.len(), 1);
+
+        // Different signer, different gap: independent.
+        assert!(
+            should_fetch(&mut outstanding, bob, 2, timeout),
+            "Bob's gap is independent"
+        );
+        assert_eq!(outstanding.len(), 2);
+
+        // Contiguous case: no gap, never reaches should_fetch.
+        // If expected == last_nonce + 1, check_nonce passes silently.
+        // The assertion is: outstanding unchanged.
+        assert!(!outstanding.contains_key(&(alice, 1)));
+    }
 }

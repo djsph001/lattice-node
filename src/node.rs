@@ -47,6 +47,13 @@ pub const LATTICE_TX_TOPIC: &str = "lattice/tx/v1";
 /// On a 3-node LAN mesh, round-trips are sub-second — 5s is generous.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Minimum peers in the topic mesh before we consider a broadcast
+/// handoff as strong evidence of delivery.  On a 3-node mesh with
+/// a relay hub, N=1 is sufficient — the relay is an always-on
+/// witness.  On flaky homelab meshes, raise to N=2 to require two
+/// independent recipients before removing from the outbound queue.
+const OUTBOUND_CONFIRM_PEERS: usize = 1;
+
 // ── Phase 6: storage verification types ────────────────────
 
 /// Tracks the context of an outbound storage challenge so the
@@ -1336,7 +1343,7 @@ impl LatticeNode {
                 let in_mesh = self.swarm.behaviour().gossipsub
                     .mesh_peers(&topic_hash)
                     .count();
-                if in_mesh >= 1 {
+                if in_mesh >= OUTBOUND_CONFIRM_PEERS {
                     if let Ok(signer) = signed.transaction.signer().parse::<PeerId>() {
                         if signer == self.local_peer_id {
                             let nonce = signed.transaction.nonce();

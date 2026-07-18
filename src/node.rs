@@ -1343,6 +1343,7 @@ impl LatticeNode {
                 let in_mesh = self.swarm.behaviour().gossipsub
                     .mesh_peers(&topic_hash)
                     .count();
+                info!("[broadcast] mesh_peers for tx topic: {}", in_mesh);
                 if in_mesh >= OUTBOUND_CONFIRM_PEERS {
                     if let Ok(signer) = signed.transaction.signer().parse::<PeerId>() {
                         if signer == self.local_peer_id {

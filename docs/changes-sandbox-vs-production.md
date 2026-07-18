@@ -129,6 +129,21 @@ Epoch mint and redistribution transactions are created, signed, and gossiped via
 
 ---
 
+## 5. Operational Safeguards
+
+### 5.1 Startup NTP Clock Drift Check
+**Status: ✅ Landed (e4aec30)**
+
+On startup, the node queries NTP servers in order (`time.apple.com`, `time.google.com`, `pool.ntp.org`), compares the response against the local wall clock, and hard-fails with an actionable error if drift > 300s. Prevents operators from broadcasting bad-timestamped transactions (the 15-hour Mac drift failure revealed by the soak).
+
+- `--skip-ntp-check` flag bypasses the check (air-gapped/lab networks, logged at WARN).
+- `--ntp-server` flag for custom NTP servers.
+- Uses `rsntp` crate with `SntpClient` in a `spawn_blocking` call (sync protocol is fine for a one-time startup check).
+
+Validated live: Florida booted with `drift 0s against pool.ntp.org`. Mac pending pull.
+
+---
+
 ## 3. Fetch Protocol (Receiver-Side Gap Recovery)
 
 ### 3.1 `ValidationError::GappedNonce`

@@ -1,8 +1,7 @@
-use std::time::SystemTime;
-
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
-use rsntp::AsyncSntpClient;
+use rsntp::SntpClient;
+use std::time::SystemTime;
 use tracing::{info, warn};
 
 /// Maximum acceptable clock drift in seconds.
@@ -26,46 +25,52 @@ pub async fn verify_clock_sync(
         DEFAULT_NTP_SERVERS.iter().map(|s| s.to_string()).collect()
     });
 
-    for server in &servers {
-        let client = AsyncSntpClient::new(server);
-        match client.synchronize().await {
-            Ok(result) => {
-                let ntp_dt: DateTime<Utc> = DateTime::from(result.datetime());
-                let local_dt: DateTime<Utc> = SystemTime::now().into();
-                let drift = (ntp_dt - local_dt).num_seconds();
+    // Use spawn_blocking since the SNTP client is synchronous.
+    let handle = tokio::task::spawn_blocking(move || -> Result<()> {
+        for server in &servers {
+            match SntpClient::new(server) {
+                Ok(client) => match client.synchronize() {
+                    Ok(result) => {
+                        let ntp_dt: DateTime<Utc> = DateTime::from(result.datetime());
+                        let local_dt: DateTime<Utc> = SystemTime::now().into();
+                        let drift = (ntp_dt - local_dt).num_seconds();
 
-                if drift.abs() > CLOCK_DRIFT_THRESHOLD_SECS {
-                    let direction = if drift > 0 { "behind" } else { "ahead" };
-                    bail!(
-                        "Clock drift too large: local clock is {}s {} of NTP server {}.\n\
-                         Threshold: ±{}s.\n\n\
-                         Sync your clock and restart:\n\n\
-                         \tmacOS:   sudo sntp -sS {}\n\
-                         \tLinux:   sudo ntpdate {}  (or: sudo chronyc -a makestep)\n\
-                         \tWindows: w32tm /resync /force\n\n\
-                         If you need to start anyway (air-gapped or lab), use: --skip-ntp-check",
-                        drift.abs(), direction, server,
-                        CLOCK_DRIFT_THRESHOLD_SECS, server, server,
-                    );
+                        if drift.abs() > CLOCK_DRIFT_THRESHOLD_SECS {
+                            let direction = if drift > 0 { "behind" } else { "ahead" };
+                            bail!(
+                                "Clock drift too large: local clock is {}s {} of {} (threshold ±{}s).\n\
+                                 Sync your clock and restart.\n\
+                                 macOS:   sudo sntp -sS {}\n\
+                                 Linux:   sudo ntpdate {}  (or: sudo chronyc -a makestep)\n\
+                                 Windows: w32tm /resync /force\n\
+                                 To bypass: --skip-ntp-check",
+                                drift.abs(), direction, server,
+                                CLOCK_DRIFT_THRESHOLD_SECS, server, server,
+                            );
+                        }
+
+                        info!(
+                            "✅ Clock verified against {}: drift {}s (threshold ±{}s)",
+                            server, drift, CLOCK_DRIFT_THRESHOLD_SECS
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!("NTP query to {} failed: {} (trying next)", server, e);
+                    }
+                },
+                Err(e) => {
+                    warn!("Failed to create NTP client for {}: {} (trying next)", server, e);
                 }
-
-                info!(
-                    "✅ Clock verified against {}: drift {}s (threshold ±{}s)",
-                    server, drift, CLOCK_DRIFT_THRESHOLD_SECS
-                );
-                return Ok(());
-            }
-            Err(e) => {
-                warn!("NTP query to {} failed: {} (trying next)", server, e);
             }
         }
-    }
+        bail!(
+            "Could not reach any NTP server (tried: {}). Check network or use --skip-ntp-check.",
+            servers.join(", ")
+        );
+    });
 
-    bail!(
-        "Could not reach any NTP server (tried: {}).\n\n\
-         Check your network connection.\n\n\
-         If you're on an air-gapped network with a verified clock,\n\
-         restart with: --skip-ntp-check",
-        servers.join(", ")
-    );
+    // Propagate both the join error and the inner Result
+    handle.await.map_err(|e| anyhow::anyhow!("NTP check panicked: {}", e))??;
+    Ok(())
 }

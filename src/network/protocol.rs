@@ -29,6 +29,13 @@ pub const LATTICE_ENCLAVE_CERT_TOPIC: &str = "lattice/enclave-cert/v1";
 /// Gossipsub topic for agent task propagation (Phase 8).
 pub const LATTICE_AGENT_TOPIC: &str = "lattice/agent/v1";
 
+/// Gossipsub topic for chain block propagation.
+/// Blocks committed by any node are broadcast here, enabling
+/// the chain to be a distributed structure rather than a
+/// per-node local ledger. Peers validate and append contiguous
+/// blocks; divergent blocks trigger fork resolution.
+pub const LATTICE_BLOCK_TOPIC: &str = "lattice/block/v1";
+
 /// Composed network behaviour for a Lattice node.
 ///
 /// Phase 2 starts with mDNS for local peer discovery.

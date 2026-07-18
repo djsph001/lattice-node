@@ -47,6 +47,12 @@ pub const LATTICE_TX_TOPIC: &str = "lattice/tx/v1";
 /// On a 3-node LAN mesh, round-trips are sub-second — 5s is generous.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How old an outstanding fetch request must be before it is evicted
+/// by the periodic sweep.  600s = 10 minutes, well beyond any legitimate
+/// mesh recovery time.  The aged threshold (FETCH_TIMEOUT * 10 = 50s)
+/// flags entries for attention; this threshold is where they are deleted.
+const FETCH_EVICTION_THRESHOLD: Duration = Duration::from_secs(600);
+
 /// Minimum peers in the topic mesh before we consider a broadcast
 /// handoff as strong evidence of delivery.  On a 3-node mesh with
 /// a relay hub, N=1 is sufficient — the relay is an always-on
@@ -157,6 +163,10 @@ pub struct LatticeNode {
     /// Inserted on gap detection, removed on matching response, evicted
     /// on timeout (lazy — checked on next insert for same signer).
     outstanding_fetches: HashMap<(PeerId, u64), Instant>,
+    /// Cumulative count of stale fetch entries that have been evicted
+    /// by the periodic sweep.  Logged when > 0.  Tracks the sweep's
+    /// effectiveness across restarts (in-memory only — not persisted).
+    total_evicted_fetches: usize,
     /// Amount to mint at startup (test bootstrapping).
     mint_on_start: Option<u64>,
     /// One-shot transfer on startup: (to_peer_id, amount).
@@ -495,6 +505,7 @@ impl LatticeNode {
             tx_store: HashMap::new(),
             pending: HashMap::new(),
             outstanding_fetches: HashMap::new(),
+            total_evicted_fetches: 0,
             outbound: HashMap::new(),
             mint_on_start,
             transfer_on_start,
@@ -953,6 +964,8 @@ impl LatticeNode {
                 }
                 _ = heartbeat_timer.tick() => {
                     self.broadcast_heartbeat().await;
+                    // Sweep stale fetch entries before computing metrics
+                    self.sweep_stale_fetches();
                     // ── Metrics ────────────────────────────────────
                     // Instrumentation for soak test: outstanding_fetches
                     // is the leak canary (entries > 10×FETCH_TIMEOUT ≈ 50s
@@ -1915,6 +1928,24 @@ impl LatticeNode {
             Err(e) => {
                 warn!(error = %e, "Failed to publish heartbeat");
             }
+        }
+    }
+
+    /// Sweep stale entries from the outstanding_fetches map.
+    /// Entries older than FETCH_EVICTION_THRESHOLD (600s) are removed.
+    /// Runs on every metrics tick to prevent unbounded accumulation.
+    fn sweep_stale_fetches(&mut self) {
+        let now = Instant::now();
+        let before = self.outstanding_fetches.len();
+        self.outstanding_fetches
+            .retain(|_, inserted_at| now.duration_since(*inserted_at) < FETCH_EVICTION_THRESHOLD);
+        let evicted = before - self.outstanding_fetches.len();
+        if evicted > 0 {
+            self.total_evicted_fetches += evicted;
+            info!(
+                "swept {} stale fetch entries (total evicted: {})",
+                evicted, self.total_evicted_fetches
+            );
         }
     }
 

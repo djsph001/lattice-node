@@ -170,6 +170,11 @@ pub struct LatticeNode {
     /// by the periodic sweep.  Logged when > 0.  Tracks the sweep's
     /// effectiveness across restarts (in-memory only — not persisted).
     total_evicted_fetches: usize,
+    /// Peers with an in-flight ChainRangeRequest.  Prevents firing
+    /// multiple overlapping catch-up requests to the same peer while
+    /// the first is still outstanding.  Cleared on response (success
+    /// or failure).
+    outstanding_chain_requests_by_peer: HashSet<PeerId>,
     /// Amount to mint at startup (test bootstrapping).
     mint_on_start: Option<u64>,
     /// One-shot transfer on startup: (to_peer_id, amount).
@@ -522,6 +527,7 @@ impl LatticeNode {
             pending: HashMap::new(),
             outstanding_fetches: HashMap::new(),
             total_evicted_fetches: 0,
+            outstanding_chain_requests_by_peer: HashSet::new(),
             outbound: HashMap::new(),
             mint_on_start,
             transfer_on_start,
@@ -875,12 +881,25 @@ impl LatticeNode {
         }
 
         // ── Case 4: Future block (gap > 1) ────────────────────
-        tracing::warn!(
+        info!(
             height, local_height, gap = height - local_height,
             from = %propagation_source,
-            "[block-recv] Future block — ahead of tip by {}. Catch-up sync not yet wired.",
-            height - local_height
+            "[chain-sync] Future block at {} — catching up via ChainRangeRequest ({}..{})",
+            height, local_height + 1, height,
         );
+        // Fire a ChainRangeRequest if we don't already have one
+        // in-flight to this peer.  Dedup by peer ID so a burst of
+        // future blocks from the same peer fires only one request.
+        if !self.outstanding_chain_requests_by_peer.contains(propagation_source) {
+            let req = ChainRangeRequest {
+                from_height: local_height + 1,
+                to_height: height,
+            };
+            self.outstanding_chain_requests_by_peer.insert(*propagation_source);
+            let _ = self.swarm.behaviour_mut()
+                .chain_sync_rpc
+                .send_request(propagation_source, req);
+        }
     }
 
     pub fn submit_agent_task(
@@ -1963,6 +1982,8 @@ impl LatticeNode {
                     request_response::Message::Response {
                         response, ..
                     } => {
+                        // Clear dedup guard — request completed (success or partial)
+                        self.outstanding_chain_requests_by_peer.remove(&peer);
                         // Requester side: validate and apply received blocks
                         for wire in &response.blocks {
                             // Convert WireBlock back to signatures with PeerId
@@ -1991,6 +2012,7 @@ impl LatticeNode {
                 request_response::Event::OutboundFailure { peer, error, .. },
             )) => {
                 warn!(peer = %peer, error = ?error, "[chain-sync] Request failed");
+                self.outstanding_chain_requests_by_peer.remove(&peer);
             }
 
             // ── Kademlia events ──────────────────────────────

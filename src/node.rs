@@ -714,44 +714,76 @@ impl LatticeNode {
     /// Submit an agent task to the mesh and store it in the local registry.
 
     /// Handle an incoming block message from gossipsub.
-    /// Three cases: (1) old block → drop, (2) contiguous extension → append,
-    /// (3) divergent parent hash → trigger fork resolution.
+    /// Four cases:
+    ///   1. Old (height < tip) → drop
+    ///   2. Divergent (height == tip, different block) → WARN
+    ///   3. Contiguous (height == tip_height) → validate, apply, commit
+    ///   4. Future (height > tip_height+1) → WARN (catch-up needed)
+    ///
+    /// For case 3, Genesis is a special case: height 0, no parent hash
+    /// check. All other blocks must have prev_hash matching local tip.
     fn handle_block_message(&mut self, data: &[u8], propagation_source: &PeerId) {
-        // Parse the block frame: same format as on-disk ledger
-        if data.len() < 8 + 32 + 32 {
-            tracing::warn!("[block-recv] Block too short ({}) bytes", data.len());
+        if data.len() < 72 {
+            tracing::warn!("[block-recv] Block too short ({} bytes)", data.len());
             return;
         }
+
+        // Parse the block frame header
         let height = u64::from_be_bytes([
             data[0], data[1], data[2], data[3],
             data[4], data[5], data[6], data[7],
         ]);
+        let prev_hash: [u8; 32] = data[8..40].try_into().unwrap();
+        let block_hash: [u8; 32] = data[40..72].try_into().unwrap();
 
         let local_height = self.commit_manager.height();
+        let local_tip = self.commit_manager.tip_hash();
 
-        // Case 1: old block — already past this height, drop
+        // ── Case 1: Old block ──────────────────────────────
         if height < local_height {
             tracing::debug!(
-                height,
-                local_height,
+                height, local_height,
                 from = %propagation_source,
                 "[block-recv] Old block — dropping"
             );
             return;
         }
 
-        // Case 2: contiguous extension — this block is the next one
-        // expected at local_height. Validate signature, apply to ledger,
-        // commit to local chain. This is the common case.
-        if height == local_height {
-            tracing::info!(
-                height,
-                local_height,
+        // ── Case 2: Divergent (same height, different block) ──
+        if height == local_height && local_height > 0 {
+            // Same height as our tip but different hash → fork.
+            // Need the full remote ledger to resolve. Log and defer.
+            tracing::warn!(
+                height, local_height,
+                their_hash = %hex::encode(block_hash),
+                our_hash = %hex::encode(local_tip),
                 from = %propagation_source,
-                "[block-recv] Contiguous block — validating and extending chain"
+                "[block-recv] DIVERGENT — same height, different block hash. Fork resolution pending."
             );
-            // Parse cert_bytes from the block frame.
-            let offset = 8 + 32 + 32; // skip height, prev_hash, block_hash
+            return;
+        }
+
+        // ── Case 3: Contiguous extension ──────────────────────
+        if height == local_height {
+            // Genesis: height 0, no parent
+            let is_genesis = height == 0;
+
+            // Parent hash check for non-genesis
+            if !is_genesis {
+                if prev_hash != local_tip {
+                    tracing::warn!(
+                        height,
+                        their_parent = %hex::encode(prev_hash),
+                        our_tip = %hex::encode(local_tip),
+                        from = %propagation_source,
+                        "[block-recv] Parent hash mismatch — rejecting"
+                    );
+                    return;
+                }
+            }
+
+            // Parse cert_bytes from the block frame
+            let offset = 72; // after height + prev_hash + block_hash
             if data.len() <= offset + 4 {
                 tracing::warn!("[block-recv] Block too short for cert");
                 return;
@@ -766,7 +798,6 @@ impl LatticeNode {
             }
             let cert_bytes = &data[offset + 4..cert_end];
 
-            // Parse the SignedTransaction from the cert bytes.
             let stx = match serde_cbor::from_slice::<crate::ledger::types::SignedTransaction>(cert_bytes) {
                 Ok(s) => s,
                 Err(e) => {
@@ -775,9 +806,30 @@ impl LatticeNode {
                 }
             };
 
-            // Validate and apply — genesis gets the root gate, everything
-            // else gets standard validation.
-            let is_genesis = matches!(stx.transaction, crate::ledger::types::Transaction::Genesis { .. });
+            // Block type validity: genesis only at height 0,
+            // BootstrapEnded only after genesis, certs after that.
+            let tx_type = match &stx.transaction {
+                crate::ledger::types::Transaction::Genesis { .. } => "genesis",
+                crate::ledger::types::Transaction::BootstrapEnded { .. } => "bootstrap-ended",
+                crate::ledger::types::Transaction::Mint { .. } => "mint",
+                _ => "other",
+            };
+            if is_genesis && tx_type != "genesis" {
+                tracing::warn!(
+                    tx_type, height,
+                    "[block-recv] Non-genesis block at height 0 — rejecting"
+                );
+                return;
+            }
+            if !is_genesis && tx_type == "genesis" {
+                tracing::warn!(
+                    height,
+                    "[block-recv] Genesis at non-zero height — rejecting"
+                );
+                return;
+            }
+
+            // Validate and apply
             if is_genesis {
                 if let Err(e) = crate::ledger::validation::validate_and_apply_with_genesis_root(
                     &stx, &mut self.ledger, &mut self.seen_nonces,
@@ -795,10 +847,9 @@ impl LatticeNode {
                 }
             }
 
-            // Commit to local chain.
-            let kind = if is_genesis { "genesis" } else if matches!(stx.transaction, crate::ledger::types::Transaction::BootstrapEnded { .. }) { "bootstrap-ended" } else { "cert" };
+            // Commit to local chain
             if let Err(e) = self.commit_manager.commit_root_block(
-                cert_bytes, kind,
+                cert_bytes, tx_type,
                 &stx.signature, &self.local_peer_id,
             ) {
                 tracing::warn!(error = %e, "[block-recv] Failed to commit block to local chain");
@@ -806,20 +857,19 @@ impl LatticeNode {
             }
 
             tracing::info!(
-                height,
-                kind,
+                height, tx_type,
                 from = %propagation_source,
                 "[block-recv] Block applied and committed ✓"
             );
             return;
         }
 
-        // Case 3: future block — ahead of local tip. Gap.
-        tracing::debug!(
-            height,
-            local_height,
+        // ── Case 4: Future block (gap > 1) ────────────────────
+        tracing::warn!(
+            height, local_height, gap = height - local_height,
             from = %propagation_source,
-            "[block-recv] Future block — ahead of local tip"
+            "[block-recv] Future block — ahead of tip by {}. Catch-up sync not yet wired.",
+            height - local_height
         );
     }
 

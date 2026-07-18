@@ -2798,6 +2798,27 @@ impl LatticeNode {
                     nonce = response.nonce,
                     "Status response received"
                 );
+                // Proactive catch-up trigger: if this peer's chain is
+                // ahead of ours, fire a ChainRangeRequest.  The per-peer
+                // dedup guard prevents firing multiple overlapping requests.
+                let local_tip = self.commit_manager.height();
+                if response.chain_height > local_tip {
+                    info!(
+                        from = %peer, remote_tip = response.chain_height, local_tip,
+                        "[chain-sync] Status shows peer ahead — catching up via ChainRangeRequest ({}..{})",
+                        local_tip + 1, response.chain_height,
+                    );
+                    if !self.outstanding_chain_requests_by_peer.contains(&peer) {
+                        self.outstanding_chain_requests_by_peer.insert(peer);
+                        let req = ChainRangeRequest {
+                            from_height: local_tip + 1,
+                            to_height: response.chain_height,
+                        };
+                        let _ = self.swarm.behaviour_mut()
+                            .chain_sync_rpc
+                            .send_request(&peer, req);
+                    }
+                }
             }
         }
     }
@@ -2921,6 +2942,7 @@ impl LatticeNode {
             heartbeats_sent: self.heartbeats_sent,
             version: env!("CARGO_PKG_VERSION").to_string(),
             protocol_version: PROTOCOL_VERSION,
+            chain_height: self.commit_manager.height(),
         }
     }
 

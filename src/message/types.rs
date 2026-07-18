@@ -137,6 +137,9 @@ pub struct StatusResponse {
     pub version: String,
     /// Lattice protocol version for compatibility checks.
     pub protocol_version: u32,
+    /// Current height of this node's certificate chain.
+    /// Used by the catch-up sync protocol to detect peers ahead.
+    pub chain_height: u64,
 }
 
 /// Direct request for a specific peer's balance.

@@ -299,3 +299,38 @@ pub struct StorageProofData {
     pub salted_hash: [u8; 32],
     pub merkle_proof: Vec<Vec<u8>>,
 }
+
+// ── Phase 10: chain sync ─────────────────────────────────
+
+/// Request a range of certificate-chain blocks from a peer.
+/// Used by the catch-up sync protocol when a node discovers
+/// it has fallen behind the mesh's chain tip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainRangeRequest {
+    /// First height to fetch (inclusive).
+    pub from_height: u64,
+    /// Last height to fetch (inclusive).
+    pub to_height: u64,
+}
+
+/// Response to a ChainRangeRequest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainRangeResponse {
+    /// Blocks in the requested range.
+    pub blocks: Vec<WireBlock>,
+    /// False if the response was capped (100 blocks or 5 MB)
+    /// and the requester needs a follow-up request.
+    pub complete: bool,
+}
+
+/// A block frame serializable over the wire — uses string PeerId
+/// representation so serde can handle it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireBlock {
+    pub height: u64,
+    pub prev_hash: [u8; 32],
+    pub block_hash: [u8; 32],
+    pub cert_bytes: Vec<u8>,
+    /// Signatures as (PeerId_base58, sig_bytes) pairs.
+    pub signatures: Vec<(String, Vec<u8>)>,
+}

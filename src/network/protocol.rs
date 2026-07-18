@@ -4,10 +4,12 @@
 use libp2p::{gossipsub, identify, kad, mdns, relay, request_response, swarm::NetworkBehaviour};
 use libp2p::swarm::behaviour::toggle::Toggle;
 
-use crate::message::codec::rpc::{BalanceCodec, LatticeCodec};
+use crate::message::codec::rpc::{ChainSyncCodec, BalanceCodec, LatticeCodec};
 use crate::message::codec::rpc::{TransactionCodec, VerifyCodec};
 use crate::message::types::{BalanceRequest, BalanceResponse, StatusRequest, StatusResponse};
 use crate::message::types::{TransactionRequest, TransactionResponse};
+use crate::message::types::WireBlock;
+use crate::message::types::{ChainRangeRequest, ChainRangeResponse};
 use crate::message::types::{VerifyRequest, VerifyResponse};
 use crate::agent::codec::{AgentStateCodec, AGENT_STATE_PROTOCOL};
 use crate::agent::state::{AgentStateQuery, AgentStateReply};
@@ -74,6 +76,9 @@ pub struct LatticeBehaviour {
     /// Phase 4: transaction fetch RPC — request missing transactions
     /// by (signer, nonce) coordinate to close gaps.
     pub tx_rpc: request_response::Behaviour<TransactionCodec>,
+    /// Phase 10: chain sync RPC — request a range of certificate-chain
+    /// blocks from a peer to catch up when behind the mesh tip.
+    pub chain_sync_rpc: request_response::Behaviour<ChainSyncCodec>,
 }
 
 impl LatticeBehaviour {
@@ -89,6 +94,7 @@ impl LatticeBehaviour {
         identify: identify::Behaviour,
         agent_rpc: request_response::Behaviour<AgentStateCodec>,
         tx_rpc: request_response::Behaviour<TransactionCodec>,
+        chain_sync_rpc: request_response::Behaviour<ChainSyncCodec>,
     ) -> Self {
         Self {
             mdns,
@@ -102,6 +108,7 @@ impl LatticeBehaviour {
             identify,
             agent_rpc,
             tx_rpc,
+            chain_sync_rpc,
         }
     }
 }
@@ -127,6 +134,8 @@ pub enum LatticeBehaviourEvent {
     AgentRpc(request_response::Event<AgentStateQuery, AgentStateReply>),
     /// Phase 4: transaction fetch RPC events.
     TxRpc(request_response::Event<TransactionRequest, TransactionResponse>),
+    /// Phase 10: chain sync RPC events.
+    ChainSyncRpc(request_response::Event<ChainRangeRequest, ChainRangeResponse>),
 }
 
 impl From<mdns::Event> for LatticeBehaviourEvent {
@@ -212,5 +221,13 @@ impl From<request_response::Event<TransactionRequest, TransactionResponse>>
         event: request_response::Event<TransactionRequest, TransactionResponse>,
     ) -> Self {
         LatticeBehaviourEvent::TxRpc(event)
+    }
+}
+
+impl From<request_response::Event<ChainRangeRequest, ChainRangeResponse>>
+    for LatticeBehaviourEvent
+{
+    fn from(event: request_response::Event<ChainRangeRequest, ChainRangeResponse>) -> Self {
+        LatticeBehaviourEvent::ChainSyncRpc(event)
     }
 }

@@ -22,10 +22,13 @@ use crate::ledger::types::{DigitalUtilityUnit, SignedTransaction, Transaction};
 use crate::ledger::validation;
 use crate::message::codec::rpc::{BalanceCodec, BalanceProtocol, LatticeCodec, LatticeProtocol};
 use crate::message::codec::rpc::{TransactionCodec, TransactionProtocol, VerifyProtocol};
+use crate::message::codec::rpc::{ChainSyncCodec, ChainSyncProtocol};
 use crate::message::types::{
     BalanceRequest, BalanceResponse, Heartbeat, LatticeMessage, StatusRequest, StatusResponse,
 };
 use crate::message::types::{TransactionRequest, TransactionResponse};
+use crate::message::types::{ChainRangeRequest, ChainRangeResponse};
+use crate::message::types::WireBlock;
 use crate::message::types::{VerifyRequest, VerifyResponse};
 use crate::network::protocol::{
     LatticeBehaviour, LatticeBehaviourEvent, LATTICE_HEARTBEAT_TOPIC, LATTICE_KAD_PROTOCOL,
@@ -469,6 +472,12 @@ impl LatticeNode {
                     request_response::Config::default(),
                 );
 
+                // Chain sync RPC channel (Phase 10).
+                let chain_sync_rpc = request_response::Behaviour::new(
+                    [(ChainSyncProtocol, request_response::ProtocolSupport::Full)],
+                    request_response::Config::default(),
+                );
+
                 Ok(LatticeBehaviour::new(
                     mdns,
                     gossipsub,
@@ -481,6 +490,7 @@ impl LatticeNode {
                     identify,
                     agent_rpc,
                     tx_rpc,
+                    chain_sync_rpc,
                 ))
             })?
             .with_swarm_config(|c| {
@@ -1896,6 +1906,91 @@ impl LatticeNode {
                 request_response::Event::OutboundFailure { peer, error, .. },
             )) => {
                 debug!(peer = %peer, error = ?error, "[tx-fetch] Request failed");
+            }
+
+            // ── Phase 10: chain sync ────────────────────────────
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::ChainSyncRpc(
+                request_response::Event::Message { peer, message },
+            )) => {
+                match message {
+                    request_response::Message::Request {
+                        request_id: _, request, channel,
+                    } => {
+                        // Responder side: serve blocks from the local ledger
+                        let mut blocks = Vec::new();
+                        let mut complete = true;
+                        let max_blocks = 100u64;
+                        let max_bytes = 5 * 1024 * 1024; // 5 MB
+                        let mut total_bytes: usize = 0;
+
+                        for height in request.from_height..=request.to_height {
+                            if blocks.len() as u64 >= max_blocks {
+                                complete = false;
+                                break;
+                            }
+                            match self.commit_manager.get_block_bytes(height) {
+                                Some(raw) => {
+                                    if total_bytes + raw.len() > max_bytes as usize {
+                                        complete = false;
+                                        break;
+                                    }
+                                    total_bytes += raw.len();
+                                    // Re-serialize as WireBlock for the wire format
+                                    let mut reader = std::io::BufReader::new(&raw[..]);
+                                    if let Ok(Some(frame)) = self.commit_manager.read_block(&mut reader) {
+                                        let wire = WireBlock {
+                                            height: frame.height,
+                                            prev_hash: frame.prev_hash,
+                                            block_hash: frame.block_hash,
+                                            cert_bytes: frame.cert_bytes,
+                                            signatures: frame.signatures
+                                                .into_iter()
+                                                .map(|(peer, sig)| (peer.to_base58(), sig))
+                                                .collect(),
+                                        };
+                                        blocks.push(wire);
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+
+                        let response = ChainRangeResponse { blocks, complete };
+                        let _ = self.swarm.behaviour_mut().chain_sync_rpc.send_response(
+                            channel, response,
+                        );
+                    }
+                    request_response::Message::Response {
+                        response, ..
+                    } => {
+                        // Requester side: validate and apply received blocks
+                        for wire in &response.blocks {
+                            // Convert WireBlock back to signatures with PeerId
+                            let signatures: Vec<(PeerId, Vec<u8>)> = wire.signatures
+                                .iter()
+                                .filter_map(|(peer_str, sig)| {
+                                    peer_str.parse::<PeerId>().ok().map(|pid| (pid, sig.clone()))
+                                })
+                                .collect();
+                            match self.commit_manager.commit(
+                                &wire.cert_bytes,
+                                "",  // proposal_id not available in catch-up; block hash is the identity
+                                &signatures,
+                            ) {
+                                Ok(hash) => debug!("[chain-sync] Applied block {} hash={:?}", wire.height, hash),
+                                Err(e) => {
+                                    warn!("[chain-sync] Block {} validation failed: {}. Keeping prior blocks.", wire.height, e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::ChainSyncRpc(
+                request_response::Event::OutboundFailure { peer, error, .. },
+            )) => {
+                warn!(peer = %peer, error = ?error, "[chain-sync] Request failed");
             }
 
             // ── Kademlia events ──────────────────────────────

@@ -34,6 +34,7 @@ pub mod rpc {
     use crate::message::types::{BalanceRequest, BalanceResponse, StatusRequest, StatusResponse};
     use crate::message::types::{TransactionRequest, TransactionResponse};
     use crate::message::types::{VerifyRequest, VerifyResponse};
+    use crate::message::types::{ChainRangeRequest, ChainRangeResponse};
 
     /// Maximum frame size (1 MiB) — guards against a malicious or buggy peer
     /// announcing a huge length prefix and exhausting memory.
@@ -352,6 +353,52 @@ pub mod rpc {
         where
             T: AsyncWrite + Unpin + Send,
         {
+            let data = super::encode(&res).map_err(to_io)?;
+            write_frame(io, &data).await
+        }
+    }
+
+    // ── Phase 10: chain sync ───────────────────────────────
+    /// Protocol identifier for the chain range request RPC channel.
+    #[derive(Debug, Clone)]
+    pub struct ChainSyncProtocol;
+
+    impl AsRef<str> for ChainSyncProtocol {
+        fn as_ref(&self) -> &str {
+            "/lattice/chain-sync/v1"
+        }
+    }
+
+    /// CBOR + length-prefix codec for ChainRangeRequest/ChainRangeResponse.
+    #[derive(Debug, Clone, Default)]
+    pub struct ChainSyncCodec;
+
+    #[async_trait]
+    impl request_response::Codec for ChainSyncCodec {
+        type Protocol = ChainSyncProtocol;
+        type Request = ChainRangeRequest;
+        type Response = ChainRangeResponse;
+
+        async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
+        where T: AsyncRead + Unpin + Send {
+            let data = read_frame(io).await?;
+            super::decode(&data).map_err(to_io)
+        }
+
+        async fn read_response<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Response>
+        where T: AsyncRead + Unpin + Send {
+            let data = read_frame(io).await?;
+            super::decode(&data).map_err(to_io)
+        }
+
+        async fn write_request<T>(&mut self, _: &Self::Protocol, io: &mut T, req: Self::Request) -> io::Result<()>
+        where T: AsyncWrite + Unpin + Send {
+            let data = super::encode(&req).map_err(to_io)?;
+            write_frame(io, &data).await
+        }
+
+        async fn write_response<T>(&mut self, _: &Self::Protocol, io: &mut T, res: Self::Response) -> io::Result<()>
+        where T: AsyncWrite + Unpin + Send {
             let data = super::encode(&res).map_err(to_io)?;
             write_frame(io, &data).await
         }

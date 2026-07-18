@@ -9,7 +9,11 @@ use tracing::{info, warn};
 const CLOCK_DRIFT_THRESHOLD_SECS: i64 = 300;
 
 /// Default NTP servers, tried in order until one responds.
-const DEFAULT_NTP_SERVERS: &[&str] = &["time.apple.com", "time.google.com", "pool.ntp.org"];
+const DEFAULT_NTP_SERVERS: &[&str] = &[
+    "pool.ntp.org",
+    "time.apple.com",
+    "time.google.com",
+];
 
 /// Verify clock sync before node startup.
 pub async fn verify_clock_sync(
@@ -56,11 +60,11 @@ pub async fn verify_clock_sync(
                         return Ok(());
                     }
                     Err(e) => {
-                        warn!("NTP query to {} failed: {} (trying next)", server, e);
+                        warn!("NTP query to {} failed: {} (fallback)", server, e);
                     }
                 },
                 Err(e) => {
-                    warn!("Failed to create NTP client for {}: {} (trying next)", server, e);
+                    warn!("Failed to create NTP client for {}: {} (fallback)", server, e);
                 }
             }
         }

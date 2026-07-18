@@ -1325,6 +1325,10 @@ impl LatticeNode {
 
         let topic = gossipsub::IdentTopic::new(LATTICE_TX_TOPIC);
         self.track_outbound(&encoded);
+        let topic_hash = topic.hash();
+        let mesh_peers = self.swarm.behaviour().gossipsub
+            .mesh_peers(&topic_hash)
+            .count();
         match self
             .swarm
             .behaviour_mut()
@@ -1332,19 +1336,14 @@ impl LatticeNode {
             .publish(topic, encoded)
         {
             Ok(_) => {
-                debug!(nonce = signed.transaction.nonce(), "Transaction broadcast");
+                info!("[broadcast] Ok: mesh_peers={} nonce={}", mesh_peers, signed.transaction.nonce());
                 // Remove from outbound queue only if at least one other peer
                 // is in the topic mesh — gossipsub Ok means handoff, not delivery,
                 // but with ≥1 peer the odds of delivery are high enough that
                 // keeping the entry creates unbounded queue growth without
                 // improving reliability.  On a healthy 3-node mesh this fires
                 // immediately; on an isolated node the entry stays for retry.
-                let topic_hash = gossipsub::IdentTopic::new(LATTICE_TX_TOPIC).hash();
-                let in_mesh = self.swarm.behaviour().gossipsub
-                    .mesh_peers(&topic_hash)
-                    .count();
-                info!("[broadcast] mesh_peers for tx topic: {}", in_mesh);
-                if in_mesh >= OUTBOUND_CONFIRM_PEERS {
+                if mesh_peers >= OUTBOUND_CONFIRM_PEERS {
                     if let Ok(signer) = signed.transaction.signer().parse::<PeerId>() {
                         if signer == self.local_peer_id {
                             let nonce = signed.transaction.nonce();
@@ -1359,9 +1358,10 @@ impl LatticeNode {
                 }
             }
             Err(gossipsub::PublishError::InsufficientPeers) => {
-                debug!("Transaction broadcast skipped: no peers yet");
+                info!("[broadcast] InsufficientPeers: mesh_peers={}", mesh_peers);
             }
             Err(e) => {
+                error!("[broadcast] PublishError: {} mesh_peers={}", e, mesh_peers);
                 return Err(anyhow::anyhow!("failed to broadcast transaction: {e}"));
             }
         }

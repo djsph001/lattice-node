@@ -13,6 +13,7 @@ mod commit;
 mod economics;
 mod ingest;
 mod ledger;
+mod startup;
 mod message;
 mod network;
 mod node;
@@ -212,6 +213,17 @@ struct Cli {
     /// recovery.  Stores state in <storage-dir>/persistence/.
     #[arg(long, default_value_t = false)]
     persistence: bool,
+    /// Skip NTP clock verification on startup.  Use only for
+    /// air-gapped or lab networks where no NTP server is reachable.
+    /// WARNING: a node with an unsynchronised clock will broadcast
+    /// transactions with bad timestamps that peers will reject.
+    #[arg(long, default_value_t = false)]
+    skip_ntp_check: bool,
+    /// Custom NTP server(s) for clock verification.  Can be
+    /// specified multiple times (e.g. --ntp-server pool.ntp.org).
+    /// Defaults to time.apple.com, time.google.com, pool.ntp.org.
+    #[arg(long, value_name = "SERVER")]
+    ntp_server: Option<Vec<String>>,
 }
 
 #[tokio::main]
@@ -227,6 +239,10 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     info!("Lattice node starting...");
+
+    // Verify clock sync before anything else — a node with a drifted
+    // clock will broadcast transactions that peers reject.
+    startup::verify_clock_sync(cli.ntp_server.clone(), cli.skip_ntp_check).await?;
 
     // Parse bootstrap peer addresses from CLI strings
     let bootstrap_peers: Vec<libp2p::Multiaddr> = cli

@@ -740,68 +740,87 @@ impl LatticeNode {
             return;
         }
 
-        // If this is the next expected block, try to extend our chain.
-        // Currently we can't easily append a single block from wire bytes
-        // without deserializing the certificate. For now, if the height
-        // matches our tip, attempt fork detection against a remote ledger.
-        //
-        // In the common case (genesis sent once, then BootstrapEnded,
-        // then certificates), the blocks arrive in order and extend
-        // naturally. Out-of-order delivery triggers fork detection.
+        // Case 2: contiguous extension — this block is the next one
+        // expected at local_height. Validate signature, apply to ledger,
+        // commit to local chain. This is the common case.
         if height == local_height {
             tracing::info!(
                 height,
                 local_height,
                 from = %propagation_source,
-                "[block-recv] Block at current height — checking for divergence"
+                "[block-recv] Contiguous block — validating and extending chain"
             );
-            // For now: accept if it's the first block (genesis) we don't
-            // yet have. Fork resolution for later heights requires the
-            // full remote ledger file.
-            if local_height == 0 {
-                tracing::info!(
-                    from = %propagation_source,
-                    height,
-                    "[block-recv] Genesis block received from peer — chain now distributed"
-                );
-                // The genesis transaction is embedded in the block's cert_bytes.
-                // Deserialize and apply to the local ledger.
-                let offset = 8 + 32 + 32; // skip height, prev_hash, block_hash
-                if data.len() > offset + 4 {
-                    let cert_len = u32::from_be_bytes([
-                        data[offset], data[offset+1], data[offset+2], data[offset+3]
-                    ]) as usize;
-                    let cert_end = offset + 4 + cert_len;
-                    if data.len() >= cert_end {
-                        let cert_bytes = &data[offset + 4..cert_end];
-                        if let Ok(stx) = serde_cbor::from_slice::<crate::ledger::types::SignedTransaction>(cert_bytes) {
-                            if let Err(e) = crate::ledger::validation::validate_and_apply_with_genesis_root(
-                                &stx, &mut self.ledger, &mut self.seen_nonces,
-                                self.genesis_root.as_ref(),
-                            ) {
-                                tracing::warn!(error = %e, "[block-recv] Genesis validation failed");
-                            } else {
-                                tracing::info!("[block-recv] Genesis applied to local ledger ✓");
-                                // Commit to local chain
-                                if let Err(e) = self.commit_manager.commit_root_block(
-                                    cert_bytes, "genesis-from-peer",
-                                    &stx.signature, &self.local_peer_id,
-                                ) {
-                                    tracing::warn!(error = %e, "[block-recv] Failed to commit genesis to local chain");
-                                }
-                            }
-                        }
-                    }
+            // Parse cert_bytes from the block frame.
+            let offset = 8 + 32 + 32; // skip height, prev_hash, block_hash
+            if data.len() <= offset + 4 {
+                tracing::warn!("[block-recv] Block too short for cert");
+                return;
+            }
+            let cert_len = u32::from_be_bytes([
+                data[offset], data[offset+1], data[offset+2], data[offset+3]
+            ]) as usize;
+            let cert_end = offset + 4 + cert_len;
+            if data.len() < cert_end {
+                tracing::warn!("[block-recv] Truncated cert bytes");
+                return;
+            }
+            let cert_bytes = &data[offset + 4..cert_end];
+
+            // Parse the SignedTransaction from the cert bytes.
+            let stx = match serde_cbor::from_slice::<crate::ledger::types::SignedTransaction>(cert_bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "[block-recv] Failed to deserialize block cert");
+                    return;
+                }
+            };
+
+            // Validate and apply — genesis gets the root gate, everything
+            // else gets standard validation.
+            let is_genesis = matches!(stx.transaction, crate::ledger::types::Transaction::Genesis { .. });
+            if is_genesis {
+                if let Err(e) = crate::ledger::validation::validate_and_apply_with_genesis_root(
+                    &stx, &mut self.ledger, &mut self.seen_nonces,
+                    self.genesis_root.as_ref(),
+                ) {
+                    tracing::warn!(error = %e, "[block-recv] Genesis validation failed");
+                    return;
+                }
+            } else {
+                if let Err(e) = crate::ledger::validation::validate_and_apply(
+                    &stx, &mut self.ledger, &mut self.seen_nonces,
+                ) {
+                    tracing::warn!(error = %e, "[block-recv] Block validation failed");
+                    return;
                 }
             }
-        } else {
-            tracing::debug!(
+
+            // Commit to local chain.
+            let kind = if is_genesis { "genesis" } else if matches!(stx.transaction, crate::ledger::types::Transaction::BootstrapEnded { .. }) { "bootstrap-ended" } else { "cert" };
+            if let Err(e) = self.commit_manager.commit_root_block(
+                cert_bytes, kind,
+                &stx.signature, &self.local_peer_id,
+            ) {
+                tracing::warn!(error = %e, "[block-recv] Failed to commit block to local chain");
+                return;
+            }
+
+            tracing::info!(
                 height,
-                local_height,
+                kind,
                 from = %propagation_source,
-                "[block-recv] Future block — ahead of local tip"
+                "[block-recv] Block applied and committed ✓"
             );
+            return;
         }
+
+        // Case 3: future block — ahead of local tip. Gap.
+        tracing::debug!(
+            height,
+            local_height,
+            from = %propagation_source,
+            "[block-recv] Future block — ahead of local tip"
+        );
     }
 
     pub fn submit_agent_task(

@@ -12,6 +12,9 @@ pub struct PeerInfo {
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
     pub heartbeats_received: u64,
+    /// The epoch when the last heartbeat was received from this peer.
+    /// 0 = never received a heartbeat.
+    pub last_heartbeat_epoch: u64,
 }
 
 /// In-memory peer table tracking all known nodes in the mesh.
@@ -50,6 +53,7 @@ impl PeerTable {
                     first_seen: now,
                     last_seen: now,
                     heartbeats_received: 0,
+                    last_heartbeat_epoch: 0,
                 }
             });
     }
@@ -71,6 +75,7 @@ impl PeerTable {
                 first_seen: now,
                 last_seen: now,
                 heartbeats_received: 0,
+                last_heartbeat_epoch: 0,
             },
         );
     }
@@ -87,6 +92,16 @@ impl PeerTable {
         if let Some(info) = self.peers.get_mut(peer_id) {
             info.last_seen = Utc::now();
             info.heartbeats_received += 1;
+        }
+    }
+
+    /// Record receipt of a heartbeat with the current epoch number.
+    /// Called from the node's heartbeat handler which knows the current epoch.
+    pub fn record_heartbeat_epoch(&mut self, peer_id: &PeerId, epoch: u64) {
+        if let Some(info) = self.peers.get_mut(peer_id) {
+            info.last_seen = Utc::now();
+            info.heartbeats_received += 1;
+            info.last_heartbeat_epoch = epoch;
         }
     }
 
@@ -108,6 +123,11 @@ impl PeerTable {
     /// Get info for a specific peer.
     pub fn get(&self, peer_id: &PeerId) -> Option<&PeerInfo> {
         self.peers.get(peer_id)
+    }
+
+    /// Get mutable info for a specific peer.
+    pub fn get_mut(&mut self, peer_id: &PeerId) -> Option<&mut PeerInfo> {
+        self.peers.get_mut(peer_id)
     }
 
     /// Return peers that haven't been seen within the given duration.

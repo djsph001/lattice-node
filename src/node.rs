@@ -84,6 +84,18 @@ const CIRCUIT_BREAKER_LIMIT: usize = 3;
 /// independent recipients before removing from the outbound queue.
 const OUTBOUND_CONFIRM_PEERS: usize = 1;
 
+/// How many epochs without a heartbeat before a peer is evicted
+/// as a zombie.  At a 30s epoch interval, 30 epochs = 15 minutes.
+/// The wall-clock thresholds (ZOMBIE_WARN/EVICT_THRESHOLD_SECS)
+/// still fire first for half-open connection detection.
+const ZOMBIE_EPOCH_THRESHOLD: u64 = 30;
+
+/// How many epochs without an attestation, combined with zero
+/// thickness, must elapse before a peer is classified as a zombie.
+/// A peer that neither contributes thickness nor attests to others'
+/// contributions is dead weight.
+const ZOMBIE_ATTESTATION_SILENCE_EPOCHS: u64 = 10;
+
 // ── Phase 6: storage verification types ────────────────────
 
 /// Tracks the context of an outbound storage challenge so the
@@ -281,6 +293,11 @@ pub struct LatticeNode {
     /// Key: proposal_id, Value: list of (peer_id, signature, public_key) triples.
     /// When 3-of-5 threshold is met, the certificate is ratified.
     witness_sigs: HashMap<String, Vec<(PeerId, Vec<u8>, Vec<u8>)>>,
+
+    /// Tracks the last epoch in which each peer submitted a valid
+    /// witness attestation.  Used by zombie eviction to detect peers
+    /// that neither attest nor carry thickness.
+    last_attestation_epoch: HashMap<PeerId, u64>,
 
     // ── Phase 7: commit layer ───────────────────────────────
     /// Raw protobuf bytes of decoded certificates, keyed by
@@ -587,6 +604,7 @@ impl LatticeNode {
             cert_watch_dir,
             escalation_exclusions: Vec::new(),
             witness_sigs: HashMap::new(),
+            last_attestation_epoch: HashMap::new(),
             cert_cache: HashMap::new(),
             commit_manager: crate::commit::CommitManager::open(&storage_path),
             agent_registry: crate::agent::registry::AgentRegistry::open(&storage_path),
@@ -2588,41 +2606,72 @@ impl LatticeNode {
         }
     }
 
-    /// Check peer liveness and evict zombies (half-open connections).
+    /// Check peer liveness and evict zombies (half-open connections + epoch-based).
     /// Runs on every heartbeat tick, after sweep_stale_fetches.
     ///
-    /// Thresholds:
-    ///   30s silent → WARN
-    ///   90s silent → force disconnect + mark pending_reconnect
-    ///   3+ evictions in 60s → circuit breaker (skip disconnect, ERROR)
-    ///   pending_reconnect > 30s → ERROR (self-healing failed)
+    /// Two detection layers:
+    ///   1. Wall-clock (fast): 30s silent → WARN, 90s silent → EVICT
+    ///   2. Epoch-based (deep): 30 epochs without heartbeat → EVICT
+    ///      OR zero thickness + 10 epochs without attestation → EVICT
+    ///
+    /// Circuit breaker: 3+ evictions in 60s → skip disconnect, ERROR.
     fn check_peer_liveness(&mut self) {
         let now = Instant::now();
+        let current_epoch = self.economic_engine.epoch_count();
 
         // Drain circuit breaker window of entries older than 60s
         self.evictions_last_minute
             .retain(|t| now.duration_since(*t).as_secs() < 60);
 
         let mut longest_silence = 0u64;
+        let mut to_evict: Vec<(PeerId, String)> = Vec::new(); // (peer_id, reason)
+
+        // ── Collect peer IDs first to avoid borrow conflicts ──────
         let peer_ids: Vec<PeerId> = self.peer_table.iter().map(|i| i.peer_id).collect();
 
-        for peer_id in peer_ids {
+        for peer_id in &peer_ids {
             // Skip self
-            if peer_id == self.local_peer_id {
+            if *peer_id == self.local_peer_id {
                 continue;
             }
 
-            let last_seen = match self.peer_table.get(&peer_id) {
-                Some(info) => info.last_seen,
+            let info = match self.peer_table.get(peer_id) {
+                Some(i) => i,
                 None => continue,
             };
 
-            let elapsed = (Utc::now() - last_seen).num_seconds().max(0) as u64;
-
+            let elapsed = (Utc::now() - info.last_seen).num_seconds().max(0) as u64;
             if elapsed > longest_silence {
                 longest_silence = elapsed;
             }
 
+            // ── Layer 2: epoch-based heartbeat silence ─────────
+            let epochs_since_heartbeat =
+                current_epoch.saturating_sub(info.last_heartbeat_epoch);
+            if epochs_since_heartbeat > ZOMBIE_EPOCH_THRESHOLD {
+                to_evict.push((*peer_id, format!(
+                    "heartbeat silence: {} epochs since last heartbeat (threshold {})",
+                    epochs_since_heartbeat, ZOMBIE_EPOCH_THRESHOLD
+                )));
+                continue;
+            }
+
+            // ── Layer 2: zero thickness + attestation silence ─
+            let thickness = self.ledger.thickness_graph.total_thickness(peer_id);
+            if thickness < 0.001 {
+                let last_att_epoch = self.last_attestation_epoch.get(peer_id).copied().unwrap_or(0);
+                let epochs_since_attest =
+                    current_epoch.saturating_sub(last_att_epoch);
+                if epochs_since_attest > ZOMBIE_ATTESTATION_SILENCE_EPOCHS {
+                    to_evict.push((*peer_id, format!(
+                        "zero thickness + no attestations for {} epochs (threshold {})",
+                        epochs_since_attest, ZOMBIE_ATTESTATION_SILENCE_EPOCHS
+                    )));
+                    continue;
+                }
+            }
+
+            // ── Layer 1: wall-clock (fast path for half-open connections) ─
             if elapsed > ZOMBIE_EVICT_THRESHOLD_SECS {
                 // Circuit breaker check
                 let recent = self.evictions_last_minute.len();
@@ -2636,14 +2685,10 @@ impl LatticeNode {
                     continue;
                 }
 
-                warn!(
-                    peer = %peer_id,
-                    elapsed_secs = elapsed,
-                    "Evicting zombie peer — silent beyond threshold"
-                );
-                let _ = self.swarm.disconnect_peer_id(peer_id);
-                self.evictions_last_minute.push_back(now);
-                self.pending_reconnect.insert(peer_id, now);
+                to_evict.push((*peer_id, format!(
+                    "wall-clock silence: {}s (threshold {}s)",
+                    elapsed, ZOMBIE_EVICT_THRESHOLD_SECS
+                )));
             } else if elapsed > ZOMBIE_WARN_THRESHOLD_SECS {
                 warn!(
                     peer = %peer_id,
@@ -2652,6 +2697,34 @@ impl LatticeNode {
                     "Peer silent — approaching zombie threshold"
                 );
             }
+        }
+
+        // ── Execute evictions ────────────────────────────────────
+        for (peer_id, reason) in &to_evict {
+            warn!(
+                peer = %peer_id,
+                reason = %reason,
+                "Evicting zombie peer"
+            );
+
+            // Remove from local peer table
+            self.peer_table.remove_peer(peer_id);
+
+            // Disconnect from swarm (triggers gossipsub mesh cleanup)
+            let _ = self.swarm.disconnect_peer_id(*peer_id);
+
+            // Clear witness signatures from this peer across all proposals
+            self.witness_sigs.values_mut().for_each(|sigs| {
+                sigs.retain(|(pid, _, _)| pid != peer_id);
+            });
+            // Purge empty proposal entries
+            self.witness_sigs.retain(|_, sigs| !sigs.is_empty());
+
+            // Clear attestation epoch tracker
+            self.last_attestation_epoch.remove(peer_id);
+
+            self.evictions_last_minute.push_back(now);
+            self.pending_reconnect.insert(*peer_id, now);
         }
 
         // Check pending reconnects that have timed out
@@ -2809,7 +2882,10 @@ impl LatticeNode {
                             info!(peer = %peer_id, from = %hb.node_name, "Inserting peer from gossip");
                             self.peer_table.insert_peer(peer_id);
                         }
-                        self.peer_table.record_heartbeat(&peer_id);
+                        self.peer_table.record_heartbeat_epoch(
+                            &peer_id,
+                            self.economic_engine.epoch_count(),
+                        );
                         let count = self
                             .peer_table
                             .get(&peer_id)
@@ -4098,6 +4174,12 @@ impl LatticeNode {
         sigs.push((signer_peer_id, sig.to_vec(), pk_bytes.to_vec()));
         let count = sigs.len();
 
+        // Record that this peer attested in the current epoch — used
+        // by zombie eviction to detect peers that neither carry
+        // thickness nor participate in attestation.
+        self.last_attestation_epoch
+            .insert(signer_peer_id, self.economic_engine.epoch_count());
+
         info!(
             proposal_id = %proposal_id,
             signatures_collected = count,
@@ -4893,5 +4975,179 @@ mod quorum_certificate_tests {
         let hash = mgr.commit(&cert_bytes, &decoded.0, &sigs_2).unwrap();
         assert!(!hash.iter().all(|b| *b == 0));
         assert!(mgr.is_committed(&decoded.0));
+    }
+}
+
+#[cfg(test)]
+mod zombie_eviction_tests {
+    use super::*;
+    use crate::state::peers::PeerInfo;
+
+    fn test_peer() -> PeerId {
+        PeerId::random()
+    }
+
+    fn make_addr() -> Multiaddr {
+        "/ip4/192.168.1.100/tcp/4001".parse().unwrap()
+    }
+
+    // ── Predicate helpers (mirror check_peer_liveness logic) ───
+
+    fn is_zombie_heartbeat(info: &PeerInfo, current_epoch: u64) -> bool {
+        current_epoch.saturating_sub(info.last_heartbeat_epoch) > ZOMBIE_EPOCH_THRESHOLD
+    }
+
+    fn is_zombie_thickness_attestation(
+        thickness: f64,
+        last_attestation_epoch: u64,
+        current_epoch: u64,
+    ) -> bool {
+        thickness < 0.001
+            && current_epoch.saturating_sub(last_attestation_epoch) > ZOMBIE_ATTESTATION_SILENCE_EPOCHS
+    }
+
+    // ── Tests ────────────────────────────────────────────────
+
+    #[test]
+    fn peer_silent_for_31_epochs_is_zombie() {
+        // Default ZOMBIE_EPOCH_THRESHOLD = 30
+        let current_epoch = 31;
+        let mut peer_info = PeerInfo {
+            peer_id: test_peer(),
+            addresses: vec![make_addr()],
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+            heartbeats_received: 1,
+            last_heartbeat_epoch: 0, // never seen a heartbeat since epoch tracking started
+        };
+
+        // At epoch 31, 31-0 = 31 > 30 → zombie
+        assert!(is_zombie_heartbeat(&peer_info, current_epoch));
+
+        // At epoch 30, 30-0 = 30, NOT > 30 → not zombie yet
+        assert!(!is_zombie_heartbeat(&peer_info, 30));
+
+        // At epoch 10, 10-0 = 10 → not zombie
+        assert!(!is_zombie_heartbeat(&peer_info, 10));
+
+        // Update last heartbeat to epoch 5
+        peer_info.last_heartbeat_epoch = 5;
+        // At epoch 35, 35-5 = 30, NOT > 30 → still not zombie
+        assert!(!is_zombie_heartbeat(&peer_info, 35));
+        // At epoch 36, 36-5 = 31 > 30 → zombie
+        assert!(is_zombie_heartbeat(&peer_info, 36));
+    }
+
+    #[test]
+    fn zero_thickness_no_attestations_is_zombie() {
+        let current_epoch = 11; // > ZOMBIE_ATTESTATION_SILENCE_EPOCHS (10)
+        let thickness = 0.0;
+        let last_attestation_epoch = 0;
+
+        assert!(is_zombie_thickness_attestation(
+            thickness,
+            last_attestation_epoch,
+            current_epoch
+        ));
+
+        // At epoch 10, NOT > 10 → not zombie yet
+        assert!(!is_zombie_thickness_attestation(
+            thickness,
+            last_attestation_epoch,
+            10
+        ));
+    }
+
+    #[test]
+    fn non_zero_thickness_is_not_zombie() {
+        // Peer with thickness > 0 should NOT be evicted on attestation grounds
+        assert!(!is_zombie_thickness_attestation(1.0, 0, 100));
+        assert!(!is_zombie_thickness_attestation(0.001, 0, 100));
+    }
+
+    #[test]
+    fn healthy_peer_recent_heartbeat_not_zombie() {
+        let current_epoch = 5;
+        let peer_info = PeerInfo {
+            peer_id: test_peer(),
+            addresses: vec![make_addr()],
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+            heartbeats_received: 10,
+            last_heartbeat_epoch: 5, // just received a heartbeat
+        };
+
+        // 5 - 5 = 0 → not zombie
+        assert!(!is_zombie_heartbeat(&peer_info, current_epoch));
+
+        // With thickness, not zombie on attestation grounds either
+        assert!(!is_zombie_thickness_attestation(10.0, 0, current_epoch));
+    }
+
+    #[test]
+    fn evicted_peer_reconnects_as_fresh_peer() {
+        // Simulate a peer that was evicted and then reconnects
+        let pid = test_peer();
+        let addr = make_addr();
+
+        let mut table = PeerTable::new();
+
+        // First connection — peer appears
+        table.add_peer(pid, addr.clone());
+        table.record_heartbeat_epoch(&pid, 1);
+        assert_eq!(table.len(), 1);
+
+        // Simulate zombie detection — evict (remove)
+        table.remove_peer(&pid);
+        assert_eq!(table.len(), 0);
+
+        // Peer reconnects — re-added as fresh peer
+        table.add_peer(pid, addr.clone());
+        assert_eq!(table.len(), 1);
+
+        let info = table.get(&pid).unwrap();
+        // Fresh peer: heartbeats_received reset, last_heartbeat_epoch reset
+        assert_eq!(info.heartbeats_received, 0);
+        assert_eq!(info.last_heartbeat_epoch, 0);
+
+        // Record a heartbeat in epoch 50
+        table.record_heartbeat_epoch(&pid, 50);
+        let info = table.get(&pid).unwrap();
+        assert_eq!(info.heartbeats_received, 1);
+        assert_eq!(info.last_heartbeat_epoch, 50);
+    }
+
+    #[test]
+    fn witness_sigs_cleared_on_eviction() {
+        // Test that eviction clears witness signatures for the evicted peer
+        let pid = test_peer();
+        let other_pid = test_peer();
+
+        let mut sigs: HashMap<String, Vec<(PeerId, Vec<u8>, Vec<u8>)>> = HashMap::new();
+
+        // Add sigs from pid and other_pid for a proposal
+        sigs.insert("proposal-1".into(), vec![
+            (pid, vec![1, 2, 3], vec![4, 5, 6]),
+            (other_pid, vec![7, 8, 9], vec![10, 11, 12]),
+        ]);
+
+        // Add sigs from pid only for another proposal
+        sigs.insert("proposal-2".into(), vec![
+            (pid, vec![13, 14, 15], vec![16, 17, 18]),
+        ]);
+
+        // Evict pid
+        sigs.values_mut().for_each(|s| {
+            s.retain(|(p, _, _)| *p != pid);
+        });
+        sigs.retain(|_, s| !s.is_empty());
+
+        // proposal-1 still has other_pid's sig
+        let p1_sigs = sigs.get("proposal-1").unwrap();
+        assert_eq!(p1_sigs.len(), 1);
+        assert_eq!(p1_sigs[0].0, other_pid);
+
+        // proposal-2 is empty, should be removed
+        assert!(sigs.get("proposal-2").is_none());
     }
 }

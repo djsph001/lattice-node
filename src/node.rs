@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -14,6 +14,7 @@ use libp2p::{
 use libp2p::swarm::behaviour::toggle::Toggle;
 use serde::{Deserialize, Serialize};
 use tokio::time;
+use chrono::Utc;
 use tracing::{debug, error, info, warn};
 
 use crate::agent::ModelSize;
@@ -55,6 +56,21 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// mesh recovery time.  The aged threshold (FETCH_TIMEOUT * 10 = 50s)
 /// flags entries for attention; this threshold is where they are deleted.
 const FETCH_EVICTION_THRESHOLD: Duration = Duration::from_secs(600);
+
+/// How long without a heartbeat before a peer is flagged as silent.
+/// 30s = 3× heartbeat interval (10s).
+const ZOMBIE_WARN_THRESHOLD_SECS: u64 = 30;
+
+/// How long without a heartbeat before a peer is force-disconnected.
+/// 90s = 9× heartbeat interval. Well beyond any legitimate network
+/// hiccup, short enough that the half-open connection doesn't persist.
+const ZOMBIE_EVICT_THRESHOLD_SECS: u64 = 90;
+
+/// How long to wait for reconnect after eviction before logging ERROR.
+const RECONNECT_TIMEOUT_SECS: u64 = 30;
+
+/// Max evictions per 60s window before the circuit breaker trips.
+const CIRCUIT_BREAKER_LIMIT: usize = 3;
 
 /// Minimum peers in the topic mesh before we consider a broadcast
 /// handoff as strong evidence of delivery.  On a 3-node mesh with
@@ -170,6 +186,15 @@ pub struct LatticeNode {
     /// by the periodic sweep.  Logged when > 0.  Tracks the sweep's
     /// effectiveness across restarts (in-memory only — not persisted).
     total_evicted_fetches: usize,
+    /// Peers evicted as zombies, awaiting reconnect. Cleared on
+    /// ConnectionEstablished or after RECONNECT_TIMEOUT_SECS (ERROR).
+    pending_reconnect: HashMap<PeerId, Instant>,
+    /// Eviction timestamps for circuit breaker. Drained of entries
+    /// older than 60s on each check.
+    evictions_last_minute: VecDeque<Instant>,
+    /// Max peer silence in seconds, updated by check_peer_liveness.
+    /// Included in the metrics line.
+    last_max_peer_silence: u64,
     /// Peers with an in-flight ChainRangeRequest.  Prevents firing
     /// multiple overlapping catch-up requests to the same peer while
     /// the first is still outstanding.  Cleared on response (success
@@ -527,6 +552,9 @@ impl LatticeNode {
             pending: HashMap::new(),
             outstanding_fetches: HashMap::new(),
             total_evicted_fetches: 0,
+            pending_reconnect: HashMap::new(),
+            evictions_last_minute: VecDeque::new(),
+            last_max_peer_silence: 0,
             outstanding_chain_requests_by_peer: HashSet::new(),
             outbound: HashMap::new(),
             mint_on_start,
@@ -1209,6 +1237,8 @@ impl LatticeNode {
                     self.broadcast_heartbeat().await;
                     // Sweep stale fetch entries before computing metrics
                     self.sweep_stale_fetches();
+                    // Check peer liveness — evict zombies
+                    self.check_peer_liveness();
                     // ── Metrics ────────────────────────────────────
                     // Instrumentation for soak test: outstanding_fetches
                     // is the leak canary (entries > 10×FETCH_TIMEOUT ≈ 50s
@@ -1233,10 +1263,11 @@ impl LatticeNode {
                         })
                         .collect();
                     info!(
-                        "metrics: outstanding_fetches={} aged={} outbound_queues=[{}]",
+                        "metrics: outstanding_fetches={} aged={} outbound_queues=[{}] max_peer_silence={}s",
                         fetch_total,
                         fetch_aged,
-                        queues.join(" ")
+                        queues.join(" "),
+                        self.last_max_peer_silence
                     );
                 }
                 _ = epoch_timer.tick() => {
@@ -2207,6 +2238,10 @@ impl LatticeNode {
 
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 info!(peer = %peer_id, "Connection established");
+                // Clear pending reconnect if this peer was evicted as zombie
+                if self.pending_reconnect.remove(&peer_id).is_some() {
+                    info!(peer = %peer_id, "Reconnected after zombie eviction — self-healing succeeded");
+                }
                 if !self.mdns_peers.contains(&peer_id) {
                     warn!(peer = %peer_id, "Connection from non-mDNS peer");
                 }
@@ -2282,6 +2317,91 @@ impl LatticeNode {
                 evicted, self.total_evicted_fetches
             );
         }
+    }
+
+    /// Check peer liveness and evict zombies (half-open connections).
+    /// Runs on every heartbeat tick, after sweep_stale_fetches.
+    ///
+    /// Thresholds:
+    ///   30s silent → WARN
+    ///   90s silent → force disconnect + mark pending_reconnect
+    ///   3+ evictions in 60s → circuit breaker (skip disconnect, ERROR)
+    ///   pending_reconnect > 30s → ERROR (self-healing failed)
+    fn check_peer_liveness(&mut self) {
+        let now = Instant::now();
+
+        // Drain circuit breaker window of entries older than 60s
+        self.evictions_last_minute
+            .retain(|t| now.duration_since(*t).as_secs() < 60);
+
+        let mut longest_silence = 0u64;
+        let peer_ids: Vec<PeerId> = self.peer_table.iter().map(|i| i.peer_id).collect();
+
+        for peer_id in peer_ids {
+            // Skip self
+            if peer_id == self.local_peer_id {
+                continue;
+            }
+
+            let last_seen = match self.peer_table.get(&peer_id) {
+                Some(info) => info.last_seen,
+                None => continue,
+            };
+
+            let elapsed = (Utc::now() - last_seen).num_seconds().max(0) as u64;
+
+            if elapsed > longest_silence {
+                longest_silence = elapsed;
+            }
+
+            if elapsed > ZOMBIE_EVICT_THRESHOLD_SECS {
+                // Circuit breaker check
+                let recent = self.evictions_last_minute.len();
+                if recent >= CIRCUIT_BREAKER_LIMIT {
+                    error!(
+                        peer = %peer_id,
+                        elapsed_secs = elapsed,
+                        evictions_last_minute = recent,
+                        "Circuit breaker active — too many evictions. Human intervention needed."
+                    );
+                    continue;
+                }
+
+                warn!(
+                    peer = %peer_id,
+                    elapsed_secs = elapsed,
+                    "Evicting zombie peer — silent beyond threshold"
+                );
+                let _ = self.swarm.disconnect_peer_id(peer_id);
+                self.evictions_last_minute.push_back(now);
+                self.pending_reconnect.insert(peer_id, now);
+            } else if elapsed > ZOMBIE_WARN_THRESHOLD_SECS {
+                warn!(
+                    peer = %peer_id,
+                    elapsed_secs = elapsed,
+                    evict_threshold_secs = ZOMBIE_EVICT_THRESHOLD_SECS,
+                    "Peer silent — approaching zombie threshold"
+                );
+            }
+        }
+
+        // Check pending reconnects that have timed out
+        self.pending_reconnect.retain(|peer_id, since| {
+            let waiting = now.duration_since(*since).as_secs();
+            if waiting > RECONNECT_TIMEOUT_SECS {
+                error!(
+                    peer = %peer_id,
+                    waiting_secs = waiting,
+                    "Failed to reconnect after zombie eviction — manual restart may be needed"
+                );
+                false // remove after logging
+            } else {
+                true
+            }
+        });
+
+        // Store for metrics line
+        self.last_max_peer_silence = longest_silence;
     }
 
     /// Record a successfully-applied transaction: insert into tx_store,

@@ -38,6 +38,11 @@ pub const LATTICE_AGENT_TOPIC: &str = "lattice/agent/v1";
 /// blocks; divergent blocks trigger fork resolution.
 pub const LATTICE_BLOCK_TOPIC: &str = "lattice/block/v1";
 
+/// Gossipsub topic for block sync requests and responses.
+/// Nodes request block ranges when they detect they're behind;
+/// peers serve blocks from their local chain.
+pub const LATTICE_BLOCK_SYNC_TOPIC: &str = "lattice/block-sync/v1";
+
 /// Composed network behaviour for a Lattice node.
 ///
 /// Phase 2 starts with mDNS for local peer discovery.

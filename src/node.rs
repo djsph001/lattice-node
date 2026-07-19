@@ -1912,6 +1912,7 @@ impl LatticeNode {
 
     /// Dispatch on swarm events.
     async fn handle_swarm_event(&mut self, event: SwarmEvent<LatticeBehaviourEvent>) {
+        use prost::Message;
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!(addr = %address, "Listening");
@@ -2201,9 +2202,26 @@ impl LatticeNode {
                                     peer_str.parse::<PeerId>().ok().map(|pid| (pid, sig.clone()))
                                 })
                                 .collect();
+
+                            // Extract real proposal_id from cert_bytes.
+                            // Era One: SignedTransaction → transaction → nonce/type
+                            // Era Two: ImpactCertificate protobuf → proposal_id field
+                            let proposal_id: String = if let Ok(stx) = serde_cbor::from_slice::<crate::ledger::types::SignedTransaction>(&wire.cert_bytes) {
+                                // Era One: derive id from transaction type + signer
+                                let nonce = stx.transaction.nonce();
+                                let signer = stx.transaction.signer().to_string();
+                                format!("{}-{}", signer, nonce)
+                            } else if let Ok(cert) = crate::ingest::proto::ImpactCertificate::decode(&wire.cert_bytes[..]) {
+                                // Era Two: use proposal_id from certificate
+                                cert.proposal_id.clone()
+                            } else {
+                                // Fallback to block hash
+                                hex::encode(wire.block_hash)
+                            };
+
                             match self.commit_manager.commit(
                                 &wire.cert_bytes,
-                                "",  // proposal_id not available in catch-up; block hash is the identity
+                                &proposal_id,
                                 &signatures,
                             ) {
                                 Ok(hash) => debug!("[chain-sync] Applied block {} hash={:?}", wire.height, hash),

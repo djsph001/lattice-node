@@ -1084,4 +1084,45 @@ mod tests {
              derives to zero at arbitrary depth without traversal."
         );
     }
+
+    #[test]
+    fn thickness_root_deterministic() {
+        // Same thickness state built in different insertion orders
+        // must produce the same root.
+        let pid_a = PeerId::random();
+        let pid_b = PeerId::random();
+
+        let build = |order: &[usize]| -> [u8; 32] {
+            let mut g = ThicknessGraph::new();
+            // Genesis must come first — vouch requires thickness to exist.
+            g.add_genesis_thickness(&pid_a, 500.0, Some(10)).unwrap();
+            for &i in order {
+                match i {
+                    0 => {
+                        // Genesis already applied above — no-op in loop
+                    }
+                    1 => {
+                        let rid = [0xAA; 32];
+                        g.add_verified_contribution(&pid_b, rid, 100.0);
+                    }
+                    2 => {
+                        // vouch from pid_a to pid_b
+                        g.stake_vouch(&pid_a, &pid_b, 5000, 1, None).unwrap();
+                    }
+                    _ => {}
+                }
+            }
+            g.thickness_root()
+        };
+
+        // A-genesis → B-contribution, A→B vouch
+        let root_1 = build(&[1, 2]);
+        // A-genesis → A→B vouch, B-contribution
+        let root_2 = build(&[2, 1]);
+
+        assert_eq!(
+            root_1, root_2,
+            "thickness_root must be order-independent"
+        );
+    }
 }

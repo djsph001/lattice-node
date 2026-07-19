@@ -152,6 +152,7 @@ impl LedgerState {
             Transaction::Genesis {
                 root,
                 thickness_grant,
+                amortize_over,
                 ..
             } => {
                 let root_peer: PeerId = root
@@ -159,7 +160,8 @@ impl LedgerState {
                     .map_err(|e| anyhow::anyhow!("invalid root PeerId in genesis: {e}"))?;
                 // Seed thickness into the provenance graph.
                 self.thickness_graph
-                    .add_genesis_thickness(&root_peer, *thickness_grant, None);
+                    .add_genesis_thickness(&root_peer, *thickness_grant, *amortize_over)
+                    .map_err(|e| anyhow::anyhow!("genesis thickness failed: {e}"))?;
                 info!(
                     root = %root,
                     thickness_grant = format!("{:.2}", thickness_grant),
@@ -364,6 +366,7 @@ impl LedgerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ledger::thickness::derive_genesis_amount;
     use crate::ledger::types::DigitalUtilityUnit;
     use chrono::Utc;
 
@@ -510,6 +513,49 @@ mod tests {
         assert!(
             state.get_claim(&rid).is_none(),
             "evicted claim should be removed"
+        );
+    }
+
+    #[test]
+    fn genesis_amortizes_to_zero_over_contributions() {
+        let mut state = LedgerState::new();
+        let root = PeerId::random();
+        let rid_template = [0xCC; 32];
+
+        // Seed self-liquidating genesis: 1000 units amortized over 10 contributions.
+        let tx = Transaction::Genesis {
+            root: root.to_string(),
+            thickness_grant: 1000.0,
+            declared_operator_keys: vec![root.to_string()],
+            amortize_over: Some(10),
+            nonce: 0,
+            timestamp: Utc::now(),
+        };
+        state.apply_transaction(&tx).unwrap();
+
+        // Full thickness at the start.
+        assert!(
+            (state.thickness_graph.total_thickness(&root) - 1000.0).abs() < f64::EPSILON,
+            "genesis should start at full thickness"
+        );
+
+        // Record 10 contributions, each large enough to mint thickness.
+        for i in 0..10u64 {
+            let mut rid = rid_template;
+            rid[0] = i as u8;
+            state.register_claim(rid, root.to_string(), 10_000_000, 1);
+            state.record_verification_success(&rid, &root, i + 1);
+        }
+
+        // After 10 contributions the linearly amortized genesis amount is zero.
+        assert!(
+            state.thickness_graph.total_thickness(&root) > 0.0,
+            "contribution thickness should remain after amortization"
+        );
+        let genesis_only = derive_genesis_amount(1000.0, Some(10), 10);
+        assert!(
+            genesis_only.abs() < f64::EPSILON,
+            "genesis component should amortize to zero"
         );
     }
 }

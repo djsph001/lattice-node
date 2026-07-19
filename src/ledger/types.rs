@@ -163,6 +163,9 @@ pub enum Transaction {
         /// Certificates from panels composed entirely of declared keys
         /// are structurally self-certifications — auditable, not forbidden.
         declared_operator_keys: Vec<String>,
+        /// If Some(N), the genesis grant self-liquidates linearly over N
+        /// verified contributions. None makes the grant permanent.
+        amortize_over: Option<u64>,
         nonce: u64,
         timestamp: DateTime<Utc>,
     },

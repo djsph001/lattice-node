@@ -120,15 +120,26 @@ struct Cli {
     #[arg(long)]
     genesis_root: Option<String>,
 
-    /// Submit a Genesis transaction from this node. The node MUST be
-    /// the genesis_root — it signs only if its own identity matches
-    /// the configured root. Seeds thickness and declares operator keys.
-    #[arg(long, requires = "genesis_root")]
+    /// Submit a Genesis transaction from this node. If --genesis-root is
+    /// set, the node must match that root. If omitted, the node self-authors
+    /// genesis using its own identity (useful for spawning a new mesh).
+    #[arg(long)]
     submit_genesis: bool,
 
     /// Initial thickness grant for genesis (gauge-scaled).
     #[arg(long, default_value_t = 1000.0)]
     genesis_thickness: f64,
+
+    /// Self-liquidation period for genesis thickness. If set, the genesis
+    /// grant decays linearly over N verified contributions. None = permanent.
+    #[arg(long)]
+    genesis_amortize_over: Option<u64>,
+
+    /// Automatically submit genesis on startup if the chain is empty.
+    /// The node uses its own identity as the root. Implies self-authored
+    /// genesis; --genesis-root is not required.
+    #[arg(long)]
+    auto_genesis: bool,
 
     /// Submit a BootstrapEnded declaration from this node. One-way:
     /// after this block, root-authorized blocks are rejected and only
@@ -315,6 +326,9 @@ async fn main() -> Result<()> {
         cli.density_margin,
         cli.thickness_gauge,
         cli.genesis_root,
+        cli.genesis_amortize_over,
+        cli.auto_genesis,
+        cli.genesis_thickness,
         cli.force_era_two,
     )?;
 
@@ -337,7 +351,8 @@ async fn main() -> Result<()> {
     }
 
     // Submit Genesis if requested — node signs only if its identity
-    // is the configured genesis_root.
+    // matches the configured genesis_root, or self-authors if no root
+    // is configured.
     if cli.submit_genesis {
         node.submit_genesis(cli.genesis_thickness)?;
     }

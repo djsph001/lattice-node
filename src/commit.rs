@@ -875,6 +875,7 @@ mod tests {
             root: "test_root".to_string(),
             thickness_grant: 1000.0,
             declared_operator_keys: vec![],
+            amortize_over: None,
             nonce: 0,
             timestamp: chrono::Utc::now(),
         };
@@ -914,6 +915,7 @@ mod tests {
             root: "12D3KooWQw6".to_string(),
             thickness_grant: 1000.0,
             declared_operator_keys: vec!["12D3KooWBoVfr".to_string(), "12D3KooWQw6".to_string()],
+            amortize_over: None,
             nonce: 0,
             timestamp: chrono::Utc::now(),
         };
@@ -957,6 +959,7 @@ mod tests {
             root: "12D3KooWQw6".to_string(),
             thickness_grant: 1000.0,
             declared_operator_keys: vec![],
+            amortize_over: None,
             nonce: 0,
             timestamp: chrono::Utc::now(),
         };

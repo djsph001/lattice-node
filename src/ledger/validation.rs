@@ -52,15 +52,21 @@ pub fn validate_and_apply(
     state: &mut LedgerState,
     seen_nonces: &mut HashMap<PeerId, u64>,
 ) -> Result<(), ValidationError> {
-    validate_and_apply_with_genesis_root(tx, state, seen_nonces, None)
+    validate_and_apply_with_genesis_root(tx, state, seen_nonces, None, false)
 }
 
 /// Full validation with genesis-root gate.
+///
+/// `allow_self_authored_genesis` relaxes the gate when `genesis_root` is
+/// `None`, allowing a node to accept a genesis transaction signed by the
+/// embedded root. The caller must ensure this is only used at chain height 0
+/// before BootstrapEnded.
 pub fn validate_and_apply_with_genesis_root(
     tx: &SignedTransaction,
     state: &mut LedgerState,
     seen_nonces: &mut HashMap<PeerId, u64>,
     genesis_root: Option<&PeerId>,
+    allow_self_authored_genesis: bool,
 ) -> Result<(), ValidationError> {
     // 1. Verify the signature
     verify_signature(tx)?;
@@ -76,6 +82,7 @@ pub fn validate_and_apply_with_genesis_root(
                 "genesis rejected: signer {} is not the configured root {}",
                 signer, root
             ))),
+            None if allow_self_authored_genesis => { /* ok */ }
             None => return Err(ValidationError::Other(anyhow::anyhow!(
                 "genesis rejected: --genesis-root not configured — \
                  this node cannot validate the trust anchor"
@@ -513,13 +520,14 @@ mod tests {
             root: imposter.to_string(),
             thickness_grant: 1000.0,
             declared_operator_keys: vec![],
+            amortize_over: None,
             nonce: 0,
             timestamp: chrono::Utc::now(),
         };
         let signed = sign_transaction(&tx, &imposter_key);
 
         let result = validate_and_apply_with_genesis_root(
-            &signed, &mut state, &mut nonces, Some(&root),
+            &signed, &mut state, &mut nonces, Some(&root), false,
         );
         assert!(result.is_err(), "non-root genesis must be rejected");
         assert!(
@@ -539,13 +547,14 @@ mod tests {
             root: signer.to_string(),
             thickness_grant: 1000.0,
             declared_operator_keys: vec![],
+            amortize_over: None,
             nonce: 0,
             timestamp: chrono::Utc::now(),
         };
         let signed = sign_transaction(&tx, &key);
 
         let result = validate_and_apply_with_genesis_root(
-            &signed, &mut state, &mut nonces, None,
+            &signed, &mut state, &mut nonces, None, false,
         );
         assert!(result.is_err(), "genesis without trust anchor must be rejected");
         assert!(
@@ -565,14 +574,61 @@ mod tests {
             root: root.to_string(),
             thickness_grant: 1000.0,
             declared_operator_keys: vec![root.to_string()],
+            amortize_over: None,
             nonce: 0,
             timestamp: chrono::Utc::now(),
         };
         let signed = sign_transaction(&tx, &root_key);
 
         let result = validate_and_apply_with_genesis_root(
-            &signed, &mut state, &mut nonces, Some(&root),
+            &signed, &mut state, &mut nonces, Some(&root), false,
         );
         assert!(result.is_ok(), "valid root genesis must be accepted");
+    }
+
+    #[test]
+    fn self_authored_genesis_accepted_when_allowed() {
+        let key = identity::Keypair::generate_ed25519();
+        let root = PeerId::from(key.public());
+        let mut state = LedgerState::new();
+        let mut nonces = HashMap::new();
+
+        let tx = Transaction::Genesis {
+            root: root.to_string(),
+            thickness_grant: 1000.0,
+            declared_operator_keys: vec![root.to_string()],
+            amortize_over: None,
+            nonce: 0,
+            timestamp: chrono::Utc::now(),
+        };
+        let signed = sign_transaction(&tx, &key);
+
+        let result = validate_and_apply_with_genesis_root(
+            &signed, &mut state, &mut nonces, None, true,
+        );
+        assert!(result.is_ok(), "self-authored genesis must be accepted when allowed");
+    }
+
+    #[test]
+    fn self_authored_genesis_rejected_when_not_allowed() {
+        let key = identity::Keypair::generate_ed25519();
+        let root = PeerId::from(key.public());
+        let mut state = LedgerState::new();
+        let mut nonces = HashMap::new();
+
+        let tx = Transaction::Genesis {
+            root: root.to_string(),
+            thickness_grant: 1000.0,
+            declared_operator_keys: vec![root.to_string()],
+            amortize_over: None,
+            nonce: 0,
+            timestamp: chrono::Utc::now(),
+        };
+        let signed = sign_transaction(&tx, &key);
+
+        let result = validate_and_apply_with_genesis_root(
+            &signed, &mut state, &mut nonces, None, false,
+        );
+        assert!(result.is_err(), "self-authored genesis must be rejected when not allowed");
     }
 }

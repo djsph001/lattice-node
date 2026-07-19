@@ -346,7 +346,14 @@ pub struct LatticeNode {
     density_margin: f64,
     thickness_gauge: f64,
     /// Expected root PeerId for genesis validation (out-of-band trust anchor).
+    /// If None, the node may self-author genesis using its own identity.
     genesis_root: Option<PeerId>,
+    /// Self-liquidation period for genesis thickness. None = permanent.
+    genesis_amortize_over: Option<u64>,
+    /// Automatically submit genesis on startup if the chain is empty.
+    auto_genesis: bool,
+    /// Initial thickness grant for genesis (gauge-scaled).
+    genesis_thickness: f64,
     /// Transaction persistence layer (WAL + snapshot).  When set,
     /// every validated and applied transaction is recorded in the WAL
     /// and nonces are snapshotted for crash recovery.  Optional so
@@ -386,6 +393,9 @@ impl LatticeNode {
         density_margin: f64,
         thickness_gauge: f64,
         genesis_root: Option<String>,
+        genesis_amortize_over: Option<u64>,
+        auto_genesis: bool,
+        genesis_thickness: f64,
         force_era_two: bool,
     ) -> Result<Self> {
         let key_path = resolve_identity_path(identity_dir)?;
@@ -634,15 +644,19 @@ impl LatticeNode {
             thickness_gauge,
             genesis_root: {
                 let parsed = genesis_root.and_then(|s| s.parse().ok());
-                if parsed.is_none() {
+                if parsed.is_none() && !auto_genesis {
                     tracing::warn!(
                         "--genesis-root not set — this node cannot validate genesis. \
                          Economic participation (panels, certificates, thickness) \
-                         requires a configured trust anchor. Relay and gossip still work."
+                         requires a configured trust anchor. Relay and gossip still work. \
+                         Use --auto-genesis to self-author a new mesh."
                     );
                 }
                 parsed
             },
+            genesis_amortize_over,
+            auto_genesis,
+            genesis_thickness,
             state_store: None,
             executor: crate::agent::executor::OllamaExecutor::new(),
             exec_tx: None,
@@ -658,10 +672,8 @@ impl LatticeNode {
     /// identity matches the configured genesis_root — the strictest gate
     /// in the system, because Genesis mints thickness from nothing.
     pub fn submit_genesis(&mut self, thickness_grant: f64) -> Result<()> {
-        let root = match &self.genesis_root {
-            Some(r) => r.clone(),
-            None => bail!("--genesis-root is required to submit genesis"),
-        };
+        // If no external root is configured, the node self-authors genesis.
+        let root = self.genesis_root.unwrap_or(self.local_peer_id);
         if self.local_peer_id != root {
             bail!(
                 "this node ({}) is not the configured genesis root ({}) — \
@@ -680,6 +692,7 @@ impl LatticeNode {
             root: self.local_peer_id.to_string(),
             thickness_grant,
             declared_operator_keys: vec![self.local_peer_id.to_string()],
+            amortize_over: self.genesis_amortize_over,
             nonce: 0,
             timestamp: chrono::Utc::now(),
         };
@@ -1176,9 +1189,11 @@ impl LatticeNode {
 
             // Validate and apply
             if is_genesis {
+                let allow_self_authored = self.genesis_root.is_none();
                 if let Err(e) = crate::ledger::validation::validate_and_apply_with_genesis_root(
                     &stx, &mut self.ledger, &mut self.seen_nonces,
                     self.genesis_root.as_ref(),
+                    allow_self_authored,
                 ) {
                     tracing::warn!(error = %e, "[block-recv] Genesis validation failed");
                     return;
@@ -1519,6 +1534,20 @@ impl LatticeNode {
         // Phase 7: API server — Unix Domain Socket for local queries
         let api_socket = self.storage_dir.join("lattice.sock");
         let mut api_rx = crate::api::spawn_api_server(api_socket);
+
+        // ── Auto-genesis: spawn a new mesh if the chain is empty ─────
+        if self.auto_genesis
+            && self.commit_manager.height() == 0
+            && !self.commit_manager.is_bootstrap_ended()
+        {
+            info!(
+                peer_id = %self.local_peer_id,
+                "Auto-genesis enabled — chain is empty, self-authoring genesis"
+            );
+            if let Err(e) = self.submit_genesis(self.genesis_thickness) {
+                warn!(error = %e, "Auto-genesis failed");
+            }
+        }
 
         info!(
             name = %self.node_name,

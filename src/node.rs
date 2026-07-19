@@ -2427,6 +2427,23 @@ impl LatticeNode {
                                 hex::encode(wire.block_hash)
                             };
 
+                            // ── Era Two: verify state roots before committing ──
+                            if wire.cert_bytes.first() == Some(&ERA_TWO_BLOCK_MARKER) {
+                                if let Ok(rb) = RatificationBlock::decode_wire(&wire.cert_bytes[1..]) {
+                                    let local_state = self.ledger.state_root(&self.seen_nonces);
+                                    let local_thickness = self.ledger.thickness_graph.thickness_root();
+                                    if rb.state_root != local_state || rb.thickness_root != local_thickness {
+                                        warn!(
+                                            height = wire.height,
+                                            state_match = rb.state_root == local_state,
+                                            thickness_match = rb.thickness_root == local_thickness,
+                                            "[chain-sync] RatificationBlock root mismatch — catch-up rejected"
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+
                             match self.commit_manager.commit(
                                 &wire.cert_bytes,
                                 &proposal_id,

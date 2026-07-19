@@ -1900,6 +1900,16 @@ impl LatticeNode {
             "Recovered {} peer nonces from persistence",
             self.seen_nonces.len()
         );
+
+        // Hydrate economic state: balances from snapshot
+        let (_, balances) = state.export_state();
+        for (peer, balance) in &balances {
+            self.ledger.set_balance(peer, *balance);
+        }
+        if !balances.is_empty() {
+            info!(count = balances.len(), "Recovered balances from economic snapshot");
+        }
+
         self.state_store = Some(Box::new(store));
         Ok(())
     }

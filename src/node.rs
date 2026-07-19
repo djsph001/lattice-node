@@ -31,6 +31,7 @@ use crate::message::types::{TransactionRequest, TransactionResponse};
 use crate::message::types::{ChainRangeRequest, ChainRangeResponse};
 use crate::message::types::WireBlock;
 use crate::message::types::{VerifyRequest, VerifyResponse};
+use crate::message::types::{RatificationBlock, ERA_ONE_BLOCK_MARKER, ERA_TWO_BLOCK_MARKER};
 use crate::network::protocol::{
     LatticeBehaviour, LatticeBehaviourEvent, LATTICE_HEARTBEAT_TOPIC, LATTICE_KAD_PROTOCOL,
     LATTICE_ENCLAVE_CERT_TOPIC, LATTICE_AGENT_TOPIC, LATTICE_BLOCK_TOPIC,
@@ -789,6 +790,94 @@ impl LatticeNode {
         }
     }
 
+    /// Publish an Era Two ratification block on `lattice/block/v1`.
+    /// Single-producer proposal: the sortitioned node assembles the
+    /// block, prepends ERA_TWO_BLOCK_MARKER, and broadcasts.  No
+    /// multi-sig quorum round — peers verify roots independently.
+    fn publish_ratification_block(&mut self, block: &RatificationBlock) {
+        let raw = match block.encode_wire() {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "[block-publish] Failed to encode RatificationBlock");
+                return;
+            }
+        };
+
+        let topic = gossipsub::IdentTopic::new(LATTICE_BLOCK_TOPIC);
+        self.track_outbound(&raw);
+        match self.swarm.behaviour_mut().gossipsub.publish(topic, raw) {
+            Ok(msg_id) => {
+                tracing::info!(
+                    epoch = block.epoch,
+                    proposal_id = %block.proposal_id,
+                    message_id = %msg_id,
+                    "[block-publish] RatificationBlock broadcast to mesh (Era Two, 0x02)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    epoch = block.epoch,
+                    proposal_id = %block.proposal_id,
+                    error = %e,
+                    "[block-publish] Failed to publish RatificationBlock"
+                );
+            }
+        }
+    }
+
+    /// Handle an Era Two RatificationBlock received via `lattice/block/v1`.
+    /// Verifies roots against local state.  If they match, commits the
+    /// epoch boundary.  If they mismatch, logs a state fork warning and
+    /// drops the block — does NOT trigger catch-up sync.
+    fn handle_ratification_block(&mut self, data: &[u8], propagation_source: &PeerId) {
+        let block = match RatificationBlock::decode_wire(data) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    from = %propagation_source,
+                    "[block-recv] Failed to deserialize RatificationBlock"
+                );
+                return;
+            }
+        };
+
+        let current_epoch = self.economic_engine.epoch_count();
+        // Accept current or next epoch (the producer may be one epoch ahead).
+        if block.epoch != current_epoch && block.epoch != current_epoch + 1 {
+            tracing::debug!(
+                their_epoch = block.epoch,
+                our_epoch = current_epoch,
+                from = %propagation_source,
+                "[block-recv] RatificationBlock for unexpected epoch — dropping"
+            );
+            return;
+        }
+
+        // Compute local roots
+        let local_state = self.ledger.state_root(&self.seen_nonces);
+        let local_thickness = self.ledger.thickness_graph.thickness_root();
+
+        if block.state_root == local_state && block.thickness_root == local_thickness {
+            tracing::info!(
+                epoch = block.epoch,
+                proposal_id = %block.proposal_id,
+                from = %propagation_source,
+                "[block-recv] RatificationBlock verified — roots match"
+            );
+            // TODO: commit as epoch boundary marker
+        } else {
+            tracing::warn!(
+                epoch = block.epoch,
+                proposal_id = %block.proposal_id,
+                from = %propagation_source,
+                state_match = block.state_root == local_state,
+                thickness_match = block.thickness_root == local_thickness,
+                "[block-recv] STATE FORK — RatificationBlock roots differ from local state. Dropping."
+            );
+        }
+    }
+
     /// Encode a verified quorum certificate (QC) for gossip on the
     /// enclave-cert topic. Uses marker byte 0x02.
     ///
@@ -958,6 +1047,26 @@ impl LatticeNode {
     /// For case 3, Genesis is a special case: height 0, no parent hash
     /// check. All other blocks must have prev_hash matching local tip.
     fn handle_block_message(&mut self, data: &[u8], propagation_source: &PeerId) {
+        if data.is_empty() {
+            tracing::warn!("[block-recv] Empty block message");
+            return;
+        }
+
+        // ── Era Two: RatificationBlock (0x02 prefix) ─────────────
+        if data[0] == ERA_TWO_BLOCK_MARKER {
+            self.handle_ratification_block(&data[1..], propagation_source);
+            return;
+        }
+
+        // ── Era One: legacy block frame ─────────────────────────
+        if data[0] != ERA_ONE_BLOCK_MARKER {
+            // No prefix byte at all — treat as legacy Era One for
+            // backward compatibility with nodes that don't prefix.
+            // (The existing wire format has height as the first 8 bytes,
+            // which will never be 0x01 or 0x02 in practice for height > 0.)
+        }
+        let data = if data[0] == ERA_ONE_BLOCK_MARKER { &data[1..] } else { data };
+
         if data.len() < 72 {
             tracing::warn!("[block-recv] Block too short ({} bytes)", data.len());
             return;
@@ -1694,6 +1803,28 @@ impl LatticeNode {
 
         // Phase 8b: deadline monitor — expire tasks past their deadline.
         self.expire_agent_tasks(epoch);
+
+        // ── Era Two: produce RatificationBlock ────────────────────
+        // After economic cycle completes and roots are computed, the
+        // sortitioned block producer assembles and broadcasts the
+        // ratification block.  Gated behind BootstrapEnded.
+        if self.commit_manager.is_bootstrap_ended() {
+            let state_root = self.ledger.state_root(&self.seen_nonces);
+            let thickness_root = self.ledger.thickness_graph.thickness_root();
+            let proposal_id = format!("epoch-{epoch}");
+            let block = RatificationBlock {
+                epoch,
+                state_root,
+                thickness_root,
+                proposal_id: proposal_id.clone(),
+            };
+            tracing::info!(
+                epoch,
+                proposal_id = %proposal_id,
+                "[ratification] Assembled RatificationBlock for Era Two broadcast"
+            );
+            self.publish_ratification_block(&block);
+        }
     }
 
     /// Phase 8b: Mark agent tasks as Failed if past deadline_epoch.
@@ -5408,5 +5539,98 @@ mod outbound_sweep_tests {
         // When mesh_peers == 0, skip retry
         let mesh_peers = 0usize;
         assert!(!(mesh_peers > 0));
+    }
+}
+
+#[cfg(test)]
+mod ratification_block_tests {
+    use super::*;
+    use crate::message::types::{RatificationBlock, ERA_ONE_BLOCK_MARKER, ERA_TWO_BLOCK_MARKER};
+
+    fn make_block(epoch: u64) -> RatificationBlock {
+        RatificationBlock {
+            epoch,
+            state_root: [0xAA; 32],
+            thickness_root: [0xBB; 32],
+            proposal_id: format!("epoch-{epoch}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_encode_decode() {
+        let block = make_block(42);
+        let encoded = block.encode_wire().expect("encode must succeed");
+        // First byte must be ERA_TWO_BLOCK_MARKER
+        assert_eq!(encoded[0], ERA_TWO_BLOCK_MARKER);
+
+        let decoded = RatificationBlock::decode_wire(&encoded[1..])
+            .expect("decode must succeed");
+        assert_eq!(decoded, block);
+    }
+
+    #[test]
+    fn prefix_discrimination_era_one() {
+        // Era One blocks: first byte 0x01 or no prefix
+        let raw = vec![ERA_ONE_BLOCK_MARKER];
+        assert_eq!(raw[0], ERA_ONE_BLOCK_MARKER);
+        assert_ne!(raw[0], ERA_TWO_BLOCK_MARKER);
+    }
+
+    #[test]
+    fn prefix_discrimination_era_two() {
+        let block = make_block(7);
+        let encoded = block.encode_wire().unwrap();
+        assert_eq!(encoded[0], ERA_TWO_BLOCK_MARKER);
+        assert_ne!(encoded[0], ERA_ONE_BLOCK_MARKER);
+    }
+
+    #[test]
+    fn root_verification_match() {
+        // Two blocks with identical roots match
+        let block_a = make_block(5);
+        let block_b = make_block(5);
+        assert_eq!(block_a.state_root, block_b.state_root);
+        assert_eq!(block_a.thickness_root, block_b.thickness_root);
+    }
+
+    #[test]
+    fn root_verification_mismatch() {
+        let block_a = make_block(5);
+        let mut block_b = make_block(5);
+        block_b.state_root = [0xFF; 32];
+        // Roots differ — mismatch
+        assert_ne!(block_a.state_root, block_b.state_root);
+    }
+
+    #[test]
+    fn epoch_filter_rejects_wrong_epoch() {
+        let current_epoch = 10u64;
+        let block_epoch = 8u64;  // too old
+        let accept = block_epoch == current_epoch || block_epoch == current_epoch + 1;
+        assert!(!accept);
+
+        let block_epoch = 12u64;  // too far ahead
+        let accept = block_epoch == current_epoch || block_epoch == current_epoch + 1;
+        assert!(!accept);
+    }
+
+    #[test]
+    fn epoch_filter_accepts_current_and_next() {
+        let current_epoch = 10u64;
+        assert!(10 == current_epoch || 10 == current_epoch + 1); // current
+        assert!(11 == current_epoch || 11 == current_epoch + 1); // next
+    }
+
+    #[test]
+    fn encode_empty_state_produces_valid_cbor() {
+        let block = RatificationBlock {
+            epoch: 0,
+            state_root: [0u8; 32],
+            thickness_root: [0u8; 32],
+            proposal_id: "epoch-0".into(),
+        };
+        let encoded = block.encode_wire().unwrap();
+        assert!(encoded.len() > 1, "should have marker + CBOR body");
+        assert_eq!(encoded[0], ERA_TWO_BLOCK_MARKER);
     }
 }

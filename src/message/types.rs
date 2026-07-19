@@ -337,3 +337,41 @@ pub struct WireBlock {
     /// Signatures as (PeerId_base58, sig_bytes) pairs.
     pub signatures: Vec<(String, Vec<u8>)>,
 }
+
+/// ── Era Two: Ratification Block ──────────────────────────────
+
+/// 1-byte prefix discriminating Era One vs Era Two blocks on the wire.
+/// Prepended to every `cert_bytes` payload before broadcasting on
+/// `lattice/block/v1`.  Receivers read the first byte to choose the
+/// correct deserializer.
+pub const ERA_ONE_BLOCK_MARKER: u8 = 0x01;
+pub const ERA_TWO_BLOCK_MARKER: u8 = 0x02;
+
+/// Era Two ratification block — carries epoch-level state summaries.
+/// Produced by the sortitioned block producer at epoch boundaries,
+/// broadcast on `lattice/block/v1` with an `0x02` prefix byte.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RatificationBlock {
+    pub epoch: u64,
+    pub state_root: [u8; 32],
+    pub thickness_root: [u8; 32],
+    pub proposal_id: String,
+}
+
+impl RatificationBlock {
+    /// Encode to CBOR, prepending the ERA_TWO_BLOCK_MARKER.
+    pub fn encode_wire(&self) -> Result<Vec<u8>, String> {
+        let mut buf = vec![ERA_TWO_BLOCK_MARKER];
+        let cbor = serde_cbor::to_vec(self)
+            .map_err(|e| format!("RatificationBlock encode failed: {e}"))?;
+        buf.extend_from_slice(&cbor);
+        Ok(buf)
+    }
+
+    /// Decode from wire bytes that start with ERA_TWO_BLOCK_MARKER.
+    /// The marker byte must already be consumed by the caller.
+    pub fn decode_wire(data: &[u8]) -> Result<Self, String> {
+        serde_cbor::from_slice(data)
+            .map_err(|e| format!("RatificationBlock decode failed: {e}"))
+    }
+}

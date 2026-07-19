@@ -237,6 +237,7 @@ impl ThicknessGraph {
 
     /// Stake thickness by vouching. Stores stake_bps (integer, immutable).
     /// Validates: current_bps + new_bps ≤ 10_000 — exact integer, no epsilon.
+    /// Validates: no cycles — voucher must not be (transitively) downstream of vouchee.
     ///
     /// Returns the derived amount (voucher_total × stake_bps / 10_000).
     pub fn stake_vouch(
@@ -250,6 +251,21 @@ impl ThicknessGraph {
         if stake_bps > 10_000 {
             return Err(format!("stake_bps {stake_bps} exceeds 10_000 maximum"));
         }
+
+        // Self-vouch is always a cycle
+        if voucher == vouchee {
+            return Err("cannot vouch for self — would create trivial cycle".into());
+        }
+
+        // Check if the vouchee (transitively) vouches for the voucher.
+        // If so, accepting this vouch would create a cycle.
+        if self.can_reach(vouchee, voucher) {
+            return Err(format!(
+                "rejected: vouch {} → {} would create a cycle ({} already vouches transitively for {})",
+                voucher, vouchee, vouchee, voucher
+            ));
+        }
+
         let voucher_total = self.total_thickness(voucher);
         if voucher_total <= 0.0 {
             return Err("voucher has no thickness to stake".into());
@@ -274,6 +290,37 @@ impl ThicknessGraph {
         self.edges.entry(*vouchee).or_default().push(edge);
 
         Ok(voucher_total * stake_bps as f64 / 10_000.0)
+    }
+
+    /// Check if there's a vouch path from `start` to `target`.
+    /// Used for cycle detection before accepting a new vouch.
+    /// Traverses the vouch graph: if start vouches for X, X vouches for Y,
+    /// etc., can we reach target?
+    fn can_reach(&self, start: &PeerId, target: &PeerId) -> bool {
+        let mut visited = HashSet::new();
+        let mut stack = vec![*start];
+
+        while let Some(current) = stack.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            // Find all peers that `current` vouches for.
+            // edges are keyed by vouchee, so we scan for Vouch edges
+            // where voucher == current.
+            for (vouchee, edge_list) in &self.edges {
+                for edge in edge_list {
+                    if let ThicknessSource::Vouch { voucher, .. } = &edge.source {
+                        if voucher == &current {
+                            if vouchee == target {
+                                return true;
+                            }
+                            stack.push(*vouchee);
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Process epoch tick: remove all expired vouch edges.
@@ -1094,19 +1141,15 @@ mod tests {
 
         let build = |order: &[usize]| -> [u8; 32] {
             let mut g = ThicknessGraph::new();
-            // Genesis must come first — vouch requires thickness to exist.
             g.add_genesis_thickness(&pid_a, 500.0, Some(10)).unwrap();
             for &i in order {
                 match i {
-                    0 => {
-                        // Genesis already applied above — no-op in loop
-                    }
+                    0 => {}
                     1 => {
                         let rid = [0xAA; 32];
                         g.add_verified_contribution(&pid_b, rid, 100.0);
                     }
                     2 => {
-                        // vouch from pid_a to pid_b
                         g.stake_vouch(&pid_a, &pid_b, 5000, 1, None).unwrap();
                     }
                     _ => {}
@@ -1115,14 +1158,71 @@ mod tests {
             g.thickness_root()
         };
 
-        // A-genesis → B-contribution, A→B vouch
         let root_1 = build(&[1, 2]);
-        // A-genesis → A→B vouch, B-contribution
         let root_2 = build(&[2, 1]);
 
-        assert_eq!(
-            root_1, root_2,
-            "thickness_root must be order-independent"
-        );
+        assert_eq!(root_1, root_2, "thickness_root must be order-independent");
+    }
+
+    // ── Cycle rejection tests ────────────────────────────────
+
+    #[test]
+    fn self_vouch_rejected() {
+        let mut graph = ThicknessGraph::new();
+        let alice = PeerId::random();
+
+        graph.add_genesis_thickness(&alice, 1000.0, None).unwrap();
+
+        let result = graph.stake_vouch(&alice, &alice, 1000, 1, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("self"));
+    }
+
+    #[test]
+    fn direct_cycle_rejected() {
+        let mut graph = ThicknessGraph::new();
+        let alice = PeerId::random();
+        let bob = PeerId::random();
+
+        graph.add_genesis_thickness(&alice, 1000.0, None).unwrap();
+        graph.stake_vouch(&alice, &bob, 5000, 1, None).unwrap();
+
+        // Bob vouching for Alice would create A → B → A cycle.
+        let result = graph.stake_vouch(&bob, &alice, 1000, 2, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cycle"));
+    }
+
+    #[test]
+    fn transitive_cycle_rejected() {
+        let mut graph = ThicknessGraph::new();
+        let alice = PeerId::random();
+        let bob = PeerId::random();
+        let charlie = PeerId::random();
+
+        graph.add_genesis_thickness(&alice, 1000.0, None).unwrap();
+        graph.stake_vouch(&alice, &bob, 5000, 1, None).unwrap();
+        graph.stake_vouch(&bob, &charlie, 5000, 2, None).unwrap();
+
+        // Charlie vouching for Alice would create A → B → C → A cycle.
+        let result = graph.stake_vouch(&charlie, &alice, 1000, 3, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cycle"));
+    }
+
+    #[test]
+    fn non_cycle_vouch_accepted() {
+        let mut graph = ThicknessGraph::new();
+        let alice = PeerId::random();
+        let bob = PeerId::random();
+        let charlie = PeerId::random();
+
+        graph.add_genesis_thickness(&alice, 1000.0, None).unwrap();
+        graph.stake_vouch(&alice, &bob, 3000, 1, None).unwrap();
+        graph.stake_vouch(&alice, &charlie, 3000, 2, None).unwrap();
+
+        // Bob vouching for Charlie is fine — no path C → B exists.
+        let result = graph.stake_vouch(&bob, &charlie, 1000, 3, None);
+        assert!(result.is_ok());
     }
 }

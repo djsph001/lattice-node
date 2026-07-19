@@ -1221,7 +1221,7 @@ impl LatticeNode {
         // future blocks from the same peer fires only one request.
         if !self.outstanding_chain_requests_by_peer.contains(propagation_source) {
             let req = ChainRangeRequest {
-                from_height: local_height,
+                from_height: if local_height == 0 { 0 } else { local_height + 1 },
                 to_height: height,
             };
             self.outstanding_chain_requests_by_peer.insert(*propagation_source);
@@ -3611,7 +3611,7 @@ impl LatticeNode {
                     if !self.outstanding_chain_requests_by_peer.contains(&peer) {
                         self.outstanding_chain_requests_by_peer.insert(peer);
                         let req = ChainRangeRequest {
-                            from_height: local_tip,
+                            from_height: if local_tip == 0 { 0 } else { local_tip + 1 },
                             to_height: response.chain_height - 1,
                         };
                         let _ = self.swarm.behaviour_mut()

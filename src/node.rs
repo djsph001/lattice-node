@@ -912,15 +912,15 @@ impl LatticeNode {
         info!(
             height, local_height, gap = height - local_height,
             from = %propagation_source,
-            "[chain-sync] Future block at {} — catching up via ChainRangeRequest ({}..{})",
-            height, local_height + 1, height,
+            "Future block at {} — catching up via ChainRangeRequest ({}..{})",
+            height, local_height, height,
         );
         // Fire a ChainRangeRequest if we don't already have one
         // in-flight to this peer.  Dedup by peer ID so a burst of
         // future blocks from the same peer fires only one request.
         if !self.outstanding_chain_requests_by_peer.contains(propagation_source) {
             let req = ChainRangeRequest {
-                from_height: local_height + 1,
+                from_height: local_height,
                 to_height: height,
             };
             self.outstanding_chain_requests_by_peer.insert(*propagation_source);
@@ -2926,13 +2926,13 @@ impl LatticeNode {
                     info!(
                         from = %peer, remote_tip = response.chain_height, local_tip,
                         "[chain-sync] Status shows peer ahead — catching up via ChainRangeRequest ({}..{})",
-                        local_tip + 1, response.chain_height,
+                        local_tip, response.chain_height - 1,
                     );
                     if !self.outstanding_chain_requests_by_peer.contains(&peer) {
                         self.outstanding_chain_requests_by_peer.insert(peer);
                         let req = ChainRangeRequest {
-                            from_height: local_tip + 1,
-                            to_height: response.chain_height,
+                            from_height: local_tip,
+                            to_height: response.chain_height - 1,
                         };
                         let _ = self.swarm.behaviour_mut()
                             .chain_sync_rpc

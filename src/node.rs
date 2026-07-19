@@ -359,8 +359,8 @@ pub struct LatticeNode {
     /// and nonces are snapshotted for crash recovery.  Optional so
     /// that nodes without a data directory skip disk I/O entirely.
     state_store: Option<Box<dyn crate::ledger::persistence::StateStore>>,
-    /// Phase 9: model execution bridge (Ollama).
-    executor: crate::agent::executor::OllamaExecutor,
+    /// Phase 9: model execution bridge (Ollama / OpenAI-compatible).
+    executor: crate::agent::executor::Executor,
     /// Phase 9: channel sender for background execution results.
     exec_tx: Option<tokio::sync::mpsc::Sender<ExecutionResult>>,
 }
@@ -397,6 +397,8 @@ impl LatticeNode {
         auto_genesis: bool,
         genesis_thickness: f64,
         force_era_two: bool,
+        openai_api_key: Option<String>,
+        openai_endpoint: Option<String>,
     ) -> Result<Self> {
         let key_path = resolve_identity_path(identity_dir)?;
         let local_key = load_or_generate_identity(&key_path, fresh_identity)?;
@@ -658,7 +660,7 @@ impl LatticeNode {
             auto_genesis,
             genesis_thickness,
             state_store: None,
-            executor: crate::agent::executor::OllamaExecutor::new(),
+            executor: crate::agent::executor::Executor::new(openai_api_key, openai_endpoint),
             exec_tx: None,
         })
     }
@@ -1375,7 +1377,7 @@ impl LatticeNode {
                         .map(|r| r.task.graph_blob.clone())
                         .unwrap_or_default();
                     let hash = graph_hash;
-                    let exec_client = crate::agent::executor::OllamaExecutor::new();
+                    let exec_client = self.executor.clone();
                     let ttx = tx.clone();
                     let epoch = self.economic_engine.epoch_count();
 
@@ -3510,7 +3512,7 @@ impl LatticeNode {
                         let task_id = msg.task_id.clone();
                         let graph_blob = msg.graph_blob.clone();
                         let graph_hash = msg.graph_hash;
-                        let exec_client = crate::agent::executor::OllamaExecutor::new();
+                        let exec_client = self.executor.clone();
                         let tx = self.exec_tx.clone().expect("exec_tx not set");
                         let epoch = self.economic_engine.epoch_count();
 

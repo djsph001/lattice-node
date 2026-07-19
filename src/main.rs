@@ -241,6 +241,17 @@ struct Cli {
     /// Genesis + BootstrapEnded blocks are committed.
     #[arg(long, default_value_t = false)]
     force_era_two: bool,
+
+    // ── Phase 9: agent execution backends ─────────────────────
+    /// OpenAI API key (or any OpenAI-compatible key). Enables the
+    /// `openai:*` model backend for agent tasks.
+    #[arg(long, env = "OPENAI_API_KEY")]
+    openai_api_key: Option<String>,
+
+    /// OpenAI-compatible endpoint URL. Defaults to OpenAI's official
+    /// endpoint if not set; use this for Groq, LocalAI, vLLM, etc.
+    #[arg(long, env = "OPENAI_ENDPOINT")]
+    openai_endpoint: Option<String>,
 }
 
 #[tokio::main]
@@ -330,6 +341,8 @@ async fn main() -> Result<()> {
         cli.auto_genesis,
         cli.genesis_thickness,
         cli.force_era_two,
+        cli.openai_api_key.clone(),
+        cli.openai_endpoint.clone(),
     )?;
 
     info!(

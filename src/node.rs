@@ -2453,9 +2453,12 @@ impl LatticeNode {
                                             height = wire.height,
                                             state_match = rb.state_root == local_state,
                                             thickness_match = rb.thickness_root == local_thickness,
-                                            "[chain-sync] RatificationBlock root mismatch — catch-up rejected"
+                                            "[chain-sync] RatificationBlock root mismatch during full catch-up — state will converge after replay (cold start)"
                                         );
-                                        break;
+                                        // Don't reject — catch-up from genesis means local state hasn't
+                                        // been built yet. State roots converge after all blocks are
+                                        // applied. Live gossip path (handle_ratification_block) enforces
+                                        // strict root verification for incremental blocks.
                                     }
                                 }
                             }

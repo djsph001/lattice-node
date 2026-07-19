@@ -795,41 +795,6 @@ impl LatticeNode {
         }
     }
 
-    /// Publish an Era Two ratification block on `lattice/block/v1`.
-    /// Single-producer proposal: the sortitioned node assembles the
-    /// block, prepends ERA_TWO_BLOCK_MARKER, and broadcasts.  No
-    /// multi-sig quorum round — peers verify roots independently.
-    fn publish_ratification_block(&mut self, block: &RatificationBlock) {
-        let raw = match block.encode_wire() {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(error = %e, "[block-publish] Failed to encode RatificationBlock");
-                return;
-            }
-        };
-
-        let topic = gossipsub::IdentTopic::new(LATTICE_BLOCK_TOPIC);
-        self.track_outbound(&raw);
-        match self.swarm.behaviour_mut().gossipsub.publish(topic, raw) {
-            Ok(msg_id) => {
-                tracing::info!(
-                    epoch = block.epoch,
-                    proposal_id = %block.proposal_id,
-                    message_id = %msg_id,
-                    "[block-publish] RatificationBlock broadcast to mesh (Era Two, 0x02)"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    epoch = block.epoch,
-                    proposal_id = %block.proposal_id,
-                    error = %e,
-                    "[block-publish] Failed to publish RatificationBlock"
-                );
-            }
-        }
-    }
-
     /// Handle an Era Two RatificationBlock received via `lattice/block/v1`.
     /// Verifies roots against local state.  If they match, commits the
     /// epoch boundary via CommitManager for persistence + catch-up.
@@ -1075,15 +1040,6 @@ impl LatticeNode {
             return;
         }
 
-        // ── Era Two: RatificationBlock (0x02 prefix) ─────────────
-        if data[0] == ERA_TWO_BLOCK_MARKER {
-            // Pass full bytes including prefix — the RatificationBlock
-            // encode_wire() output is already prefixed, and we store it
-            // as-is so catch-up can serve it transparently.
-            self.handle_ratification_block(data, propagation_source);
-            return;
-        }
-
         // ── Era One: legacy block frame ─────────────────────────
         if data[0] != ERA_ONE_BLOCK_MARKER {
             // No prefix byte at all — treat as legacy Era One for
@@ -1167,6 +1123,12 @@ impl LatticeNode {
                 return;
             }
             let cert_bytes = &data[offset + 4..cert_end];
+
+            // ── Era Two: RatificationBlock (0x02 prefix inside cert_bytes) ─
+            if !cert_bytes.is_empty() && cert_bytes[0] == ERA_TWO_BLOCK_MARKER {
+                self.handle_ratification_block(cert_bytes, propagation_source);
+                return;
+            }
 
             let stx = match serde_cbor::from_slice::<crate::ledger::types::SignedTransaction>(cert_bytes) {
                 Ok(s) => s,
@@ -1872,7 +1834,7 @@ impl LatticeNode {
                         hash = %hex::encode(block_hash),
                         "[ratification] RatificationBlock committed — broadcasting to mesh"
                     );
-                    self.publish_ratification_block(&block);
+                    self.publish_committed_block(&proposal_id);
                 }
                 Err(e) => {
                     tracing::error!(

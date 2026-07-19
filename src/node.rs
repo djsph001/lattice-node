@@ -330,6 +330,9 @@ pub struct LatticeNode {
     /// ledger mutations are gated. The node still relays gossip traffic
     /// (Phase 10b: public relay safety).
     no_economics: bool,
+    /// Force Era Two block production regardless of bootstrap state.
+    /// Bypasses is_bootstrap_ended() gate for testing/development.
+    force_era_two: bool,
     /// Phase 11: thickness floor weight for sortition (security parameter).
     /// Pinned to 1/T_min where T_min is expected minimum honest thickness.
     floor_weight: f64,
@@ -379,6 +382,7 @@ impl LatticeNode {
         density_margin: f64,
         thickness_gauge: f64,
         genesis_root: Option<String>,
+        force_era_two: bool,
     ) -> Result<Self> {
         let key_path = resolve_identity_path(identity_dir)?;
         let local_key = load_or_generate_identity(&key_path, fresh_identity)?;
@@ -619,6 +623,7 @@ impl LatticeNode {
             max_model_size,
             vram_bytes,
             no_economics,
+            force_era_two,
             floor_weight,
             density_margin,
             thickness_gauge,
@@ -1828,8 +1833,8 @@ impl LatticeNode {
         // ── Era Two: produce RatificationBlock ────────────────────
         // After economic cycle completes and roots are computed, the
         // sortitioned block producer assembles and broadcasts the
-        // ratification block.  Gated behind BootstrapEnded.
-        if self.commit_manager.is_bootstrap_ended() {
+        // ratification block.  Gated behind BootstrapEnded (or --force-era-two).
+        if self.commit_manager.is_bootstrap_ended() || self.force_era_two {
             let state_root = self.ledger.state_root(&self.seen_nonces);
             let thickness_root = self.ledger.thickness_graph.thickness_root();
             let proposal_id = format!("epoch-{epoch}");

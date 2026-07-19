@@ -224,6 +224,12 @@ struct Cli {
     /// Defaults to time.apple.com, time.google.com, pool.ntp.org.
     #[arg(long, value_name = "SERVER")]
     ntp_server: Option<Vec<String>>,
+    /// Force Era Two block production regardless of bootstrap state.
+    /// Bypasses is_bootstrap_ended() gate — for testing and
+    /// development only.  In production, Era Two activates after
+    /// Genesis + BootstrapEnded blocks are committed.
+    #[arg(long, default_value_t = false)]
+    force_era_two: bool,
 }
 
 #[tokio::main]
@@ -309,6 +315,7 @@ async fn main() -> Result<()> {
         cli.density_margin,
         cli.thickness_gauge,
         cli.genesis_root,
+        cli.force_era_two,
     )?;
 
     info!(

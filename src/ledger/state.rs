@@ -45,7 +45,7 @@ const VERIFICATION_INTERVAL: u64 = 5;
 /// tracks balances as this node sees them.
 #[derive(Debug)]
 pub struct LedgerState {
-    balances: HashMap<PeerId, DigitalUtilityUnit>,
+    pub balances: HashMap<PeerId, DigitalUtilityUnit>,
     /// Resource claims tracked by this node, keyed by resource_id.
     claims: HashMap<[u8; 32], ResourceClaim>,
     /// Thickness provenance graph — tracks contribution-derived and

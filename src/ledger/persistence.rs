@@ -10,28 +10,52 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::thickness::ThicknessGraph;
-use super::types::SignedTransaction;
+use super::types::{DigitalUtilityUnit, SignedTransaction};
 
 // ── Persistent state (serializable) ──────────────────────────────
 
 /// Components of economic state that survive restarts.
 /// Transient buffers (tx_store, pending, outbound) repopulate from gossip.
-/// 
-/// NOTE: ThicknessGraph is complex to serialize (contains PeerId keys
-/// that don't implement serde). We store seen_nonces in the snapshot;
-/// the thickness graph is reconstructed from WAL replay on startup.
-/// A full snapshot (graph + nonces) is a future optimization.
 #[derive(Serialize, Deserialize)]
 pub struct PersistentEconomicState {
     /// Per-peer highest applied nonce, keyed by base58 PeerId string.
     pub seen_nonces: HashMap<String, u64>,
+    /// Per-peer balance in DUUs, keyed by base58 PeerId string.
+    pub balances: HashMap<String, u64>,
+    /// Thickness graph edges, keyed by base58 PeerId string.
+    /// Each edge is (target_peer_base58, weight).
+    pub thickness_edges: HashMap<String, Vec<(String, i64)>>,
 }
 
 impl PersistentEconomicState {
     pub fn new() -> Self {
         Self {
             seen_nonces: HashMap::new(),
+            balances: HashMap::new(),
+            thickness_edges: HashMap::new(),
         }
+    }
+
+    /// Build from in-memory state.
+    pub fn from_state(
+        nonces: &HashMap<PeerId, u64>,
+        balances: &HashMap<PeerId, DigitalUtilityUnit>,
+        thickness: &ThicknessGraph,
+    ) -> Self {
+        Self {
+            seen_nonces: nonces.iter().map(|(k, v)| (k.to_base58(), *v)).collect(),
+            balances: balances.iter().map(|(k, v)| (k.to_base58(), v.0)).collect(),
+            thickness_edges: thickness.export_edges(),
+        }
+    }
+
+    /// Hydrate back into in-memory structures.
+    pub fn export_state(&self) -> (HashMap<PeerId, u64>, HashMap<PeerId, DigitalUtilityUnit>) {
+        let nonces = self.export_nonces();
+        let balances = self.balances.iter()
+            .filter_map(|(k, v)| k.parse::<PeerId>().ok().map(|pid| (pid, DigitalUtilityUnit(*v))))
+            .collect();
+        (nonces, balances)
     }
 
     /// Import seen_nonces from the node's in-memory HashMap.

@@ -1499,6 +1499,8 @@ impl LatticeNode {
 
     /// Run one economic epoch: measure contribution, mint reward, tax & redistribute.
     async fn run_economic_epoch(&mut self) {
+        use crate::ledger::persistence::PersistentEconomicState;
+        use crate::ledger::persistence::StateStore;
         // Phase 10b: public relay safety — don't mint or participate
         // in economic cycles when running as a pure relay.
         if self.no_economics {
@@ -1631,6 +1633,20 @@ impl LatticeNode {
             ratio = %format!("{:.2}", ratio),
             "Epoch complete"
         );
+
+        // Save economic snapshot every 10 epochs (balances + thickness survive restart)
+        if epoch % 10 == 0 {
+            if let Some(ref mut store) = self.state_store {
+                let snapshot = PersistentEconomicState::from_state(
+                    &self.seen_nonces,
+                    &self.ledger.balances,
+                    &self.ledger.thickness_graph,
+                );
+                if let Err(e) = store.take_snapshot(&snapshot) {
+                    warn!(error = %e, "Failed to save economic snapshot");
+                }
+            }
+        }
 
         // Legibility: if we have peers but earned nothing, explain why.
         // Relaying is a three-party act — at n=2, every message is origin,
@@ -1861,7 +1877,7 @@ impl LatticeNode {
     /// node's seen_nonces from the snapshot, so transactions that
     /// were applied before a restart are not re-processed.
     pub fn enable_persistence(&mut self, data_dir: &std::path::Path) -> Result<()> {
-        use crate::ledger::persistence::{StateStore, WalStateStore, WalStateStoreConfig};
+        use crate::ledger::persistence::{PersistentEconomicState, StateStore, WalStateStore, WalStateStoreConfig};
         let config = WalStateStoreConfig {
             data_dir: data_dir.join("persistence"),
             fsync_batch_size: 100,

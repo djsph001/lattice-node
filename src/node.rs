@@ -806,7 +806,7 @@ impl LatticeNode {
     /// If they mismatch, logs a state fork warning and drops the block.
     fn handle_ratification_block(&mut self, data: &[u8], propagation_source: &PeerId) {
         // data includes the ERA_TWO_BLOCK_MARKER prefix byte
-        let block = match RatificationBlock::decode_wire(&data[1..]) {
+        let block = match RatificationBlock::decode_body(&data[1..]) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(
@@ -2426,7 +2426,7 @@ impl LatticeNode {
                             // Era Two v2: RatificationBlock CBOR (0x02 prefix)
                             let proposal_id: String =
                                 if wire.cert_bytes.first() == Some(&ERA_TWO_BLOCK_MARKER) {
-                                    match RatificationBlock::decode_wire(&wire.cert_bytes[1..]) {
+                                    match RatificationBlock::decode_body(&wire.cert_bytes[1..]) {
                                         Ok(rb) => rb.proposal_id.clone(),
                                         Err(_) => hex::encode(wire.block_hash),
                                     }
@@ -2445,20 +2445,31 @@ impl LatticeNode {
 
                             // ── Era Two: verify state roots before committing ──
                             if wire.cert_bytes.first() == Some(&ERA_TWO_BLOCK_MARKER) {
-                                if let Ok(rb) = RatificationBlock::decode_wire(&wire.cert_bytes[1..]) {
+                                if let Ok(rb) = RatificationBlock::decode_body(&wire.cert_bytes[1..]) {
                                     let local_state = self.ledger.state_root(&self.seen_nonces);
                                     let local_thickness = self.ledger.thickness_graph.thickness_root();
                                     if rb.state_root != local_state || rb.thickness_root != local_thickness {
-                                        warn!(
-                                            height = wire.height,
-                                            state_match = rb.state_root == local_state,
-                                            thickness_match = rb.thickness_root == local_thickness,
-                                            "[chain-sync] RatificationBlock root mismatch during full catch-up — state will converge after replay (cold start)"
-                                        );
-                                        // Don't reject — catch-up from genesis means local state hasn't
-                                        // been built yet. State roots converge after all blocks are
-                                        // applied. Live gossip path (handle_ratification_block) enforces
-                                        // strict root verification for incremental blocks.
+                                        // Only waive root verification on a true cold start. If we
+                                        // have already built partial state, a mismatch is a real fork.
+                                        let cold_start = self.ledger.balances.is_empty()
+                                            && self.seen_nonces.is_empty()
+                                            && self.ledger.thickness_graph.peer_count() == 0;
+                                        if cold_start {
+                                            warn!(
+                                                height = wire.height,
+                                                state_match = rb.state_root == local_state,
+                                                thickness_match = rb.thickness_root == local_thickness,
+                                                "[chain-sync] RatificationBlock root mismatch on cold start — waiving verification, state will converge after replay"
+                                            );
+                                        } else {
+                                            warn!(
+                                                height = wire.height,
+                                                state_match = rb.state_root == local_state,
+                                                thickness_match = rb.thickness_root == local_thickness,
+                                                "[chain-sync] RatificationBlock root mismatch after partial sync — rejecting fork"
+                                            );
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -5636,7 +5647,7 @@ mod ratification_block_tests {
         // First byte must be ERA_TWO_BLOCK_MARKER
         assert_eq!(encoded[0], ERA_TWO_BLOCK_MARKER);
 
-        let decoded = RatificationBlock::decode_wire(&encoded[1..])
+        let decoded = RatificationBlock::decode_body(&encoded[1..])
             .expect("decode must succeed");
         assert_eq!(decoded, block);
     }

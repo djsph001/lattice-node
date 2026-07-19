@@ -344,6 +344,10 @@ pub struct WireBlock {
 /// Prepended to every `cert_bytes` payload before broadcasting on
 /// `lattice/block/v1`.  Receivers read the first byte to choose the
 /// correct deserializer.
+///
+/// ERA_ONE_BLOCK_MARKER is reserved for future use. Era One blocks are
+/// currently emitted without a prefix for backward compatibility; the
+/// receiver treats a leading 0x01 as an optional prefix and strips it.
 pub const ERA_ONE_BLOCK_MARKER: u8 = 0x01;
 pub const ERA_TWO_BLOCK_MARKER: u8 = 0x02;
 
@@ -368,9 +372,9 @@ impl RatificationBlock {
         Ok(buf)
     }
 
-    /// Decode from wire bytes that start with ERA_TWO_BLOCK_MARKER.
-    /// The marker byte must already be consumed by the caller.
-    pub fn decode_wire(data: &[u8]) -> Result<Self, String> {
+    /// Decode from the CBOR body of a wire payload. The ERA_TWO_BLOCK_MARKER
+    /// prefix byte must already be consumed by the caller.
+    pub fn decode_body(data: &[u8]) -> Result<Self, String> {
         serde_cbor::from_slice(data)
             .map_err(|e| format!("RatificationBlock decode failed: {e}"))
     }

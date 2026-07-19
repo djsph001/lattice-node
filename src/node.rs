@@ -53,9 +53,14 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How old an outstanding fetch request must be before it is evicted
 /// by the periodic sweep.  600s = 10 minutes, well beyond any legitimate
-/// mesh recovery time.  The aged threshold (FETCH_TIMEOUT * 10 = 50s)
-/// flags entries for attention; this threshold is where they are deleted.
+/// network latency, short enough to bound memory on a healthy mesh.
 const FETCH_EVICTION_THRESHOLD: Duration = Duration::from_secs(600);
+
+/// How old an outbound queue entry must be before the periodic sweep
+/// evicts it.  600s = 10 minutes, same rationale as the fetch sweep.
+/// An evicted entry's transaction is not lost — it will be re-broadcast
+/// by the normal gossip path on the next trigger event.
+const OUTBOUND_SWEEP_THRESHOLD: Duration = Duration::from_secs(600);
 
 /// How long without a heartbeat before a peer is flagged as silent.
 /// 30s = 3× heartbeat interval (10s).
@@ -186,6 +191,11 @@ pub struct LatticeNode {
     /// by the periodic sweep.  Logged when > 0.  Tracks the sweep's
     /// effectiveness across restarts (in-memory only — not persisted).
     total_evicted_fetches: usize,
+    /// Tracks when each outbound queue entry was inserted, so the
+    /// periodic sweep can evict entries that have been stuck for more
+    /// than OUTBOUND_SWEEP_THRESHOLD (600s).  Keyed by (signer, nonce)
+    /// matching the outbound map.
+    outbound_insertion_times: HashMap<(PeerId, u64), Instant>,
     /// Peers evicted as zombies, awaiting reconnect. Cleared on
     /// ConnectionEstablished or after RECONNECT_TIMEOUT_SECS (ERROR).
     pending_reconnect: HashMap<PeerId, Instant>,
@@ -552,6 +562,7 @@ impl LatticeNode {
             pending: HashMap::new(),
             outstanding_fetches: HashMap::new(),
             total_evicted_fetches: 0,
+            outbound_insertion_times: HashMap::new(),
             pending_reconnect: HashMap::new(),
             evictions_last_minute: VecDeque::new(),
             last_max_peer_silence: 0,
@@ -1237,6 +1248,7 @@ impl LatticeNode {
                     self.broadcast_heartbeat().await;
                     // Sweep stale fetch entries before computing metrics
                     self.sweep_stale_fetches();
+                    self.sweep_stale_outbound();
                     // Check peer liveness — evict zombies
                     self.check_peer_liveness();
                     // ── Metrics ────────────────────────────────────
@@ -1392,11 +1404,14 @@ impl LatticeNode {
                 for (peer, nonce) in seen {
                     self.seen_nonces.insert(peer, nonce);
                 }
-                // Insert into outbound queue and flush.
+                // Insert into outbound queue and flush (mint).
                 self.outbound
                     .entry(self.local_peer_id)
                     .or_default()
                     .insert(self.tx_nonce, signed);
+                self.outbound_insertion_times.insert(
+                    (self.local_peer_id, self.tx_nonce), Instant::now(),
+                );
                 self.flush_outbound();
                 self.economic_engine.metrics.record_transaction_submitted();
             }
@@ -1423,11 +1438,14 @@ impl LatticeNode {
                 for (peer, nonce) in seen {
                     self.seen_nonces.insert(peer, nonce);
                 }
-                // Insert into outbound queue and flush.
+                // Insert into outbound queue and flush (mint).
                 self.outbound
                     .entry(self.local_peer_id)
                     .or_default()
                     .insert(self.tx_nonce, signed);
+                self.outbound_insertion_times.insert(
+                    (self.local_peer_id, self.tx_nonce), Instant::now(),
+                );
                 self.flush_outbound();
                 self.economic_engine.metrics.record_transaction_submitted();
             }
@@ -1639,6 +1657,8 @@ impl LatticeNode {
                                 if queue.is_empty() {
                                     self.outbound.remove(&signer);
                                 }
+                                // Clean up insertion time tracker
+                                self.outbound_insertion_times.remove(&(signer, nonce));
                             }
                         }
                     }
@@ -2315,6 +2335,54 @@ impl LatticeNode {
             info!(
                 "swept {} stale fetch entries (total evicted: {})",
                 evicted, self.total_evicted_fetches
+            );
+        }
+    }
+
+    /// Sweep stale entries from the outbound queue.
+    /// Entries older than OUTBOUND_SWEEP_THRESHOLD (600s) are removed.
+    /// Runs on every heartbeat tick, after sweep_stale_fetches.
+    fn sweep_stale_outbound(&mut self) {
+        let now = Instant::now();
+        let mut evicted_total = 0usize;
+
+        // Collect stale entries with a simple loop to avoid closure borrow issues
+        let stale: Vec<(PeerId, u64)> = {
+            let mut s = Vec::new();
+            for (&peer, queue) in &self.outbound {
+                for &nonce in queue.keys() {
+                    let aged = self.outbound_insertion_times
+                        .get(&(peer, nonce))
+                        .map_or(true, |inserted| now.duration_since(*inserted) >= OUTBOUND_SWEEP_THRESHOLD);
+                    if aged {
+                        s.push((peer, nonce));
+                    }
+                }
+            }
+            s
+        };
+
+        for (peer, nonce) in stale {
+            if let Some(queue) = self.outbound.get_mut(&peer) {
+                queue.remove(&nonce);
+                self.outbound_insertion_times.remove(&(peer, nonce));
+                evicted_total += 1;
+            }
+        }
+        // Clean up empty peer entries
+        let empty_peers: Vec<PeerId> = self.outbound
+            .iter()
+            .filter(|(_, q)| q.is_empty())
+            .map(|(&p, _)| p)
+            .collect();
+        for peer in empty_peers {
+            self.outbound.remove(&peer);
+        }
+
+        if evicted_total > 0 {
+            info!(
+                "[outbound-sweep] Evicted {} stale entries",
+                evicted_total,
             );
         }
     }

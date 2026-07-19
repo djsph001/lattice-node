@@ -278,9 +278,9 @@ pub struct LatticeNode {
     /// recent escalation participation (last 3 rounds).
     escalation_exclusions: Vec<PeerId>,
     /// Witness signatures collected per proposal_id.
-    /// Key: proposal_id, Value: list of (peer_id, signature) pairs.
+    /// Key: proposal_id, Value: list of (peer_id, signature, public_key) triples.
     /// When 3-of-5 threshold is met, the certificate is ratified.
-    witness_sigs: HashMap<String, Vec<(PeerId, Vec<u8>)>>,
+    witness_sigs: HashMap<String, Vec<(PeerId, Vec<u8>, Vec<u8>)>>,
 
     // ── Phase 7: commit layer ───────────────────────────────
     /// Raw protobuf bytes of decoded certificates, keyed by
@@ -761,6 +761,163 @@ impl LatticeNode {
                     proposal_id,
                     error = %e,
                     "[block-publish] Failed to publish block"
+                );
+            }
+        }
+    }
+
+    /// Encode a verified quorum certificate (QC) for gossip on the
+    /// enclave-cert topic. Uses marker byte 0x02.
+    ///
+    /// Wire format:
+    ///   [0x02] [2-byte pid_len] [proposal_id]
+    ///   [4-byte cert_len] [cert protobuf bytes]
+    ///   [2-byte sig_count] ([2-byte pubkey_len] [pubkey] [2-byte sig_len] [sig]) ...
+    fn encode_quorum_certificate(
+        proposal_id: &str,
+        cert_bytes: &[u8],
+        sigs: &[(PeerId, Vec<u8>, Vec<u8>)],
+    ) -> Vec<u8> {
+        let pid_bytes = proposal_id.as_bytes();
+        let mut qc = Vec::with_capacity(
+            1 + 2 + pid_bytes.len()
+                + 4 + cert_bytes.len()
+                + 2
+                + sigs
+                    .iter()
+                    .map(|(_, sig, pk)| 2 + pk.len() + 2 + sig.len())
+                    .sum::<usize>(),
+        );
+        qc.push(0x02);
+        qc.extend_from_slice(&(pid_bytes.len() as u16).to_be_bytes());
+        qc.extend_from_slice(pid_bytes);
+        qc.extend_from_slice(&(cert_bytes.len() as u32).to_be_bytes());
+        qc.extend_from_slice(cert_bytes);
+        qc.extend_from_slice(&(sigs.len() as u16).to_be_bytes());
+        for (_peer_id, sig, pk) in sigs {
+            qc.extend_from_slice(&(pk.len() as u16).to_be_bytes());
+            qc.extend_from_slice(pk);
+            qc.extend_from_slice(&(sig.len() as u16).to_be_bytes());
+            qc.extend_from_slice(sig);
+        }
+        qc
+    }
+
+    /// Decode and cryptographically verify a QC message (marker 0x02).
+    /// On success returns (proposal_id, cert_bytes, verified_signatures).
+    /// Invalid signatures are dropped; the caller checks the count.
+    fn decode_and_verify_quorum_certificate(
+        data: &[u8],
+    ) -> Option<(String, Vec<u8>, Vec<(PeerId, Vec<u8>, Vec<u8>)>)> {
+        use prost::Message;
+        // Skip 0x02 marker
+        let rest = &data[1..];
+        if rest.len() < 2 {
+            return None;
+        }
+
+        // Parse proposal_id
+        let pid_len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+        let after_pid = 2 + pid_len;
+        if rest.len() < after_pid {
+            return None;
+        }
+        let proposal_id = std::str::from_utf8(&rest[2..after_pid]).ok()?.to_string();
+
+        // Parse cert_bytes
+        let rest = &rest[after_pid..];
+        if rest.len() < 4 {
+            return None;
+        }
+        let cert_len = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+        let after_cert = 4 + cert_len;
+        if rest.len() < after_cert {
+            return None;
+        }
+        let cert_bytes = rest[4..after_cert].to_vec();
+
+        // Decode certificate and sanity-check proposal_id
+        let cert = crate::ingest::proto::ImpactCertificate::decode(&cert_bytes[..]).ok()?;
+        if cert.proposal_id != proposal_id {
+            return None;
+        }
+
+        // Parse signatures
+        let rest = &rest[after_cert..];
+        if rest.len() < 2 {
+            return None;
+        }
+        let sig_count = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+        let mut offset = 2;
+        let mut verified = Vec::with_capacity(sig_count);
+
+        for _ in 0..sig_count {
+            if rest.len() < offset + 2 {
+                return None;
+            }
+            let pk_len = u16::from_be_bytes([rest[offset], rest[offset + 1]]) as usize;
+            offset += 2;
+            if rest.len() < offset + pk_len {
+                return None;
+            }
+            let pk_bytes = &rest[offset..offset + pk_len];
+            offset += pk_len;
+
+            if rest.len() < offset + 2 {
+                return None;
+            }
+            let sig_len = u16::from_be_bytes([rest[offset], rest[offset + 1]]) as usize;
+            offset += 2;
+            if rest.len() < offset + sig_len {
+                return None;
+            }
+            let sig = &rest[offset..offset + sig_len];
+            offset += sig_len;
+
+            let pubkey = libp2p::identity::PublicKey::try_decode_protobuf(pk_bytes).ok()?;
+            let signer_peer_id = pubkey.to_peer_id();
+            if !pubkey.verify(proposal_id.as_bytes(), sig) {
+                continue;
+            }
+            verified.push((signer_peer_id, sig.to_vec(), pk_bytes.to_vec()));
+        }
+
+        Some((proposal_id, cert_bytes, verified))
+    }
+
+    /// Assemble and broadcast a verified quorum certificate (QC) on the
+    /// enclave-cert topic. Uses marker byte 0x02. Carries the certificate
+    /// bytes plus (public_key, signature) pairs so peers can verify the
+    /// quorum without having seen every individual attestation.
+    fn publish_quorum_certificate(
+        &mut self,
+        proposal_id: &str,
+        sigs: &[(PeerId, Vec<u8>, Vec<u8>)],
+    ) {
+        let Some(cert_bytes) = self.cert_cache.get(proposal_id) else {
+            warn!(
+                proposal_id = %proposal_id,
+                "[qc-publish] Cert not in cache — cannot broadcast QC"
+            );
+            return;
+        };
+
+        let qc = Self::encode_quorum_certificate(proposal_id, cert_bytes, sigs);
+        let topic = gossipsub::IdentTopic::new(LATTICE_ENCLAVE_CERT_TOPIC);
+        self.track_outbound(&qc);
+        match self.swarm.behaviour_mut().gossipsub.publish(topic, qc) {
+            Ok(msg_id) => {
+                info!(
+                    proposal_id = %proposal_id,
+                    message_id = %msg_id,
+                    "[qc-publish] Quorum certificate broadcast to mesh"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    proposal_id = %proposal_id,
+                    error = %e,
+                    "[qc-publish] Failed to publish quorum certificate"
                 );
             }
         }
@@ -2582,6 +2739,14 @@ impl LatticeNode {
                 self.handle_witness_attestation(data, propagation_source);
                 return;
             }
+
+            // ── Phase 7: verified quorum certificate handler ────
+            // Messages starting with 0x02 carry a full certificate plus
+            // the 3-of-5 witness signatures. Verify and commit locally.
+            if data.first() == Some(&0x02) {
+                self.handle_quorum_certificate(data, propagation_source);
+                return;
+            }
         }
 
         let msg: LatticeMessage = match crate::message::codec::decode(data) {
@@ -3741,13 +3906,13 @@ impl LatticeNode {
                 }
             };
 
+            let pubkey_bytes = self.local_key.public().encode_protobuf();
             self.witness_sigs
                 .entry(cert.proposal_id.clone())
                 .or_default()
-                .push((self.local_peer_id, sig.clone()));
+                .push((self.local_peer_id, sig.clone(), pubkey_bytes.clone()));
 
             let pid_bytes = cert.proposal_id.as_bytes();
-            let pubkey_bytes = self.local_key.public().encode_protobuf();
             let mut attestation = Vec::with_capacity(
                 1 + 2 + pid_bytes.len() + 2 + pubkey_bytes.len() + 2 + sig.len(),
             );
@@ -3877,7 +4042,7 @@ impl LatticeNode {
         let sigs = self.witness_sigs.entry(proposal_id.clone()).or_default();
 
         // Deduplicate — one sig per peer
-        if sigs.iter().any(|(pid, _)| *pid == signer_peer_id) {
+        if sigs.iter().any(|(pid, _, _)| *pid == signer_peer_id) {
             debug!(
                 proposal_id = %proposal_id,
                 signer = %signer_peer_id,
@@ -3886,7 +4051,7 @@ impl LatticeNode {
             return;
         }
 
-        sigs.push((signer_peer_id, sig.to_vec()));
+        sigs.push((signer_peer_id, sig.to_vec(), pk_bytes.to_vec()));
         let count = sigs.len();
 
         info!(
@@ -3899,6 +4064,10 @@ impl LatticeNode {
 
         // Check quorum — when reached, commit to the hash-chain ledger
         if count >= 3 {
+            // Clone signatures and release the borrow on witness_sigs before
+            // we call other &mut self methods (commit_manager, gossipsub).
+            let sigs: Vec<(PeerId, Vec<u8>, Vec<u8>)> = sigs.clone();
+
             // Dedup guard: skip if already committed (trailing attestations)
             if self.commit_manager.is_committed(&proposal_id) {
                 debug!(
@@ -3910,7 +4079,7 @@ impl LatticeNode {
 
             info!(
                 proposal_id = %proposal_id,
-                signers = ?sigs.iter().map(|(pid, _)| pid.to_string()).collect::<Vec<_>>(),
+                signers = ?sigs.iter().map(|(pid, _, _)| pid.to_string()).collect::<Vec<_>>(),
                 "═══════════════════════════════════════════\n\
                  [RATIFIED] 3-of-5 witness quorum reached!\n\
                  Certificate {} is now State 3: Ratified\n\
@@ -3922,10 +4091,17 @@ impl LatticeNode {
             // Write the ratified certificate and its signatures
             // to the append-only Blake3 hash-chain ledger.
             if let Some(cert_bytes) = self.cert_cache.get(&proposal_id) {
+                // The ledger frame stores (peer_id, signature) pairs; public
+                // keys travel in the gossiped QC message for verification.
+                let sigs_2tuple: Vec<(PeerId, Vec<u8>)> = sigs
+                    .iter()
+                    .map(|(pid, sig, _)| (*pid, sig.clone()))
+                    .collect();
+
                 match self.commit_manager.commit(
                     cert_bytes,
                     &proposal_id,
-                    sigs,
+                    &sigs_2tuple,
                 ) {
                     Ok(block_hash) => {
                         info!(
@@ -3938,8 +4114,8 @@ impl LatticeNode {
                              ═══════════════════════════════════════════",
                             self.commit_manager.height()
                         );
-                        // Broadcast the ratified block to peers.
-                        self.publish_committed_block(&proposal_id);
+                        // Gossip the verified QC so all nodes can commit.
+                        self.publish_quorum_certificate(&proposal_id, &sigs);
                     }
                     Err(e) => {
                         error!(
@@ -3953,6 +4129,80 @@ impl LatticeNode {
                 warn!(
                     proposal_id = %proposal_id,
                     "[commit] Cert not in cache — cannot commit"
+                );
+            }
+        }
+    }
+
+    /// Handle an incoming verified quorum certificate (QC), marker 0x02.
+    ///
+    /// Wire format:
+    ///   [0x02] [2-byte pid_len] [proposal_id]
+    ///   [4-byte cert_len] [cert protobuf bytes]
+    ///   [2-byte sig_count] ([2-byte pubkey_len] [pubkey] [2-byte sig_len] [sig]) ...
+    ///
+    /// Verifies the embedded 3-of-5 signatures over proposal_id, then commits
+    /// the certificate to the local hash-chain ledger. This is the Era Two
+    /// gossip path that lets every node commit ratified certificates, not
+    /// just the node that assembled the quorum.
+    fn handle_quorum_certificate(&mut self, data: &[u8], propagation_source: PeerId) {
+        let (proposal_id, cert_bytes, sigs_3tuple) =
+            match Self::decode_and_verify_quorum_certificate(data) {
+                Some(result) => result,
+                None => {
+                    warn!("[qc-recv] Failed to decode/verify quorum certificate");
+                    return;
+                }
+            };
+
+        if sigs_3tuple.len() < 3 {
+            warn!(
+                proposal_id = %proposal_id,
+                valid = sigs_3tuple.len(),
+                required = 3,
+                "[qc-recv] Insufficient valid signatures"
+            );
+            return;
+        }
+
+        info!(
+            proposal_id = %proposal_id,
+            signers = ?sigs_3tuple.iter().map(|(pid, _, _)| pid.to_string()).collect::<Vec<_>>(),
+            from = %propagation_source,
+            "[qc-recv] Quorum certificate verified ✓"
+        );
+
+        // Cache the raw certificate so the commit layer can write it
+        self.cert_cache.insert(proposal_id.clone(), cert_bytes.clone());
+
+        // Commit if not already
+        if self.commit_manager.is_committed(&proposal_id) {
+            debug!(
+                proposal_id = %proposal_id,
+                "[qc-recv] Certificate already committed"
+            );
+            return;
+        }
+
+        let sigs_2tuple: Vec<(PeerId, Vec<u8>)> = sigs_3tuple
+            .iter()
+            .map(|(pid, sig, _)| (*pid, sig.clone()))
+            .collect();
+
+        match self.commit_manager.commit(&cert_bytes, &proposal_id, &sigs_2tuple) {
+            Ok(block_hash) => {
+                info!(
+                    proposal_id = %proposal_id,
+                    block_hash = %hex::encode(block_hash),
+                    height = self.commit_manager.height(),
+                    "[qc-recv] Certificate committed to local chain"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    proposal_id = %proposal_id,
+                    error = %e,
+                    "[qc-recv] Failed to commit certificate"
                 );
             }
         }

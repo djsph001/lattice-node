@@ -27,6 +27,12 @@ pub fn floor_weight(gauge: f64) -> f64 {
     10_000.0 / gauge
 }
 
+/// Calculate thickness minted from a verified storage claim.
+/// Pure function — makes the formula testable without a full `LedgerState`.
+pub fn calculate_storage_thickness(size_bytes: u64, tenure_health: f64, gauge: f64) -> f64 {
+    (size_bytes as f64 * tenure_health) / gauge
+}
+
 /// How many epochs must pass before a previously-verified claim
 /// is due for re-verification.
 const VERIFICATION_INTERVAL: u64 = 5;
@@ -222,6 +228,30 @@ impl LedgerState {
         self.claims.values()
     }
 
+    /// Compute a deterministic state root for Era Two ratification blocks.
+    /// Hashes balances (sorted by PeerId) and nonces (sorted by PeerId).
+    /// All honest nodes processing the same epoch arrive at the same root.
+    pub fn state_root(&self, nonces: &HashMap<PeerId, u64>) -> [u8; 32] {
+        // Sort balances by PeerId — critical for determinism across nodes
+        let mut sorted_balances: Vec<(&PeerId, &DigitalUtilityUnit)> = self.balances.iter().collect();
+        sorted_balances.sort_by_key(|(peer, _)| *peer);
+
+        // Sort nonces by PeerId — same reason
+        let mut sorted_nonces: Vec<(&PeerId, &u64)> = nonces.iter().collect();
+        sorted_nonces.sort_by_key(|(peer, _)| *peer);
+
+        let mut hasher = blake3::Hasher::new();
+        for (peer, balance) in &sorted_balances {
+            hasher.update(peer.to_bytes().as_slice());
+            hasher.update(&balance.0.to_le_bytes());
+        }
+        for (peer, nonce) in &sorted_nonces {
+            hasher.update(peer.to_bytes().as_slice());
+            hasher.update(&nonce.to_le_bytes());
+        }
+        *hasher.finalize().as_bytes()
+    }
+
     // ── Phase 6: verification tracking ────────────────────
 
     /// Record a successful storage verification.
@@ -258,9 +288,9 @@ impl LedgerState {
 
         // Layer 1 thickness: verified storage contribution mints thickness.
         // This is the ONLY source of NEW thickness in the provenance graph.
-        // Amount = size_bytes × tenure_health / THICKNESS_GAUGE.
         // The gauge is a unit definition, not a security parameter.
-        let thickness_amount = (claim.size_bytes as f64 * claim.tenure_health) / THICKNESS_GAUGE;
+        let thickness_amount =
+            calculate_storage_thickness(claim.size_bytes, claim.tenure_health, THICKNESS_GAUGE);
         if thickness_amount > 0.0 {
             self.thickness_graph.add_verified_contribution(
                 peer,
@@ -338,6 +368,23 @@ mod tests {
     use chrono::Utc;
 
     #[test]
+    fn storage_thickness_scales_with_gauge() {
+        let size = 10_000_000; // 10 MiB
+        let health = 1.0;
+        let t1 = calculate_storage_thickness(size, health, 1_000_000.0);
+        let t2 = calculate_storage_thickness(size, health, 2_000_000.0);
+        assert!((t1 - 10.0).abs() < 0.001);
+        assert!((t2 - 5.0).abs() < 0.001);
+        assert!((t1 / t2 - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zero_health_or_zero_size_yields_zero_thickness() {
+        assert_eq!(calculate_storage_thickness(1_000_000, 0.0, 1_000_000.0), 0.0);
+        assert_eq!(calculate_storage_thickness(0, 1.0, 1_000_000.0), 0.0);
+    }
+
+    #[test]
     fn transfer_moves_units() {
         let mut state = LedgerState::new();
         let alice: PeerId = PeerId::random();
@@ -356,6 +403,39 @@ mod tests {
         state.apply_transaction(&tx).unwrap();
         assert_eq!(state.balance_of(&alice), DigitalUtilityUnit(700));
         assert_eq!(state.balance_of(&bob), DigitalUtilityUnit(300));
+    }
+
+    #[test]
+    fn test_state_root_deterministic() {
+        // Same state inserted in different orders → same root
+        use std::collections::HashMap;
+        let mut state1 = LedgerState::new();
+        let mut state2 = LedgerState::new();
+
+        let alice = PeerId::random();
+        let bob = PeerId::random();
+        let charlie = PeerId::random();
+
+        // State 1: Alice first, then Bob, then Charlie
+        state1.set_balance(&alice, DigitalUtilityUnit(100));
+        state1.set_balance(&bob, DigitalUtilityUnit(200));
+        state1.set_balance(&charlie, DigitalUtilityUnit(300));
+
+        // State 2: Charlie first, then Bob, then Alice
+        state2.set_balance(&charlie, DigitalUtilityUnit(300));
+        state2.set_balance(&alice, DigitalUtilityUnit(100));
+        state2.set_balance(&bob, DigitalUtilityUnit(200));
+
+        let mut nonces1 = HashMap::new();
+        nonces1.insert(alice, 10u64);
+        nonces1.insert(bob, 20u64);
+
+        let mut nonces2 = HashMap::new();
+        nonces2.insert(bob, 20u64);
+        nonces2.insert(alice, 10u64);
+
+        assert_eq!(state1.state_root(&nonces1), state2.state_root(&nonces2),
+            "identical state with different insertion order must produce same root");
     }
 
     #[test]

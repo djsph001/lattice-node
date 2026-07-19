@@ -157,7 +157,7 @@ impl ThicknessGraph {
 
     /// Sum of active (non-expired) stake_bps where this peer is the voucher.
     /// Returns integer basis points — exact, order-independent.
-    pub(crate) fn active_stake_bps(&self, voucher: &PeerId) -> u32 {
+    pub fn active_stake_bps(&self, voucher: &PeerId) -> u32 {
         self.edges
             .values()
             .flatten()
@@ -178,42 +178,23 @@ impl ThicknessGraph {
         self.total_thickness_inner(peer, &mut HashSet::new())
     }
 
-    fn total_thickness_inner(
-        &self,
-        peer: &PeerId,
-        visited: &mut HashSet<PeerId>,
-    ) -> f64 {
+    fn total_thickness_inner(&self, peer: &PeerId, visited: &mut HashSet<PeerId>) -> f64 {
         if !visited.insert(*peer) {
             return 0.0; // cycle detected — treat as zero
         }
+        let count = self.contribution_count();
         let result = self
             .edges
             .get(peer)
             .map(|edges| {
                 edges
                     .iter()
-                    .map(|e| match &e.source {
-                        ThicknessSource::VerifiedContribution { amount, .. } => *amount,
-                        ThicknessSource::Genesis {
-                            original_amount,
-                            amortize_over,
-                        } => {
-                            let k = self.contribution_count();
-                            match amortize_over {
-                                None => *original_amount,
-                                Some(n) if *n > 0 => {
-                                    *original_amount
-                                        * ((*n as f64 - k as f64).max(0.0))
-                                        / *n as f64
-                                }
-                                Some(_) => 0.0,
-                            }
-                        }
-                        ThicknessSource::Vouch {
-                            voucher,
-                            stake_bps,
-                            ..
-                        } => self.total_thickness_inner(voucher, visited) * *stake_bps as f64 / 10_000.0,
+                    .map(|e| {
+                        derive_source_amount(
+                            &e.source,
+                            count,
+                            |v| self.total_thickness_inner(v, visited),
+                        )
                     })
                     .sum()
             })
@@ -226,7 +207,7 @@ impl ThicknessGraph {
     pub fn usable_thickness(&self, peer: &PeerId) -> f64 {
         let total = self.total_thickness(peer);
         let bps = self.active_stake_bps(peer);
-        total * (10_000 - bps) as f64 / 10_000.0
+        derive_usable(total, bps)
     }
 
     /// Total encumbered thickness: total × bps/10_000.
@@ -234,7 +215,7 @@ impl ThicknessGraph {
     pub fn encumbered_for(&self, peer: &PeerId) -> f64 {
         let total = self.total_thickness(peer);
         let bps = self.active_stake_bps(peer);
-        total * bps as f64 / 10_000.0
+        derive_encumbered(total, bps)
     }
 
     // ── Mutations ──────────────────────────────────────────
@@ -359,6 +340,104 @@ impl ThicknessGraph {
     pub fn peer_count(&self) -> usize {
         self.edges.len()
     }
+
+    /// Compute a deterministic thickness root for Era Two ratification blocks.
+    /// Hashes all edges sorted by (target_peer, source_weight) so that
+    /// honest nodes arrive at the same root.
+    pub fn thickness_root(&self) -> [u8; 32] {
+        // Collect all (target_peer, source_weight_bytes) pairs and sort deterministically
+        let mut all_edges: Vec<(PeerId, Vec<u8>)> = Vec::new();
+        for (target, edge_list) in &self.edges {
+            for edge in edge_list {
+                let mut src_bytes = Vec::new();
+                match &edge.source {
+                    crate::ledger::thickness::ThicknessSource::Genesis { original_amount, amortize_over } => {
+                        src_bytes.push(0u8);
+                        src_bytes.extend_from_slice(&original_amount.to_le_bytes());
+                        src_bytes.push(amortize_over.map_or(0, |_| 1u8));
+                    }
+                    crate::ledger::thickness::ThicknessSource::VerifiedContribution { receipt_id, amount } => {
+                        src_bytes.push(1u8);
+                        src_bytes.extend_from_slice(receipt_id);
+                        src_bytes.extend_from_slice(&amount.to_le_bytes());
+                    }
+                    crate::ledger::thickness::ThicknessSource::Vouch { voucher, vouch_nonce, stake_bps, .. } => {
+                        src_bytes.push(2u8);
+                        src_bytes.extend_from_slice(voucher.to_bytes().as_slice());
+                        src_bytes.extend_from_slice(&vouch_nonce.to_le_bytes());
+                        src_bytes.extend_from_slice(&stake_bps.to_le_bytes());
+                    }
+                }
+                all_edges.push((*target, src_bytes));
+            }
+        }
+        // Sort by (target_peer, source_bytes) for determinism
+        all_edges.sort_by(|(a_peer, a_src), (b_peer, b_src)| {
+            a_peer.cmp(b_peer).then(a_src.cmp(b_src))
+        });
+
+        let mut hasher = blake3::Hasher::new();
+        for (peer, src) in &all_edges {
+            hasher.update(peer.to_bytes().as_slice());
+            hasher.update(src);
+        }
+        *hasher.finalize().as_bytes()
+    }
+}
+
+// ── Pure derivation helpers ─────────────────────────────────
+
+/// Derive the effective amount of a genesis grant given the current
+/// contribution count. Pure function — no graph state required.
+pub fn derive_genesis_amount(
+    original_amount: f64,
+    amortize_over: Option<u64>,
+    contribution_count: u64,
+) -> f64 {
+    match amortize_over {
+        None => original_amount,
+        Some(n) if n > 0 => {
+            original_amount
+                * ((n as f64 - contribution_count as f64).max(0.0))
+                / n as f64
+        }
+        Some(_) => 0.0,
+    }
+}
+
+/// Derive the effective amount of a single thickness source.
+/// `voucher_thickness` is injected so the function stays pure and
+/// testable without a full `ThicknessGraph`.
+pub fn derive_source_amount<F>(
+    source: &ThicknessSource,
+    contribution_count: u64,
+    mut voucher_thickness: F,
+) -> f64
+where
+    F: FnMut(&PeerId) -> f64,
+{
+    match source {
+        ThicknessSource::VerifiedContribution { amount, .. } => *amount,
+        ThicknessSource::Genesis {
+            original_amount,
+            amortize_over,
+        } => derive_genesis_amount(*original_amount, *amortize_over, contribution_count),
+        ThicknessSource::Vouch {
+            voucher,
+            stake_bps,
+            ..
+        } => voucher_thickness(voucher) * *stake_bps as f64 / 10_000.0,
+    }
+}
+
+/// Usable thickness after applying active stake basis points.
+pub fn derive_usable(total: f64, active_bps: u32) -> f64 {
+    total * (10_000 - active_bps) as f64 / 10_000.0
+}
+
+/// Encumbered thickness from active stake basis points.
+pub fn derive_encumbered(total: f64, active_bps: u32) -> f64 {
+    total * active_bps as f64 / 10_000.0
 }
 
 impl Default for ThicknessGraph {
@@ -372,6 +451,50 @@ mod tests {
     use super::*;
     use crate::ledger::types::DigitalUtilityUnit;
     use chrono::Utc;
+
+    // ── Pure derivation helper tests ─────────────────────────
+
+    #[test]
+    fn derive_verified_contribution_amount_is_unchanged() {
+        let source = ThicknessSource::VerifiedContribution {
+            receipt_id: [0; 32],
+            amount: 123.45,
+        };
+        assert_eq!(derive_source_amount(&source, 0, |_| 999.0), 123.45);
+    }
+
+    #[test]
+    fn derive_genesis_amount_linear_amortization() {
+        assert_eq!(derive_genesis_amount(1000.0, Some(10), 0), 1000.0);
+        assert_eq!(derive_genesis_amount(1000.0, Some(10), 5), 500.0);
+        assert_eq!(derive_genesis_amount(1000.0, Some(10), 10), 0.0);
+        assert_eq!(derive_genesis_amount(1000.0, Some(10), 15), 0.0);
+    }
+
+    #[test]
+    fn derive_genesis_amount_no_amortization() {
+        assert_eq!(derive_genesis_amount(1000.0, None, 9999), 1000.0);
+    }
+
+    #[test]
+    fn derive_vouch_amount_proportional_to_voucher() {
+        let voucher = PeerId::random();
+        let source = ThicknessSource::Vouch {
+            voucher,
+            vouch_nonce: 1,
+            stake_bps: 2500, // 25%
+            expiration_epoch: None,
+        };
+        assert_eq!(derive_source_amount(&source, 0, |_| 1000.0), 250.0);
+    }
+
+    #[test]
+    fn derive_usable_and_encumbered_are_complementary() {
+        assert!((derive_usable(1000.0, 1000) - 900.0).abs() < f64::EPSILON);
+        assert!((derive_encumbered(1000.0, 1000) - 100.0).abs() < f64::EPSILON);
+        assert!((derive_usable(1000.0, 0) - 1000.0).abs() < f64::EPSILON);
+        assert!((derive_encumbered(1000.0, 0) - 0.0).abs() < f64::EPSILON);
+    }
 
     #[test]
     fn transfer_moves_units() {

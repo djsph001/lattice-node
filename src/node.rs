@@ -4745,3 +4745,109 @@ mod panel_access_tests {
         assert!(outstanding.contains_key(&(alice, 4)));
     }
 }
+
+#[cfg(test)]
+mod quorum_certificate_tests {
+    use super::*;
+    use prost::Message;
+
+    fn make_keypair() -> libp2p::identity::Keypair {
+        libp2p::identity::Keypair::generate_ed25519()
+    }
+
+    fn make_certificate(proposal_id: &str) -> crate::ingest::proto::ImpactCertificate {
+        crate::ingest::proto::ImpactCertificate {
+            proposal_id: proposal_id.to_string(),
+            proposer_address: "test".to_string(),
+            raw_text: "test".to_string(),
+            synthesized_text: "test".to_string(),
+            debate_rounds: vec![],
+            georgist_validation: 0,
+            carbon_budget_impact: 0.0,
+            resource_depletion_years: 0.0,
+            enclave_id: "test".to_string(),
+            lat_commitment: "test".to_string(),
+            witness_seed: "12345".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            lvn_signature: vec![],
+            tfb_enclave_signature: vec![],
+            lat_consensus_payload: vec![],
+            receipt_hash: vec![],
+        }
+    }
+
+    #[test]
+    fn qc_encode_roundtrip() {
+        let pid = "lvn:roundtrip";
+        let cert = make_certificate(pid);
+        let cert_bytes = cert.encode_to_vec();
+        let mut sigs = Vec::new();
+        for _ in 0..3 {
+            let kp = make_keypair();
+            let pk = kp.public().encode_protobuf();
+            let sig = kp.sign(pid.as_bytes()).unwrap();
+            sigs.push((kp.public().to_peer_id(), sig, pk));
+        }
+        let qc = LatticeNode::encode_quorum_certificate(pid, &cert_bytes, &sigs);
+        let decoded = LatticeNode::decode_and_verify_quorum_certificate(&qc)
+            .expect("valid QC must decode");
+        assert_eq!(decoded.0, pid);
+        assert_eq!(decoded.1, cert_bytes);
+        assert_eq!(decoded.2.len(), 3);
+    }
+
+    #[test]
+    fn qc_rejects_corrupted_signature() {
+        let pid = "lvn:bad-sig";
+        let cert = make_certificate(pid);
+        let cert_bytes = cert.encode_to_vec();
+        let kp = make_keypair();
+        let pk = kp.public().encode_protobuf();
+        let bad_sig = vec![0u8; 64];
+        let sigs = vec![(kp.public().to_peer_id(), bad_sig, pk)];
+        let qc = LatticeNode::encode_quorum_certificate(pid, &cert_bytes, &sigs);
+        let decoded = LatticeNode::decode_and_verify_quorum_certificate(&qc);
+        // decode returns Some but with empty sigs (bad sigs dropped)
+        assert_eq!(decoded.map(|d| d.2.len()).unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn qc_insufficient_sigs() {
+        let pid = "lvn:2-sigs";
+        let cert = make_certificate(pid);
+        let cert_bytes = cert.encode_to_vec();
+        let mut sigs = Vec::new();
+        for _ in 0..2 {
+            let kp = make_keypair();
+            let pk = kp.public().encode_protobuf();
+            let sig = kp.sign(pid.as_bytes()).unwrap();
+            sigs.push((kp.public().to_peer_id(), sig, pk));
+        }
+        let qc = LatticeNode::encode_quorum_certificate(pid, &cert_bytes, &sigs);
+        let decoded = LatticeNode::decode_and_verify_quorum_certificate(&qc)
+            .expect("2 valid sigs should decode");
+        assert_eq!(decoded.2.len(), 2);
+    }
+
+    #[test]
+    fn qc_commit_via_commit_manager() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = crate::commit::CommitManager::open(&dir.path().to_path_buf());
+        let pid = "lvn:commit-qc";
+        let cert = make_certificate(pid);
+        let cert_bytes = cert.encode_to_vec();
+        let mut sigs = Vec::new();
+        for _ in 0..3 {
+            let kp = make_keypair();
+            let pk = kp.public().encode_protobuf();
+            let sig = kp.sign(pid.as_bytes()).unwrap();
+            sigs.push((kp.public().to_peer_id(), sig, pk));
+        }
+        let qc = LatticeNode::encode_quorum_certificate(pid, &cert_bytes, &sigs);
+        let decoded = LatticeNode::decode_and_verify_quorum_certificate(&qc).unwrap();
+        let sigs_2: Vec<(PeerId, Vec<u8>)> = decoded.2.iter().map(|(p, s, _)| (*p, s.clone())).collect();
+        let hash = mgr.commit(&cert_bytes, &decoded.0, &sigs_2).unwrap();
+        assert!(!hash.iter().all(|b| *b == 0));
+        assert!(mgr.is_committed(&decoded.0));
+    }
+}

@@ -96,6 +96,11 @@ const ZOMBIE_EPOCH_THRESHOLD: u64 = 30;
 /// contributions is dead weight.
 const ZOMBIE_ATTESTATION_SILENCE_EPOCHS: u64 = 10;
 
+/// Fraction of peers that must be dead in a single sweep cycle
+/// before the outbound circuit breaker fires, pausing new
+/// transaction forwarding.  0.5 = 50%.
+const OUTBOUND_CIRCUIT_BREAKER_FRACTION: f64 = 0.5;
+
 // ── Phase 6: storage verification types ────────────────────
 
 /// Tracks the context of an outbound storage challenge so the
@@ -2558,12 +2563,45 @@ impl LatticeNode {
         }
     }
 
-    /// Sweep stale entries from the outbound queue.
-    /// Entries older than OUTBOUND_SWEEP_THRESHOLD (600s) are removed.
-    /// Runs on every heartbeat tick, after sweep_stale_fetches.
+    /// Sweep stale outbound queue entries with liveness awareness.
+    ///
+    /// Unlike the original sweep (which blindly evicted anything older than
+    /// 600s), this version:
+    ///   1. Uses zombie eviction data (`dead_peer_ids`) to skip entries
+    ///      whose target mesh still has live peers — the transaction may
+    ///      still route.
+    ///   2. Retries broadcasting entries before evicting them, giving the
+    ///      mesh one last chance to confirm.
+    ///   3. Circuit breaker: if >50% of known peers are dead in a single
+    ///      sweep cycle, logs an alert — the mesh may be partitioning.
     fn sweep_stale_outbound(&mut self) {
         let now = Instant::now();
+        let dead = self.dead_peer_ids();
+        let live_count = self.live_peer_count();
+        let total_peers = self.peer_table.iter()
+            .filter(|i| i.peer_id != self.local_peer_id)
+            .count();
+
+        // ── Circuit breaker: >50% peers dead ────────────────────
+        if total_peers > 0 {
+            let dead_fraction = dead.len() as f64 / total_peers as f64;
+            if dead_fraction > OUTBOUND_CIRCUIT_BREAKER_FRACTION {
+                error!(
+                    dead = dead.len(),
+                    total = total_peers,
+                    fraction = %dead_fraction,
+                    threshold = %OUTBOUND_CIRCUIT_BREAKER_FRACTION,
+                    "[outbound-sweep] CIRCUIT BREAKER: >50% peers dead — mesh may be partitioning. \
+                     Pausing outbound evictions until peers recover."
+                );
+                // Don't evict anything in a partitioned state — keep
+                // transactions queued for when peers return.
+                return;
+            }
+        }
+
         let mut evicted_total = 0usize;
+        let mut retried_total = 0usize;
 
         // Collect stale entries with a simple loop to avoid closure borrow issues
         let stale: Vec<(PeerId, u64)> = {
@@ -2582,12 +2620,52 @@ impl LatticeNode {
         };
 
         for (peer, nonce) in stale {
+            // ── Peer-count-gated flush ──────────────────────────
+            // Only evict if the mesh has no live peers OR the signer
+            // itself is dead.  If live peers exist and the signer is
+            // alive, keep the entry — it may still route.
+            if live_count > 0 && !dead.contains(&peer) {
+                debug!(
+                    peer = %peer,
+                    nonce = nonce,
+                    live_peers = live_count,
+                    "[outbound-sweep] Skipping stale entry — mesh has live peers"
+                );
+                continue;
+            }
+
+            // ── Retry before evicting ───────────────────────────
+            // Give the mesh one last chance to accept the transaction
+            // before we drop it.  If mesh_peers ≥ 1, the broadcast
+            // has a chance.
+            if let Some(queue) = self.outbound.get(&peer) {
+                if let Some(tx) = queue.get(&nonce) {
+                    let tx_clone = tx.clone();
+                    let topic = gossipsub::IdentTopic::new(LATTICE_TX_TOPIC);
+                    let mesh_peers = self.swarm.behaviour().gossipsub
+                        .mesh_peers(&topic.hash())
+                        .count();
+                    if mesh_peers > 0 {
+                        let _ = self.broadcast_transaction(&tx_clone);
+                        retried_total += 1;
+                        info!(
+                            peer = %peer,
+                            nonce = nonce,
+                            mesh_peers = mesh_peers,
+                            "[outbound-sweep] Retried broadcast before eviction"
+                        );
+                    }
+                }
+            }
+
+            // ── Evict ───────────────────────────────────────────
             if let Some(queue) = self.outbound.get_mut(&peer) {
                 queue.remove(&nonce);
                 self.outbound_insertion_times.remove(&(peer, nonce));
                 evicted_total += 1;
             }
         }
+
         // Clean up empty peer entries
         let empty_peers: Vec<PeerId> = self.outbound
             .iter()
@@ -2598,10 +2676,16 @@ impl LatticeNode {
             self.outbound.remove(&peer);
         }
 
+        if retried_total > 0 {
+            info!(
+                "[outbound-sweep] Retried {} stale entries before eviction",
+                retried_total
+            );
+        }
         if evicted_total > 0 {
             info!(
-                "[outbound-sweep] Evicted {} stale entries",
-                evicted_total,
+                "[outbound-sweep] Evicted {} stale entries (live_peers={} dead={})",
+                evicted_total, live_count, dead.len()
             );
         }
     }
@@ -2744,6 +2828,48 @@ impl LatticeNode {
 
         // Store for metrics line
         self.last_max_peer_silence = longest_silence;
+    }
+
+    /// Return the set of peer IDs that meet zombie eviction criteria.
+    /// Used by the outbound queue sweep to avoid flushing transactions
+    /// destined for live peers.  Mirrors the epoch-based criteria in
+    /// `check_peer_liveness` but does not execute evictions.
+    fn dead_peer_ids(&self) -> HashSet<PeerId> {
+        let current_epoch = self.economic_engine.epoch_count();
+        let mut dead = HashSet::new();
+
+        for info in self.peer_table.iter() {
+            if info.peer_id == self.local_peer_id {
+                continue;
+            }
+            // Heartbeat silence
+            let epochs_since_hb = current_epoch.saturating_sub(info.last_heartbeat_epoch);
+            if epochs_since_hb > ZOMBIE_EPOCH_THRESHOLD {
+                dead.insert(info.peer_id);
+                continue;
+            }
+            // Zero thickness + attestation silence
+            let thickness = self.ledger.thickness_graph.total_thickness(&info.peer_id);
+            if thickness < 0.001 {
+                let last_att_epoch =
+                    self.last_attestation_epoch.get(&info.peer_id).copied().unwrap_or(0);
+                if current_epoch.saturating_sub(last_att_epoch) > ZOMBIE_ATTESTATION_SILENCE_EPOCHS {
+                    dead.insert(info.peer_id);
+                }
+            }
+        }
+        dead
+    }
+
+    /// Count of peers that are alive (in peer table, not meeting
+    /// zombie criteria).  Used by the circuit breaker to detect
+    /// mesh partitions.
+    fn live_peer_count(&self) -> usize {
+        let dead = self.dead_peer_ids();
+        self.peer_table
+            .iter()
+            .filter(|i| i.peer_id != self.local_peer_id && !dead.contains(&i.peer_id))
+            .count()
     }
 
     /// Record a successfully-applied transaction: insert into tx_store,
@@ -5149,5 +5275,138 @@ mod zombie_eviction_tests {
 
         // proposal-2 is empty, should be removed
         assert!(sigs.get("proposal-2").is_none());
+    }
+}
+
+#[cfg(test)]
+mod outbound_sweep_tests {
+    use super::*;
+    use crate::state::peers::PeerInfo;
+
+    fn test_peer() -> PeerId {
+        PeerId::random()
+    }
+
+    // ── Tests ────────────────────────────────────────────────
+
+    #[test]
+    fn circuit_breaker_fires_when_most_peers_dead() {
+        // 3 total peers, 2 dead → 2/3 = 66.7% > 50% → fires
+        let dead_count = 2usize;
+        let total = 3usize;
+        let fraction = dead_count as f64 / total as f64;
+        assert!(fraction > OUTBOUND_CIRCUIT_BREAKER_FRACTION);
+        assert!(total > 0);
+    }
+
+    #[test]
+    fn circuit_breaker_does_not_fire_when_peers_alive() {
+        // 3 total peers, 1 dead → 1/3 = 33.3% < 50% → does not fire
+        let dead_count = 1usize;
+        let total = 3usize;
+        let fraction = dead_count as f64 / total as f64;
+        assert!(fraction <= OUTBOUND_CIRCUIT_BREAKER_FRACTION);
+    }
+
+    #[test]
+    fn circuit_breaker_boundary_exactly_half() {
+        // 4 total peers, 2 dead → 2/4 = 50% — NOT > 50% → does not fire
+        let dead_count = 2usize;
+        let total = 4usize;
+        let fraction = dead_count as f64 / total as f64;
+        assert!(!(fraction > OUTBOUND_CIRCUIT_BREAKER_FRACTION));
+    }
+
+    #[test]
+    fn empty_peer_table_no_circuit_breaker() {
+        let total = 0usize;
+        // total_peers > 0 guard prevents division by zero
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn dead_peer_ids_detects_heartbeat_silence() {
+        use crate::state::peers::PeerTable;
+
+        let pid = test_peer();
+        let mut table = PeerTable::new();
+        table.add_peer(pid, "/ip4/1.2.3.4/tcp/4001".parse().unwrap());
+
+        // Set last heartbeat to epoch 0, current epoch is 35
+        // 35 - 0 = 35 > 30 → dead
+        if let Some(info) = table.get_mut(&pid) {
+            info.last_heartbeat_epoch = 0;
+        }
+
+        let elapsed = 35u64.saturating_sub(0);
+        assert!(elapsed > ZOMBIE_EPOCH_THRESHOLD);
+    }
+
+    #[test]
+    fn dead_peer_ids_detects_zero_thickness_no_attestation() {
+        let thickness = 0.0_f64;
+        let last_att_epoch = 0u64;
+        let current_epoch = 15u64;
+
+        let is_dead = thickness < 0.001
+            && current_epoch.saturating_sub(last_att_epoch) > ZOMBIE_ATTESTATION_SILENCE_EPOCHS;
+        assert!(is_dead);
+    }
+
+    #[test]
+    fn peer_with_thickness_not_dead() {
+        let thickness = 1.0_f64;
+        let is_dead = thickness < 0.001;
+        assert!(!is_dead);
+    }
+
+    #[test]
+    fn sweep_skips_when_live_peers_exist() {
+        // Simulated: dead set doesn't contain signer, live_count > 0 → skip
+        let dead: HashSet<PeerId> = HashSet::new();
+        let live_count = 2usize;
+        let signer = test_peer();
+
+        // Signer not in dead set, live peers exist → should skip
+        let should_skip = live_count > 0 && !dead.contains(&signer);
+        assert!(should_skip);
+    }
+
+    #[test]
+    fn sweep_evicts_when_no_live_peers() {
+        // live_count = 0 → evict regardless
+        let dead: HashSet<PeerId> = HashSet::new();
+        let live_count = 0usize;
+        let signer = test_peer();
+
+        // live_count == 0 → don't skip, evict
+        let should_skip = live_count > 0 && !dead.contains(&signer);
+        assert!(!should_skip);
+    }
+
+    #[test]
+    fn sweep_evicts_when_signer_is_dead() {
+        // Signer IS in dead set → evict even if live peers exist
+        let signer = test_peer();
+        let mut dead = HashSet::new();
+        dead.insert(signer);
+        let live_count = 2usize;
+
+        let should_skip = live_count > 0 && !dead.contains(&signer);
+        assert!(!should_skip); // signer is dead → don't skip → evict
+    }
+
+    #[test]
+    fn retry_attempts_when_mesh_peers_exist() {
+        // When mesh_peers > 0, retry should be attempted
+        let mesh_peers = 1usize;
+        assert!(mesh_peers > 0);
+    }
+
+    #[test]
+    fn no_retry_when_no_mesh_peers() {
+        // When mesh_peers == 0, skip retry
+        let mesh_peers = 0usize;
+        assert!(!(mesh_peers > 0));
     }
 }

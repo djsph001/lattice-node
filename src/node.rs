@@ -181,6 +181,10 @@ pub struct LatticeNode {
     kad_bootstrapped: bool,
     /// Explicit bootstrap peer addresses.
     bootstrap_peers: Vec<Multiaddr>,
+    /// True while a ChainRangeRequest is in flight. Live block broadcasts
+    /// received during catch-up are ignored to avoid race conditions where
+    /// the catch-up response and live broadcast arrive at the same height.
+    is_catching_up: bool,
 
     // ── Phase 4: economic layer ──────────────────────────────
     /// Local ledger — this node's view of balances.
@@ -582,6 +586,7 @@ impl LatticeNode {
             mdns_peers: HashSet::new(),
             kad_bootstrapped: false,
             bootstrap_peers,
+            is_catching_up: false,
             ledger: LedgerState::new(),
             seen_nonces: HashMap::new(),
             tx_nonce: 0,
@@ -1040,6 +1045,14 @@ impl LatticeNode {
             return;
         }
 
+        // ── Catch-up guard: ignore live broadcasts while catching up ──
+        if self.is_catching_up {
+            // Live broadcast arriving during catch-up may race with the
+            // ChainRangeResponse at the same height.  Ignore — the
+            // catch-up response will bring this block.
+            return;
+        }
+
         // ── Era One: legacy block frame ─────────────────────────
         if data[0] != ERA_ONE_BLOCK_MARKER {
             // No prefix byte at all — treat as legacy Era One for
@@ -1212,6 +1225,7 @@ impl LatticeNode {
                 to_height: height,
             };
             self.outstanding_chain_requests_by_peer.insert(*propagation_source);
+            self.is_catching_up = true;
             let _ = self.swarm.behaviour_mut()
                 .chain_sync_rpc
                 .send_request(propagation_source, req);
@@ -2394,6 +2408,8 @@ impl LatticeNode {
                     } => {
                         // Clear dedup guard — request completed (success or partial)
                         self.outstanding_chain_requests_by_peer.remove(&peer);
+                        // Clear catch-up flag — resume processing live broadcasts
+                        self.is_catching_up = false;
                         // Requester side: validate and apply received blocks
                         for wire in &response.blocks {
                             // Convert WireBlock back to signatures with PeerId

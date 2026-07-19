@@ -345,9 +345,11 @@ pub struct WireBlock {
 /// `lattice/block/v1`.  Receivers read the first byte to choose the
 /// correct deserializer.
 ///
-/// ERA_ONE_BLOCK_MARKER is reserved for future use. Era One blocks are
-/// currently emitted without a prefix for backward compatibility; the
-/// receiver treats a leading 0x01 as an optional prefix and strips it.
+/// reserved for future use. Era One blocks are emitted WITHOUT a
+/// prefix for backward compatibility.  The receive side does NOT
+/// strip a leading 0x01 — it treats any non-0x02 block as unprefixed
+/// Era One.  (If we ever emit 0x01-prefixed blocks, we'll add a
+/// version gate in the receive path.)
 pub const ERA_ONE_BLOCK_MARKER: u8 = 0x01;
 pub const ERA_TWO_BLOCK_MARKER: u8 = 0x02;
 

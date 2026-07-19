@@ -1074,14 +1074,13 @@ impl LatticeNode {
             return;
         }
 
-        // ── Era One: legacy block frame ─────────────────────────
-        if data[0] != ERA_ONE_BLOCK_MARKER {
-            // No prefix byte at all — treat as legacy Era One for
-            // backward compatibility with nodes that don't prefix.
-            // (The existing wire format has height as the first 8 bytes,
-            // which will never be 0x01 or 0x02 in practice for height > 0.)
-        }
-        let data = if data[0] == ERA_ONE_BLOCK_MARKER { &data[1..] } else { data };
+        // ── Era One: legacy block frame (unprefixed) ──────────
+        // Any block NOT starting with ERA_TWO_BLOCK_MARKER is Era One.
+        // We do NOT strip a leading 0x01 — Era One blocks are emitted
+        // without a prefix, and the height field's first byte could
+        // legitimately be 0x01 at extreme heights.  Only 0x02-prefixed
+        // blocks are routed to the Era Two path.
+        let data = data; // pass through unmodified
 
         if data.len() < 72 {
             tracing::warn!("[block-recv] Block too short ({} bytes)", data.len());

@@ -1849,7 +1849,40 @@ impl LatticeNode {
                 proposal_id = %proposal_id,
                 "[ratification] Assembled RatificationBlock for Era Two broadcast"
             );
-            self.publish_ratification_block(&block);
+            // Commit locally before broadcasting — the producer MUST
+            // persist its own block so its chain height advances. If
+            // commit fails the block is not broadcast (uncommitted
+            // blocks would fork the mesh and break catch-up).
+            let cert_bytes = match block.encode_wire() {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!(
+                        epoch,
+                        error = %e,
+                        "[ratification] Failed to encode RatificationBlock — not broadcasting"
+                    );
+                    return;
+                }
+            };
+            match self.commit_manager.commit(&cert_bytes, &proposal_id, &[]) {
+                Ok(block_hash) => {
+                    tracing::info!(
+                        epoch,
+                        proposal_id = %proposal_id,
+                        hash = %hex::encode(block_hash),
+                        "[ratification] RatificationBlock committed — broadcasting to mesh"
+                    );
+                    self.publish_ratification_block(&block);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        epoch,
+                        proposal_id = %proposal_id,
+                        error = %e,
+                        "[ratification] Failed to commit RatificationBlock — not broadcasting"
+                    );
+                }
+            }
         }
     }
 

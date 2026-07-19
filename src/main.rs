@@ -343,6 +343,8 @@ async fn main() -> Result<()> {
         cli.force_era_two,
         cli.openai_api_key.clone(),
         cli.openai_endpoint.clone(),
+        cli.ntp_server.clone(),
+        cli.skip_ntp_check,
     )?;
 
     info!(

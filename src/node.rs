@@ -337,6 +337,17 @@ pub struct LatticeNode {
     /// Force Era Two block production regardless of bootstrap state.
     /// Bypasses is_bootstrap_ended() gate for testing/development.
     force_era_two: bool,
+    /// NTP servers for runtime clock verification. None = defaults.
+    ntp_servers: Option<Vec<String>>,
+    /// Skip runtime NTP checks (implied by --skip-ntp-check).
+    skip_ntp_check: bool,
+    /// When true, the node refuses to sign new transactions because
+    /// clock drift exceeds NTP_REFUSE_SIGN_THRESHOLD_SECS.
+    refuse_to_sign: bool,
+    /// Timestamp of the last successful NTP check.
+    last_ntp_check: Instant,
+    /// Most recent NTP drift measurement in seconds.
+    ntp_drift_secs: i64,
     /// Phase 11: thickness floor weight for sortition (security parameter).
     /// Pinned to 1/T_min where T_min is expected minimum honest thickness.
     floor_weight: f64,
@@ -399,6 +410,8 @@ impl LatticeNode {
         force_era_two: bool,
         openai_api_key: Option<String>,
         openai_endpoint: Option<String>,
+        ntp_servers: Option<Vec<String>>,
+        skip_ntp_check: bool,
     ) -> Result<Self> {
         let key_path = resolve_identity_path(identity_dir)?;
         let local_key = load_or_generate_identity(&key_path, fresh_identity)?;
@@ -641,6 +654,11 @@ impl LatticeNode {
             vram_bytes,
             no_economics,
             force_era_two,
+            ntp_servers: ntp_servers.clone(),
+            skip_ntp_check,
+            refuse_to_sign: false,
+            last_ntp_check: Instant::now(),
+            ntp_drift_secs: 0,
             floor_weight,
             density_margin,
             thickness_gauge,
@@ -1431,6 +1449,71 @@ impl LatticeNode {
         );
     }
 
+    /// Periodic NTP drift check, called on heartbeat tick.
+    /// Cached: only queries NTP every NTP_CACHE_TTL_SECS (5 min).
+    /// Three thresholds: WARN >30s, refuse-sign >60s, exit >300s.
+    async fn check_runtime_ntp(&mut self) {
+        if self.skip_ntp_check {
+            return;
+        }
+        let now = Instant::now();
+        if now.duration_since(self.last_ntp_check).as_secs() < crate::startup::NTP_CACHE_TTL_SECS {
+            return;
+        }
+        self.last_ntp_check = now;
+
+        match crate::startup::check_ntp_drift(self.ntp_servers.clone()).await {
+            Ok(drift) => {
+                self.ntp_drift_secs = drift;
+                let abs_drift = drift.abs();
+
+                if abs_drift > crate::startup::CLOCK_DRIFT_THRESHOLD_SECS {
+                    error!(
+                        drift_s = drift,
+                        threshold = crate::startup::CLOCK_DRIFT_THRESHOLD_SECS,
+                        "RUNTIME NTP: clock drift {}s exceeds exit threshold. \
+                         Shutting down — restart will trigger startup NTP check.",
+                        drift
+                    );
+                    std::process::exit(1);
+                } else if abs_drift > crate::startup::NTP_REFUSE_SIGN_THRESHOLD_SECS {
+                    if !self.refuse_to_sign {
+                        warn!(
+                            drift_s = drift,
+                            threshold = crate::startup::NTP_REFUSE_SIGN_THRESHOLD_SECS,
+                            "RUNTIME NTP: drift {}s exceeds sign threshold. \
+                             Refusing to sign new transactions until clock is corrected.",
+                            drift
+                        );
+                        self.refuse_to_sign = true;
+                    }
+                } else if abs_drift > crate::startup::NTP_WARN_THRESHOLD_SECS {
+                    warn!(
+                        drift_s = drift,
+                        threshold = crate::startup::NTP_WARN_THRESHOLD_SECS,
+                        "RUNTIME NTP: drift {}s exceeds warn threshold.",
+                        drift
+                    );
+                    // Clear refuse_to_sign if drift has recovered
+                    self.refuse_to_sign = false;
+                } else {
+                    // Drift is acceptable — clear any stale refuse flag
+                    if self.refuse_to_sign {
+                        info!(
+                            drift_s = drift,
+                            "RUNTIME NTP: drift {}s recovered — resuming transaction signing.",
+                            drift
+                        );
+                        self.refuse_to_sign = false;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "RUNTIME NTP: check failed — skipping this cycle");
+            }
+        }
+    }
+
     /// Main event loop.
     pub async fn run(&mut self) -> Result<()> {
         let listen_addr: Multiaddr =
@@ -1608,6 +1691,8 @@ impl LatticeNode {
                         queues.join(" "),
                         self.last_max_peer_silence
                     );
+                    // ── Runtime NTP check (every 5 min) ───────────
+                    self.check_runtime_ntp().await;
                 }
                 _ = epoch_timer.tick() => {
                     // Phase 11: unwind expired vouches before economic cycle
@@ -2002,6 +2087,13 @@ impl LatticeNode {
 
     /// Sign a transaction with the node's keypair.
     fn sign_transaction(&self, tx: &Transaction) -> Result<SignedTransaction> {
+        if self.refuse_to_sign {
+            bail!(
+                "Refusing to sign: clock drift exceeds threshold. \
+                 Sync clock (macOS: sudo sntp -sS pool.ntp.org, Linux: sudo ntpdate pool.ntp.org) \
+                 or restart with --skip-ntp-check."
+            );
+        }
         let tx_bytes = serde_cbor::to_vec(tx)
             .map_err(|e| anyhow::anyhow!("failed to encode transaction: {e}"))?;
         let signature = self

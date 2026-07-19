@@ -827,10 +827,11 @@ impl LatticeNode {
 
     /// Handle an Era Two RatificationBlock received via `lattice/block/v1`.
     /// Verifies roots against local state.  If they match, commits the
-    /// epoch boundary.  If they mismatch, logs a state fork warning and
-    /// drops the block — does NOT trigger catch-up sync.
+    /// epoch boundary via CommitManager for persistence + catch-up.
+    /// If they mismatch, logs a state fork warning and drops the block.
     fn handle_ratification_block(&mut self, data: &[u8], propagation_source: &PeerId) {
-        let block = match RatificationBlock::decode_wire(data) {
+        // data includes the ERA_TWO_BLOCK_MARKER prefix byte
+        let block = match RatificationBlock::decode_wire(&data[1..]) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(
@@ -859,13 +860,30 @@ impl LatticeNode {
         let local_thickness = self.ledger.thickness_graph.thickness_root();
 
         if block.state_root == local_state && block.thickness_root == local_thickness {
-            tracing::info!(
-                epoch = block.epoch,
-                proposal_id = %block.proposal_id,
-                from = %propagation_source,
-                "[block-recv] RatificationBlock verified — roots match"
-            );
-            // TODO: commit as epoch boundary marker
+            // ── Commit to chain for persistence + catch-up ──────────
+            match self.commit_manager.commit(
+                data, // full prefixed bytes: 0x02 + CBOR
+                &block.proposal_id,
+                &[],  // Era Two v1: single-producer, no witness sigs yet
+            ) {
+                Ok(block_hash) => {
+                    tracing::info!(
+                        epoch = block.epoch,
+                        proposal_id = %block.proposal_id,
+                        hash = %hex::encode(block_hash),
+                        from = %propagation_source,
+                        "[block-recv] RatificationBlock verified and committed to chain"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        epoch = block.epoch,
+                        proposal_id = %block.proposal_id,
+                        error = %e,
+                        "[block-recv] Failed to commit RatificationBlock to chain"
+                    );
+                }
+            }
         } else {
             tracing::warn!(
                 epoch = block.epoch,
@@ -1054,7 +1072,10 @@ impl LatticeNode {
 
         // ── Era Two: RatificationBlock (0x02 prefix) ─────────────
         if data[0] == ERA_TWO_BLOCK_MARKER {
-            self.handle_ratification_block(&data[1..], propagation_source);
+            // Pass full bytes including prefix — the RatificationBlock
+            // encode_wire() output is already prefixed, and we store it
+            // as-is so catch-up can serve it transparently.
+            self.handle_ratification_block(data, propagation_source);
             return;
         }
 
@@ -2384,9 +2405,16 @@ impl LatticeNode {
                                 .collect();
 
                             // Extract real proposal_id from cert_bytes.
-                            // Era One: SignedTransaction → transaction → nonce/type
-                            // Era Two: ImpactCertificate protobuf → proposal_id field
-                            let proposal_id: String = if let Ok(stx) = serde_cbor::from_slice::<crate::ledger::types::SignedTransaction>(&wire.cert_bytes) {
+                            // Era One: SignedTransaction CBOR
+                            // Era Two v1: ImpactCertificate protobuf
+                            // Era Two v2: RatificationBlock CBOR (0x02 prefix)
+                            let proposal_id: String =
+                                if wire.cert_bytes.first() == Some(&ERA_TWO_BLOCK_MARKER) {
+                                    match RatificationBlock::decode_wire(&wire.cert_bytes[1..]) {
+                                        Ok(rb) => rb.proposal_id.clone(),
+                                        Err(_) => hex::encode(wire.block_hash),
+                                    }
+                                } else if let Ok(stx) = serde_cbor::from_slice::<crate::ledger::types::SignedTransaction>(&wire.cert_bytes) {
                                 // Era One: derive id from transaction type + signer
                                 let nonce = stx.transaction.nonce();
                                 let signer = stx.transaction.signer().to_string();

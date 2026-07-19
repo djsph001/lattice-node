@@ -896,6 +896,12 @@ impl LatticeNode {
         cert_bytes: &[u8],
         sigs: &[(PeerId, Vec<u8>, Vec<u8>)],
     ) -> Vec<u8> {
+        // Canonical ordering: signatures are sorted by signer PeerId so that
+        // the same quorum assembled in a different order produces identical
+        // bytes and therefore an identical block hash on every node.
+        let mut sigs: Vec<(PeerId, Vec<u8>, Vec<u8>)> = sigs.to_vec();
+        sigs.sort_by(|a, b| a.0.to_bytes().cmp(&b.0.to_bytes()));
+
         let pid_bytes = proposal_id.as_bytes();
         let mut qc = Vec::with_capacity(
             1 + 2 + pid_bytes.len()
@@ -912,7 +918,7 @@ impl LatticeNode {
         qc.extend_from_slice(&(cert_bytes.len() as u32).to_be_bytes());
         qc.extend_from_slice(cert_bytes);
         qc.extend_from_slice(&(sigs.len() as u16).to_be_bytes());
-        for (_peer_id, sig, pk) in sigs {
+        for (_peer_id, sig, pk) in &sigs {
             qc.extend_from_slice(&(pk.len() as u16).to_be_bytes());
             qc.extend_from_slice(pk);
             qc.extend_from_slice(&(sig.len() as u16).to_be_bytes());
@@ -3195,8 +3201,32 @@ impl LatticeNode {
         // the actual forwarding; we track the contribution.
         self.economic_engine.metrics.record_relay(data.len() as u64);
 
-        // Phase 7: detect enclave certificate messages by protobuf
-        // signature.  These are raw ImpactCertificate payloads, not
+        // Phase 7: dispatch marker-prefixed messages FIRST.
+        // Attestations (0x01) and quorum certificates (0x02) are
+        // intentionally discriminated by their leading byte. Checking
+        // markers before the protobuf decode prevents a malformed or
+        // future-prefixed message from being silently misrouted as a
+        // raw ImpactCertificate.
+        {
+            // ── Phase 7: witness attestation handler ────────────
+            // Messages starting with 0x01 are witness attestations,
+            // not ImpactCertificates. Parse, verify, and collect.
+            if data.first() == Some(&0x01) {
+                self.handle_witness_attestation(data, propagation_source);
+                return;
+            }
+
+            // ── Phase 7: verified quorum certificate handler ────
+            // Messages starting with 0x02 carry a full certificate plus
+            // the 3-of-5 witness signatures. Verify and commit locally.
+            if data.first() == Some(&0x02) {
+                self.handle_quorum_certificate(data, propagation_source);
+                return;
+            }
+        }
+
+        // Phase 7: detect raw enclave certificate messages by protobuf
+        // signature.  These are unmarked ImpactCertificate payloads, not
         // LatticeMessage envelopes.  Decode, run Witness sortition,
         // and begin multi-sig collection if selected.
         {
@@ -3216,22 +3246,6 @@ impl LatticeNode {
                 // ── Phase 7: Witness sortition ──────────────────
                 self.run_witness_sortition(&cert);
 
-                return;
-            }
-
-            // ── Phase 7: witness attestation handler ────────────
-            // Messages starting with 0x01 are witness attestations,
-            // not ImpactCertificates. Parse, verify, and collect.
-            if data.first() == Some(&0x01) {
-                self.handle_witness_attestation(data, propagation_source);
-                return;
-            }
-
-            // ── Phase 7: verified quorum certificate handler ────
-            // Messages starting with 0x02 carry a full certificate plus
-            // the 3-of-5 witness signatures. Verify and commit locally.
-            if data.first() == Some(&0x02) {
-                self.handle_quorum_certificate(data, propagation_source);
                 return;
             }
         }
@@ -4562,7 +4576,11 @@ impl LatticeNode {
         if count >= 3 {
             // Clone signatures and release the borrow on witness_sigs before
             // we call other &mut self methods (commit_manager, gossipsub).
-            let sigs: Vec<(PeerId, Vec<u8>, Vec<u8>)> = sigs.clone();
+            let mut sigs: Vec<(PeerId, Vec<u8>, Vec<u8>)> = sigs.clone();
+
+            // Canonical ordering: every node must derive the same block hash
+            // from the same quorum, regardless of the order attestations arrived.
+            sigs.sort_by(|a, b| a.0.to_bytes().cmp(&b.0.to_bytes()));
 
             // Dedup guard: skip if already committed (trailing attestations)
             if self.commit_manager.is_committed(&proposal_id) {
@@ -5345,6 +5363,74 @@ mod quorum_certificate_tests {
         let hash = mgr.commit(&cert_bytes, &decoded.0, &sigs_2).unwrap();
         assert!(!hash.iter().all(|b| *b == 0));
         assert!(mgr.is_committed(&decoded.0));
+    }
+
+    #[test]
+    fn qc_signatures_are_sorted_canonically() {
+        let pid = "lvn:canonical";
+        let cert = make_certificate(pid);
+        let cert_bytes = cert.encode_to_vec();
+
+        // Generate three signers and build signatures in arbitrary order.
+        let kp1 = make_keypair();
+        let kp2 = make_keypair();
+        let kp3 = make_keypair();
+        let sig1 = (kp1.public().to_peer_id(), kp1.sign(pid.as_bytes()).unwrap(), kp1.public().encode_protobuf());
+        let sig2 = (kp2.public().to_peer_id(), kp2.sign(pid.as_bytes()).unwrap(), kp2.public().encode_protobuf());
+        let sig3 = (kp3.public().to_peer_id(), kp3.sign(pid.as_bytes()).unwrap(), kp3.public().encode_protobuf());
+
+        let qc_a = LatticeNode::encode_quorum_certificate(pid, &cert_bytes, &vec![sig1.clone(), sig2.clone(), sig3.clone()]);
+        let qc_b = LatticeNode::encode_quorum_certificate(pid, &cert_bytes, &vec![sig3.clone(), sig1.clone(), sig2.clone()]);
+
+        assert_eq!(qc_a, qc_b, "same quorum in different order must produce identical canonical QC bytes");
+
+        let decoded = LatticeNode::decode_and_verify_quorum_certificate(&qc_a)
+            .expect("canonical QC must decode");
+        assert_eq!(decoded.2.len(), 3);
+
+        // Verify decoded order is sorted by PeerId.
+        let peer_ids: Vec<_> = decoded.2.iter().map(|(pid, _, _)| pid.to_bytes()).collect();
+        let mut sorted = peer_ids.clone();
+        sorted.sort();
+        assert_eq!(peer_ids, sorted, "decoded signatures must be in canonical PeerId order");
+    }
+
+    #[test]
+    fn marker_prefixed_messages_are_not_raw_certificates() {
+        // A QC message (0x02 prefix) must not decode as a raw ImpactCertificate,
+        // otherwise the gossip dispatcher would misroute it.
+        let pid = "lvn:marker";
+        let cert = make_certificate(pid);
+        let cert_bytes = cert.encode_to_vec();
+        let mut sigs = Vec::new();
+        for _ in 0..3 {
+            let kp = make_keypair();
+            let pk = kp.public().encode_protobuf();
+            let sig = kp.sign(pid.as_bytes()).unwrap();
+            sigs.push((kp.public().to_peer_id(), sig, pk));
+        }
+        let qc = LatticeNode::encode_quorum_certificate(pid, &cert_bytes, &sigs);
+        assert!(
+            crate::ingest::proto::ImpactCertificate::decode(&qc[..]).is_err(),
+            "QC message must not be misdecoded as raw ImpactCertificate"
+        );
+
+        // Likewise for a 0x01 attestation message.
+        let mut attestation = vec![0x01u8];
+        let kp = make_keypair();
+        let pid_bytes = pid.as_bytes();
+        let pk_bytes = kp.public().encode_protobuf();
+        let sig = kp.sign(pid.as_bytes()).unwrap();
+        attestation.extend_from_slice(&(pid_bytes.len() as u16).to_be_bytes());
+        attestation.extend_from_slice(pid_bytes);
+        attestation.extend_from_slice(&(pk_bytes.len() as u16).to_be_bytes());
+        attestation.extend_from_slice(&pk_bytes);
+        attestation.extend_from_slice(&(sig.len() as u16).to_be_bytes());
+        attestation.extend_from_slice(&sig);
+        assert!(
+            crate::ingest::proto::ImpactCertificate::decode(&attestation[..]).is_err(),
+            "attestation message must not be misdecoded as raw ImpactCertificate"
+        );
     }
 }
 

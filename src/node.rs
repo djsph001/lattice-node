@@ -2344,28 +2344,46 @@ impl LatticeNode {
                     }
                     request_response::Message::Response { response, .. } => {
                         // Fetch response received. Apply each valid transaction.
-                        let count = response.transactions.len();
+                        let mut applied_count = 0usize;
+                        let mut skipped_count = 0usize;
                         for tx in &response.transactions {
+                            let applied_signer: PeerId = match tx.transaction.signer().parse() {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        "[tx-fetch] Fetched transaction has invalid signer"
+                                    );
+                                    continue;
+                                }
+                            };
+                            let applied_nonce = tx.transaction.nonce();
+
+                            // Gossip may have closed the gap before the response arrived.
+                            // Skip already-applied transactions silently and clear their
+                            // fetch marks so metrics don't report a stale gap.
+                            if self.seen_nonces.get(&applied_signer).map_or(false, |n| *n >= applied_nonce) {
+                                self.outstanding_fetches.remove(&(applied_signer, applied_nonce));
+                                skipped_count += 1;
+                                continue;
+                            }
+
                             match validation::validate_and_apply(
                                 tx,
                                 &mut self.ledger,
                                 &mut self.seen_nonces,
                             ) {
                                 Ok(()) => {
-                                    let applied_signer: PeerId = match tx.transaction.signer().parse() {
-                                        Ok(p) => p,
-                                        Err(_) => return,
-                                    };
-                                    let applied_nonce = tx.transaction.nonce();
                                     // Remove the outstanding fetch mark for this gap.
                                     self.outstanding_fetches.remove(&(applied_signer, applied_nonce));
                                     self.on_transaction_applied(tx);
+                                    applied_count += 1;
                                 }
                                 Err(e) => {
                                     warn!(
                                         error = %e,
-                                        signer = %tx.transaction.signer(),
-                                        nonce = tx.transaction.nonce(),
+                                        signer = %applied_signer,
+                                        nonce = applied_nonce,
                                         "[tx-fetch] Fetched transaction rejected"
                                     );
                                 }
@@ -2373,9 +2391,10 @@ impl LatticeNode {
                         }
                         debug!(
                             from = %peer,
-                            count = count,
-                            "[tx-fetch] Applied {} fetched transactions",
-                            count,
+                            received = response.transactions.len(),
+                            applied = applied_count,
+                            skipped_already_applied = skipped_count,
+                            "[tx-fetch] Fetch response processed"
                         );
                     }
                 }
@@ -3138,6 +3157,11 @@ impl LatticeNode {
         let nonce = tx.transaction.nonce();
 
         self.tx_store.insert((signer, nonce), tx.clone());
+
+        // Gossip may have closed the gap before the fetch response arrived.
+        // Clear any outstanding fetch mark for this nonce so the metrics
+        // don't report a stale gap.
+        self.outstanding_fetches.remove(&(signer, nonce));
 
         // Prune store: keep only last 100 nonces for this signer.
         const MAX_NONCES: u64 = 100;

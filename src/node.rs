@@ -2905,8 +2905,14 @@ impl LatticeNode {
             }
 
             // ── Layer 2: zero thickness + attestation silence ─
+            // Gate: skip this criterion if the mesh has never had any
+            // thickness at all.  On a fresh mesh with no genesis seed,
+            // every peer looks like a zombie by this criterion, and
+            // evicting all of them on loop breaks the mesh.
             let thickness = self.ledger.thickness_graph.total_thickness(peer_id);
-            if thickness < 0.001 {
+            if thickness < 0.001
+                && self.ledger.thickness_graph.peer_count() > 0
+            {
                 let last_att_epoch = self.last_attestation_epoch.get(peer_id).copied().unwrap_or(0);
                 let epochs_since_attest =
                     current_epoch.saturating_sub(last_att_epoch);

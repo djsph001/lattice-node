@@ -3019,8 +3019,11 @@ impl LatticeNode {
                 continue;
             }
             // Zero thickness + attestation silence
+            // Gate: skip if mesh has never had thickness (same as check_peer_liveness)
             let thickness = self.ledger.thickness_graph.total_thickness(&info.peer_id);
-            if thickness < 0.001 {
+            if thickness < 0.001
+                && self.ledger.thickness_graph.peer_count() > 0
+            {
                 let last_att_epoch =
                     self.last_attestation_epoch.get(&info.peer_id).copied().unwrap_or(0);
                 if current_epoch.saturating_sub(last_att_epoch) > ZOMBIE_ATTESTATION_SILENCE_EPOCHS {

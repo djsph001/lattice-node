@@ -837,7 +837,12 @@ impl LatticeNode {
     /// Verifies roots against local state.  If they match, commits the
     /// epoch boundary via CommitManager for persistence + catch-up.
     /// If they mismatch, logs a state fork warning and drops the block.
-    fn handle_ratification_block(&mut self, data: &[u8], propagation_source: &PeerId) {
+    fn handle_ratification_block(
+        &mut self,
+        data: &[u8],
+        propagation_source: &PeerId,
+        signatures: &[(PeerId, Vec<u8>)],
+    ) {
         // data includes the ERA_TWO_BLOCK_MARKER prefix byte
         let block = match RatificationBlock::decode_body(&data[1..]) {
             Ok(b) => b,
@@ -868,16 +873,45 @@ impl LatticeNode {
         let local_thickness = self.ledger.thickness_graph.thickness_root();
 
         if block.state_root == local_state && block.thickness_root == local_thickness {
+            // Advisory QC verification: if the block carries signatures,
+            // check that enough of them come from the expected witness panel.
+            // This is advisory (soft-fork compatible): a mismatch is logged
+            // but the block is still accepted if the roots agree.
+            if !signatures.is_empty() {
+                let panel = self.derive_ratification_panel(&block.proposal_id);
+                let quorum = crate::sortition::ratification_quorum(panel.len());
+                let panel_sigs = signatures.iter().filter(|(pid, _)| panel.contains(pid)).count();
+                if panel_sigs < quorum {
+                    tracing::warn!(
+                        epoch = block.epoch,
+                        proposal_id = %block.proposal_id,
+                        panel_sigs,
+                        quorum,
+                        from = %propagation_source,
+                        "[block-recv] RatificationBlock advisory QC check failed — insufficient panel signatures, accepting anyway (soft-fork compat)"
+                    );
+                } else {
+                    tracing::debug!(
+                        epoch = block.epoch,
+                        proposal_id = %block.proposal_id,
+                        panel_sigs,
+                        quorum,
+                        "[block-recv] RatificationBlock advisory QC check passed"
+                    );
+                }
+            }
+
             // ── Commit to chain for persistence + catch-up ──────────
             match self.commit_manager.commit(
                 data, // full prefixed bytes: 0x02 + CBOR
                 &block.proposal_id,
-                &[],  // Era Two v1: single-producer, no witness sigs yet
+                signatures,
             ) {
                 Ok(block_hash) => {
                     tracing::info!(
                         epoch = block.epoch,
                         proposal_id = %block.proposal_id,
+                        sigs = signatures.len(),
                         hash = %hex::encode(block_hash),
                         from = %propagation_source,
                         "[block-recv] RatificationBlock verified and committed to chain"
@@ -1175,9 +1209,43 @@ impl LatticeNode {
             }
             let cert_bytes = &data[offset + 4..cert_end];
 
+            // Parse witness signatures from the block frame
+            let mut signatures = Vec::new();
+            let mut sig_offset = cert_end;
+            if data.len() >= sig_offset + 2 {
+                let sig_count = u16::from_be_bytes([data[sig_offset], data[sig_offset + 1]]) as usize;
+                sig_offset += 2;
+                for _ in 0..sig_count {
+                    if data.len() < sig_offset + 2 {
+                        break;
+                    }
+                    let peer_len = u16::from_be_bytes([data[sig_offset], data[sig_offset + 1]]) as usize;
+                    sig_offset += 2;
+                    if data.len() < sig_offset + peer_len {
+                        break;
+                    }
+                    let peer_id = match PeerId::from_bytes(&data[sig_offset..sig_offset + peer_len]) {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    };
+                    sig_offset += peer_len;
+                    if data.len() < sig_offset + 2 {
+                        break;
+                    }
+                    let sig_len = u16::from_be_bytes([data[sig_offset], data[sig_offset + 1]]) as usize;
+                    sig_offset += 2;
+                    if data.len() < sig_offset + sig_len {
+                        break;
+                    }
+                    let sig = data[sig_offset..sig_offset + sig_len].to_vec();
+                    sig_offset += sig_len;
+                    signatures.push((peer_id, sig));
+                }
+            }
+
             // ── Era Two: RatificationBlock (0x02 prefix inside cert_bytes) ─
             if !cert_bytes.is_empty() && cert_bytes[0] == ERA_TWO_BLOCK_MARKER {
-                self.handle_ratification_block(cert_bytes, propagation_source);
+                self.handle_ratification_block(cert_bytes, propagation_source, &signatures);
                 return;
             }
 
@@ -1928,9 +1996,12 @@ impl LatticeNode {
         self.expire_agent_tasks(epoch);
 
         // ── Era Two: produce RatificationBlock ────────────────────
-        // After economic cycle completes and roots are computed, the
-        // sortitioned block producer assembles and broadcasts the
-        // ratification block.  Gated behind BootstrapEnded (or --force-era-two).
+        // After economic cycle completes and roots are computed, every
+        // node assembles the same deterministic RatificationBlock.  A
+        // sortitioned witness panel then signs 0x01 attestations; once a
+        // quorum is reached the block is committed to the hash-chain and
+        // broadcast on the block topic.  Gated behind BootstrapEnded (or
+        // --force-era-two).
         if self.commit_manager.is_bootstrap_ended() || self.force_era_two {
             let state_root = self.ledger.state_root(&self.seen_nonces);
             let thickness_root = self.ledger.thickness_graph.thickness_root();
@@ -1944,41 +2015,41 @@ impl LatticeNode {
             tracing::info!(
                 epoch,
                 proposal_id = %proposal_id,
-                "[ratification] Assembled RatificationBlock for Era Two broadcast"
+                "[ratification] Assembled RatificationBlock for Era Two"
             );
-            // Commit locally before broadcasting — the producer MUST
-            // persist its own block so its chain height advances. If
-            // commit fails the block is not broadcast (uncommitted
-            // blocks would fork the mesh and break catch-up).
+
+            // Cache the encoded block so the QC commit path can write it
+            // to the ledger once a quorum of panel signatures is reached.
             let cert_bytes = match block.encode_wire() {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::error!(
                         epoch,
                         error = %e,
-                        "[ratification] Failed to encode RatificationBlock — not broadcasting"
+                        "[ratification] Failed to encode RatificationBlock"
                     );
                     return;
                 }
             };
-            match self.commit_manager.commit(&cert_bytes, &proposal_id, &[]) {
-                Ok(block_hash) => {
-                    tracing::info!(
-                        epoch,
-                        proposal_id = %proposal_id,
-                        hash = %hex::encode(block_hash),
-                        "[ratification] RatificationBlock committed — broadcasting to mesh"
-                    );
-                    self.publish_committed_block(&proposal_id);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        epoch,
-                        proposal_id = %proposal_id,
-                        error = %e,
-                        "[ratification] Failed to commit RatificationBlock — not broadcasting"
-                    );
-                }
+            self.cert_cache.insert(proposal_id.clone(), cert_bytes);
+
+            let panel = self.derive_ratification_panel(&proposal_id);
+            if panel.contains(&self.local_peer_id) {
+                tracing::info!(
+                    epoch,
+                    proposal_id = %proposal_id,
+                    panel = ?panel.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+                    "[ratification] Local node on witness panel — publishing attestation"
+                );
+                self.publish_witness_attestation(&proposal_id);
+                self.maybe_commit_ratification_qc(&proposal_id);
+            } else {
+                tracing::debug!(
+                    epoch,
+                    proposal_id = %proposal_id,
+                    panel = ?panel.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+                    "[ratification] Local node not on witness panel — observing quorum"
+                );
             }
         }
     }
@@ -4518,57 +4589,150 @@ impl LatticeNode {
                 panel = ?panel.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
                 "[sortition] Local node selected as Witness — signing certificate"
             );
-
-            let sig = match self.local_key.sign(cert.proposal_id.as_bytes()) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(error = %e, "[sortition] Failed to sign certificate");
-                    return;
-                }
-            };
-
-            let pubkey_bytes = self.local_key.public().encode_protobuf();
-            self.witness_sigs
-                .entry(cert.proposal_id.clone())
-                .or_default()
-                .push((self.local_peer_id, sig.clone(), pubkey_bytes.clone()));
-
-            let pid_bytes = cert.proposal_id.as_bytes();
-            let mut attestation = Vec::with_capacity(
-                1 + 2 + pid_bytes.len() + 2 + pubkey_bytes.len() + 2 + sig.len(),
-            );
-            attestation.push(0x01);
-            attestation.extend_from_slice(&(pid_bytes.len() as u16).to_be_bytes());
-            attestation.extend_from_slice(pid_bytes);
-            attestation.extend_from_slice(&(pubkey_bytes.len() as u16).to_be_bytes());
-            attestation.extend_from_slice(&pubkey_bytes);
-            attestation.extend_from_slice(&(sig.len() as u16).to_be_bytes());
-            attestation.extend_from_slice(&sig);
-
-            let topic =
-                gossipsub::IdentTopic::new(crate::network::protocol::LATTICE_ENCLAVE_CERT_TOPIC);
-            self.track_outbound(&attestation);
-            match self.swarm.behaviour_mut().gossipsub.publish(topic, attestation) {
-                Ok(msg_id) => {
-                    info!(
-                        message_id = %msg_id,
-                        proposal_id = %cert.proposal_id,
-                        "[sortition] Witness attestation published to mesh"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "[sortition] Failed to publish witness attestation"
-                    );
-                }
-            }
+            self.publish_witness_attestation(&cert.proposal_id);
         } else {
             debug!(
                 proposal_id = %cert.proposal_id,
                 panel_size = panel.len(),
                 "[sortition] Local node not on panel — observing quorum"
             );
+        }
+    }
+
+    /// Sign the given proposal_id and publish a 0x01 witness attestation
+    /// on the enclave-cert topic.  Idempotent: if this node has already
+    /// attested to the proposal, the second call is a no-op.
+    ///
+    /// Returns true if an attestation was (or already had been) published.
+    fn publish_witness_attestation(&mut self, proposal_id: &str) -> bool {
+        // Scope the mutable borrow on witness_sigs so we can call other
+        // &mut self methods (gossipsub) afterwards.
+        let (sig, pubkey_bytes) = {
+            let sigs = self.witness_sigs.entry(proposal_id.to_string()).or_default();
+            if sigs.iter().any(|(pid, _, _)| *pid == self.local_peer_id) {
+                return true;
+            }
+
+            let sig = match self.local_key.sign(proposal_id.as_bytes()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        proposal_id = proposal_id,
+                        "[sortition] Failed to sign attestation"
+                    );
+                    return false;
+                }
+            };
+
+            let pubkey_bytes = self.local_key.public().encode_protobuf();
+            sigs.push((self.local_peer_id, sig.clone(), pubkey_bytes.clone()));
+            (sig, pubkey_bytes)
+        };
+
+        let pid_bytes = proposal_id.as_bytes();
+        let mut attestation = Vec::with_capacity(
+            1 + 2 + pid_bytes.len() + 2 + pubkey_bytes.len() + 2 + sig.len(),
+        );
+        attestation.push(0x01);
+        attestation.extend_from_slice(&(pid_bytes.len() as u16).to_be_bytes());
+        attestation.extend_from_slice(pid_bytes);
+        attestation.extend_from_slice(&(pubkey_bytes.len() as u16).to_be_bytes());
+        attestation.extend_from_slice(&pubkey_bytes);
+        attestation.extend_from_slice(&(sig.len() as u16).to_be_bytes());
+        attestation.extend_from_slice(&sig);
+
+        let topic =
+            gossipsub::IdentTopic::new(crate::network::protocol::LATTICE_ENCLAVE_CERT_TOPIC);
+        self.track_outbound(&attestation);
+        match self.swarm.behaviour_mut().gossipsub.publish(topic, attestation) {
+            Ok(msg_id) => {
+                info!(
+                    message_id = %msg_id,
+                    proposal_id = proposal_id,
+                    "[sortition] Witness attestation published to mesh"
+                );
+                true
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "[sortition] Failed to publish witness attestation"
+                );
+                false
+            }
+        }
+    }
+
+    /// Derive the deterministic witness panel for a RatificationBlock.
+    fn derive_ratification_panel(&self, proposal_id: &str) -> Vec<PeerId> {
+        let peers: Vec<PeerId> = self.peer_table.iter().map(|info| info.peer_id).collect();
+        crate::sortition::derive_ratification_panel(proposal_id, &self.local_peer_id, &peers)
+    }
+
+    /// Try to commit a RatificationBlock once a quorum of panel signatures
+    /// has been collected.  Idempotent via `commit_manager.is_committed`.
+    fn maybe_commit_ratification_qc(&mut self, proposal_id: &str) {
+        if self.commit_manager.is_committed(proposal_id) {
+            return;
+        }
+
+        let panel = self.derive_ratification_panel(proposal_id);
+        let quorum = crate::sortition::ratification_quorum(panel.len());
+        let sigs = self
+            .witness_sigs
+            .get(proposal_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut panel_sigs: Vec<(PeerId, Vec<u8>, Vec<u8>)> = sigs
+            .into_iter()
+            .filter(|(pid, _, _)| panel.contains(pid))
+            .collect();
+
+        if panel_sigs.len() < quorum {
+            return;
+        }
+
+        // Canonical ordering: every node must derive the same block hash
+        // from the same quorum, regardless of the order attestations arrived.
+        panel_sigs.sort_by(|a, b| a.0.to_bytes().cmp(&b.0.to_bytes()));
+
+        let Some(cert_bytes) = self.cert_cache.get(proposal_id).cloned() else {
+            // We have not yet assembled this RatificationBlock locally (e.g.
+            // an attestation arrived before our epoch handler ran).  Do not
+            // re-derive from local state here: the cached block is the one
+            // the panel actually signed.  We will commit it when the block
+            // is broadcast by the node that completes the quorum, or once
+            // our own epoch handler caches it and we re-evaluate.
+            debug!(
+                proposal_id = proposal_id,
+                "[ratification-qc] Block not in cache yet — deferring commit"
+            );
+            return;
+        };
+
+        let sigs_2tuple: Vec<(PeerId, Vec<u8>)> = panel_sigs
+            .iter()
+            .map(|(pid, sig, _)| (*pid, sig.clone()))
+            .collect();
+
+        match self.commit_manager.commit(&cert_bytes, proposal_id, &sigs_2tuple) {
+            Ok(block_hash) => {
+                info!(
+                    proposal_id = proposal_id,
+                    hash = %hex::encode(block_hash),
+                    sigs = panel_sigs.len(),
+                    "[ratification-qc] RatificationBlock committed via witness QC"
+                );
+                self.publish_committed_block(proposal_id);
+            }
+            Err(e) => {
+                warn!(
+                    proposal_id = proposal_id,
+                    error = %e,
+                    "[ratification-qc] Failed to commit RatificationBlock QC"
+                );
+            }
         }
     }
 
@@ -4684,11 +4848,16 @@ impl LatticeNode {
         info!(
             proposal_id = %proposal_id,
             signatures_collected = count,
-            threshold = 3,
-            "[attestation] Signature collected — {}/3 toward quorum",
-            count
+            "[attestation] Signature collected"
         );
 
+        // Era Two RatificationBlock: drive commit via panel QC.
+        if proposal_id.starts_with("epoch-") {
+            self.maybe_commit_ratification_qc(&proposal_id);
+            return;
+        }
+
+        // ImpactCertificate: 3-of-5 witness quorum.
         // Check quorum — when reached, commit to the hash-chain ledger
         if count >= 3 {
             // Clone signatures and release the borrow on witness_sigs before
@@ -5948,5 +6117,44 @@ mod ratification_block_tests {
         let encoded = block.encode_wire().unwrap();
         assert!(encoded.len() > 1, "should have marker + CBOR body");
         assert_eq!(encoded[0], ERA_TWO_BLOCK_MARKER);
+    }
+
+    #[test]
+    fn ratification_block_commit_with_signatures() {
+        use crate::commit::CommitManager;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().to_path_buf();
+        let mut mgr = CommitManager::open(&storage);
+
+        let block = make_block(7);
+        let cert_bytes = block.encode_wire().unwrap();
+        let sigs: Vec<(PeerId, Vec<u8>)> = (0..3)
+            .map(|i| (PeerId::random(), vec![i as u8, i as u8 + 1, i as u8 + 2]))
+            .collect();
+
+        let hash = mgr.commit(&cert_bytes, &block.proposal_id, &sigs).unwrap();
+        assert_eq!(mgr.height(), 1);
+
+        // Read back the raw frame and verify signatures are persisted.
+        let raw = mgr.get_block_bytes(0).expect("block 0 must exist");
+        assert!(!raw.is_empty());
+
+        let mut reader = std::io::BufReader::new(&raw[..]);
+        let frame = mgr.read_block(&mut reader).unwrap().unwrap();
+        assert_eq!(frame.cert_bytes, cert_bytes);
+        assert_eq!(frame.signatures.len(), 3);
+        assert!(!frame.block_hash.iter().all(|&b| b == 0));
+
+        // Block hash must include the signatures (non-empty sigs → non-zero hash).
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&[0u8; 32]);
+        hasher.update(block.proposal_id.as_bytes());
+        for (_, sig) in &sigs {
+            hasher.update(sig);
+        }
+        let expected_hash: [u8; 32] = hasher.finalize().into();
+        assert_eq!(frame.block_hash, expected_hash);
+        assert_eq!(hash, frame.block_hash);
     }
 }

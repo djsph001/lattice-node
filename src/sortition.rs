@@ -77,6 +77,34 @@ pub fn is_local_witness(panel: &[PeerId], local_id: &PeerId) -> bool {
     panel.contains(local_id)
 }
 
+/// Deterministic witness panel for an Era Two RatificationBlock.
+///
+/// RatificationBlocks have no `witness_seed`, so the `proposal_id`
+/// (`"epoch-{N}"`) is used as the sortition seed.  The peer pool is
+/// all known peers plus the local node, sorted canonically by PeerId so
+/// every node arrives at the same panel regardless of local insertion
+/// order.
+pub fn derive_ratification_panel(
+    proposal_id: &str,
+    local_peer_id: &PeerId,
+    peers: &[PeerId],
+) -> Vec<PeerId> {
+    let mut pool: Vec<PeerId> = peers.to_vec();
+    pool.push(*local_peer_id);
+    pool.sort_by(|a, b| a.to_bytes().cmp(&b.to_bytes()));
+    pool.dedup();
+    select_witness_panel(proposal_id, &pool, &[])
+}
+
+/// Quorum size for a RatificationBlock witness panel.
+///
+/// Uses simple majority: 1-of-1, 2-of-2, 2-of-3, 3-of-4, 3-of-5, etc.
+/// This keeps small meshes usable while retaining majority semantics
+/// for larger panels.
+pub fn ratification_quorum(panel_size: usize) -> usize {
+    (panel_size / 2) + 1
+}
+
 /// Select a deterministic 5-person Witness panel, weighted by thickness.
 ///
 /// Each candidate's selection probability is proportional to their weight.
@@ -168,6 +196,7 @@ pub fn select_weighted_witness_panel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::seq::SliceRandom;
 
     #[test]
     fn test_deterministic_panel_selection() {
@@ -308,6 +337,81 @@ mod tests {
             is_local_witness(&panel, &local),
             "is_local_witness MUST return true when local peer is in the pool"
         );
+    }
+
+    // ── RatificationBlock panel tests ───────────────────────
+
+    #[test]
+    fn ratification_panel_deterministic() {
+        let local = PeerId::random();
+        // Use a pool of exactly 5 peers so the panel is the whole pool
+        // and determinism is easy to verify.
+        let peers: Vec<PeerId> = (0..4).map(|_| PeerId::random()).collect();
+
+        let panel_a = derive_ratification_panel("epoch-42", &local, &peers);
+        let panel_b = derive_ratification_panel("epoch-42", &local, &peers);
+
+        assert_eq!(panel_a, panel_b, "Same inputs must produce the same panel");
+        assert_eq!(panel_a.len(), 5, "Panel should include all peers when pool is 5");
+        assert!(panel_a.contains(&local), "Local peer must be eligible for selection");
+    }
+
+    #[test]
+    fn ratification_panel_caps_at_five() {
+        let local = PeerId::random();
+        let peers: Vec<PeerId> = (0..20).map(|_| PeerId::random()).collect();
+
+        let panel = derive_ratification_panel("epoch-99", &local, &peers);
+
+        assert_eq!(panel.len(), 5, "Panel must be capped at 5 peers");
+    }
+
+    #[test]
+    fn ratification_panel_includes_local_when_pool_small() {
+        let local = PeerId::random();
+        let a = PeerId::random();
+        let b = PeerId::random();
+
+        let panel = derive_ratification_panel("epoch-1", &local, &[a, b]);
+
+        assert_eq!(panel.len(), 3, "Small pool returns all peers");
+        assert!(panel.contains(&local));
+    }
+
+    #[test]
+    fn ratification_panel_sorted_input_invariant() {
+        let local = PeerId::random();
+        let peers: Vec<PeerId> = (0..10).map(|_| PeerId::random()).collect();
+        let mut shuffled = peers.clone();
+        shuffled.shuffle(&mut rand::thread_rng());
+
+        let panel_sorted = derive_ratification_panel("epoch-5", &local, &peers);
+        let panel_shuffled = derive_ratification_panel("epoch-5", &local, &shuffled);
+
+        assert_eq!(
+            panel_sorted, panel_shuffled,
+            "Input order must not affect the derived panel"
+        );
+    }
+
+    #[test]
+    fn ratification_panel_different_seeds_differ() {
+        let local = PeerId::random();
+        let peers: Vec<PeerId> = (0..20).map(|_| PeerId::random()).collect();
+
+        let panel_a = derive_ratification_panel("epoch-1", &local, &peers);
+        let panel_b = derive_ratification_panel("epoch-2", &local, &peers);
+
+        assert_ne!(panel_a, panel_b, "Different epochs should produce different panels");
+    }
+
+    #[test]
+    fn ratification_quorum_values() {
+        assert_eq!(ratification_quorum(1), 1);
+        assert_eq!(ratification_quorum(2), 2);
+        assert_eq!(ratification_quorum(3), 2);
+        assert_eq!(ratification_quorum(4), 3);
+        assert_eq!(ratification_quorum(5), 3);
     }
 }
 

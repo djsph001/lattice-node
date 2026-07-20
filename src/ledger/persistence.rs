@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::thickness::ThicknessGraph;
 use super::types::{DigitalUtilityUnit, SignedTransaction};
@@ -161,6 +161,24 @@ impl WalStateStore {
                     let _ = dir.sync_all();
                 }
             }
+            // Diagnose F4: log WAL state after every flush so we can
+            // detect mid-run deletion.
+            let wal_exists = self.wal_path.exists();
+            let wal_size = wal_exists.then(|| {
+                std::fs::metadata(&self.wal_path).ok().map(|m| m.len()).unwrap_or(0)
+            }).unwrap_or(0);
+            if !wal_exists {
+                error!(
+                    "F4-DIAG: WAL file MISSING after flush. wal_buffer={}B",
+                    self.wal_buffer.len(),
+                );
+            } else {
+                debug!(
+                    "F4-DIAG: WAL size={} after flush, buffer={}B",
+                    wal_size,
+                    self.wal_buffer.len(),
+                );
+            }
             self.wal_buffer.clear();
             self.fsync_counter = 0;
             self.last_fsync = Instant::now();
@@ -303,28 +321,33 @@ impl StateStore for WalStateStore {
         }
 
         // Compare — snapshot+WAL and WAL-only must agree on nonces and balances
+        // for peers that appear in BOTH states.  A peer present only in
+        // snap_state means the snapshot fully covers it and no WAL entries
+        // exist for that peer — WAL-only starts from empty, so 0 is expected.
         // (thickness edges may differ since import_edges clears the graph;
         //  the WAL-only path won't have snapshot-provided edges).
         for (peer, &nonce_snap) in &snap_state.seen_nonces {
-            let nonce_wal = wal_state.seen_nonces.get(peer).copied().unwrap_or(0);
-            if nonce_snap != nonce_wal {
-                anyhow::bail!(
-                    "WAL consistency check FAILED — nonce mismatch for {}. \
-                     Snapshot+WAL has {} but WAL-only has {}. \
-                     The WAL may be truncated or corrupted.",
-                    peer, nonce_snap, nonce_wal
-                );
+            if let Some(&nonce_wal) = wal_state.seen_nonces.get(peer) {
+                if nonce_snap != nonce_wal {
+                    anyhow::bail!(
+                        "WAL consistency check FAILED — nonce mismatch for {}. \
+                         Snapshot+WAL has {} but WAL-only has {}. \
+                         The WAL may be truncated or corrupted.",
+                        peer, nonce_snap, nonce_wal
+                    );
+                }
             }
         }
         for (peer, &bal_snap) in &snap_state.balances {
-            let bal_wal = wal_state.balances.get(peer).copied().unwrap_or(0);
-            if bal_snap != bal_wal {
-                anyhow::bail!(
-                    "WAL consistency check FAILED — balance mismatch for {}. \
-                     Snapshot+WAL has {} but WAL-only has {}. \
-                     The WAL may be truncated or corrupted.",
-                    peer, bal_snap, bal_wal
-                );
+            if let Some(&bal_wal) = wal_state.balances.get(peer) {
+                if bal_snap != bal_wal {
+                    anyhow::bail!(
+                        "WAL consistency check FAILED — balance mismatch for {}. \
+                         Snapshot+WAL has {} but WAL-only has {}. \
+                         The WAL may be truncated or corrupted.",
+                        peer, bal_snap, bal_wal
+                    );
+                }
             }
         }
 

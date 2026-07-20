@@ -582,4 +582,108 @@ mod tests {
              Fix 3 broken version used global max ({}+1={})",
             tx_nonce, 99, global_max, global_max + 1);
     }
+
+    /// Negative test for Fix 5: corrupt one balance in the snapshot CBOR
+    /// and confirm verify_consistency() rejects it loudly.
+    /// An assertion never observed failing is dead code — this proves it lives.
+    #[test]
+    fn verify_consistency_detects_corruption() {
+        let dir = tempdir().unwrap();
+        let cfg = WalStateStoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync_batch_size: 100,
+            fsync_interval: Duration::from_secs(60),
+        };
+        let mut store = WalStateStore::new(cfg).unwrap();
+
+        // Create a snapshot with a real balance
+        let mut snap = PersistentEconomicState::new();
+        let peer_str = "12D3KooWTest00000000000000000000000000000000000000000";
+        snap.seen_nonces.insert(peer_str.into(), 5);
+        snap.balances.insert(peer_str.into(), 1000);
+        store.take_snapshot(&snap).unwrap();
+
+        // Corrupt the snapshot: flip a byte in the CBOR file
+        let snap_path = dir.path().join("state.snapshot");
+        let mut bytes = std::fs::read(&snap_path).unwrap();
+        if bytes.len() > 20 {
+            bytes[15] ^= 0xFF; // flip all bits in one byte
+            std::fs::write(&snap_path, &bytes).unwrap();
+        }
+
+        // verify_consistency should fail — corrupted snapshot won't match WAL
+        let result = store.verify_consistency();
+        assert!(
+            result.is_err(),
+            "verify_consistency() MUST reject a corrupted snapshot. \
+             Got Ok(()) but expected Err — Fix 5 assertion is dead code."
+        );
+    }
+
+    /// Full populated-WAL recovery: persist transactions BEFORE and AFTER
+    /// snapshot, kill-9, recover, and assert all economic effects present.
+    /// This exercises Fix 1 (balance replay), Fix 6 (nonce-gated replay),
+    /// and Fix 5 (consistency assertion on the combined result).
+    #[test]
+    fn populated_wal_recovery_with_snapshot() {
+        let dir = tempdir().unwrap();
+        let cfg = WalStateStoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync_batch_size: 100,
+            fsync_interval: Duration::from_secs(60),
+        };
+        let mut store = WalStateStore::new(cfg).unwrap();
+
+        let kp = make_keypair();
+        let alice = kp.public().to_peer_id();
+        let bob = PeerId::random();
+
+        // ── Phase 1: pre-snapshot transactions ──────────────
+        let mint1 = Transaction::Mint {
+            to: alice.to_string(), amount: DigitalUtilityUnit(5000),
+            authority: alice.to_string(), nonce: 1, timestamp: Utc::now(),
+        };
+        store.persist(&sign(mint1, &kp)).unwrap();
+
+        // ── Phase 2: snapshot at nonce=1, balance=5000 ─────
+        let mut snap = PersistentEconomicState::new();
+        snap.seen_nonces.insert(alice.to_base58(), 1);
+        snap.balances.insert(alice.to_base58(), 5000);
+        store.take_snapshot(&snap).unwrap();
+
+        // ── Phase 3: post-snapshot transactions ─────────────
+        let transfer = Transaction::Transfer {
+            from: alice.to_string(), to: bob.to_string(),
+            amount: DigitalUtilityUnit(300), nonce: 2, timestamp: Utc::now(),
+        };
+        store.persist(&sign(transfer, &kp)).unwrap();
+
+        let mint2 = Transaction::Mint {
+            to: alice.to_string(), amount: DigitalUtilityUnit(200),
+            authority: alice.to_string(), nonce: 3, timestamp: Utc::now(),
+        };
+        store.persist(&sign(mint2, &kp)).unwrap();
+
+        // ── Phase 4: recover (simulate kill-9 restart) ─────
+        let cfg2 = WalStateStoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync_batch_size: 100,
+            fsync_interval: Duration::from_secs(60),
+        };
+        let mut store2 = WalStateStore::new(cfg2).unwrap();
+        let recovered = store2.recover().unwrap();
+
+        // Post-snapshot effects: balance was 5000, transfer -300 = 4700, mint +200 = 4900
+        assert_eq!(recovered.seen_nonces.get(&alice.to_base58()), Some(&3));
+        assert_eq!(recovered.balances.get(&alice.to_base58()), Some(&4900));
+        // Bob got 300
+        assert_eq!(recovered.balances.get(&bob.to_base58()), Some(&300));
+
+        // Fix 5: consistency assertion must pass on uncorrupted data
+        assert!(
+            store2.verify_consistency().is_ok(),
+            "verify_consistency() failed on valid snapshot+WAL — \
+             Fix 5 asserts healthy state as well as detecting corruption."
+        );
+    }
 }

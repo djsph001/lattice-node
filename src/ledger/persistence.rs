@@ -196,6 +196,40 @@ impl WalStateStore {
                     let _ = dir.sync_all();
                 }
             }
+
+            // F4 hardening: after flush, verify the WAL still exists on disk.
+            // If the directory entry was unlinked mid-run (stray rm -rf, etc.),
+            // the held fd writes silently to a dead inode — next recover()
+            // will read by path and find nothing, losing all post-snapshot
+            // transactions.  Detect now, reopen to re-create the directory
+            // entry, so writes land somewhere visible.
+            match std::fs::metadata(&self.wal_path) {
+                Ok(_) => { /* healthy */ }
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    error!(
+                        "F4-RECOVERY: WAL file missing on disk after flush — \
+                         directory entry was unlinked. Reopening handle."
+                    );
+                    // Drop the old handle (it points to a dead inode).
+                    self.wal_file = None;
+                    // Re-create the directory entry by opening fresh.
+                    if let Err(e) = self.open_wal() {
+                        error!(
+                            error = %e,
+                            "F4-RECOVERY: Failed to reopen WAL after deletion. \
+                             Writes from here forward will be orphaned."
+                        );
+                    } else {
+                        info!("F4-RECOVERY: WAL handle re-created successfully.");
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "F4-RECOVERY: Unexpected error checking WAL metadata"
+                    );
+                }
+            }
             // Diagnose F4: log WAL state after every flush so we can
             // detect mid-run deletion.
             let wal_exists = self.wal_path.exists();

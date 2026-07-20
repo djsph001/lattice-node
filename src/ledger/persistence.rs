@@ -90,6 +90,11 @@ pub trait StateStore: Send {
     fn persist(&mut self, tx: &SignedTransaction) -> Result<()>;
     fn recover(&mut self) -> Result<PersistentEconomicState>;
     fn take_snapshot(&mut self, state: &PersistentEconomicState) -> Result<()>;
+    /// Verify that the recovered state is consistent: replay the WAL from
+    /// scratch (ignoring snapshot) and assert the result matches the
+    /// snapshot+WAL recovery.  Returns Ok(()) on match or a detailed error
+    /// describing the first discrepancy.
+    fn verify_consistency(&mut self) -> Result<()>;
 }
 
 // ── WAL State Store ───────────────────────────────────────────────
@@ -263,6 +268,51 @@ impl StateStore for WalStateStore {
         fs::write(&tmp, &bytes)?;
         fs::rename(&tmp, &self.snapshot_path)?;
         info!("Snapshot saved");
+        Ok(())
+    }
+
+    fn verify_consistency(&mut self) -> Result<()> {
+        // Recover normally (snapshot + WAL)
+        let snap_state = self.recover()?;
+
+        // Recover from WAL alone: rename snapshot temporarily out of the way
+        let snap_backup = self.snapshot_path.with_extension("verif_bak");
+        let had_snapshot = self.snapshot_path.exists();
+        if had_snapshot {
+            fs::rename(&self.snapshot_path, &snap_backup)?;
+        }
+        let wal_state = self.recover()?;
+        if had_snapshot {
+            fs::rename(&snap_backup, &self.snapshot_path)?;
+        }
+
+        // Compare — snapshot+WAL and WAL-only must agree on nonces and balances
+        // (thickness edges may differ since import_edges clears the graph;
+        //  the WAL-only path won't have snapshot-provided edges).
+        for (peer, &nonce_snap) in &snap_state.seen_nonces {
+            let nonce_wal = wal_state.seen_nonces.get(peer).copied().unwrap_or(0);
+            if nonce_snap != nonce_wal {
+                anyhow::bail!(
+                    "WAL consistency check FAILED — nonce mismatch for {}. \
+                     Snapshot+WAL has {} but WAL-only has {}. \
+                     The WAL may be truncated or corrupted.",
+                    peer, nonce_snap, nonce_wal
+                );
+            }
+        }
+        for (peer, &bal_snap) in &snap_state.balances {
+            let bal_wal = wal_state.balances.get(peer).copied().unwrap_or(0);
+            if bal_snap != bal_wal {
+                anyhow::bail!(
+                    "WAL consistency check FAILED — balance mismatch for {}. \
+                     Snapshot+WAL has {} but WAL-only has {}. \
+                     The WAL may be truncated or corrupted.",
+                    peer, bal_snap, bal_wal
+                );
+            }
+        }
+
+        info!("WAL consistency check passed — snapshot+WAL and WAL-only agree");
         Ok(())
     }
 }

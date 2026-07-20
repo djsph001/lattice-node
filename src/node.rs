@@ -2292,6 +2292,17 @@ impl LatticeNode {
             "Recovered {} peer nonces from persistence",
             self.seen_nonces.len()
         );
+
+        // Fix 5: Startup consistency assertion — snapshot+WAL state must match
+        // WAL-only replay.  Run this before consuming `store` into self.
+        if let Err(e) = store.verify_consistency() {
+            tracing::error!(
+                error = %e,
+                "PERSISTENCE CONSISTENCY CHECK FAILED — refusing to start"
+            );
+            return Err(e);
+        }
+
         self.state_store = Some(Box::new(store));
 
         // Hydrate economic state: balances from snapshot

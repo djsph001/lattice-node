@@ -119,6 +119,7 @@ impl TaxEngine {
         let peer_count = peers.len();
 
         let mut redistributions = Vec::new();
+        let mut actual_collected = 0u64;
         if tax_owed > 0 && peer_count > 0 {
             let share_per_peer = tax_owed / peer_count as u64;
             if share_per_peer > 0 {
@@ -132,11 +133,9 @@ impl TaxEngine {
                     });
                 }
                 let redistributed_total = share_per_peer * peer_count as u64;
+                actual_collected = redistributed_total;
                 let remainder = tax_owed - redistributed_total;
                 if remainder > 0 {
-                    // Remainder too small to split — absorbed by the epoch.
-                    // In a production system this could accumulate in a
-                    // community pool, but for Phase 5 it simply vanishes.
                     tracing::debug!(
                         epoch,
                         remainder,
@@ -147,16 +146,20 @@ impl TaxEngine {
         }
 
         // ── 5. Log the economic story ────────────────────
+        // Log the actual amount collected, not the theoretical amount owed.
+        // This prevents confusion when tax_owed > 0 but no peers exist to
+        // redistribute to (isolation) — the supply dynamics stay honest.
         tracing::info!(
             epoch,
             balance_before = %self_balance,
             ratio = %format!("{:.2}", ratio),
             tax_rate_bps,
             minted = mint_amount,
-            tax_owed,
+            tax_calculated = tax_owed,
+            tax_collected = actual_collected,
             redistributed_to = peer_count,
             redistribution_share = if peer_count > 0 {
-                (tax_owed / peer_count as u64).to_string()
+                (actual_collected / peer_count as u64).to_string()
             } else {
                 "n/a (no peers)".to_string()
             },

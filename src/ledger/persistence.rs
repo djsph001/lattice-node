@@ -117,6 +117,7 @@ pub struct WalStateStore {
     wal_path: PathBuf,
     snapshot_path: PathBuf,
     wal_buffer: Vec<u8>,
+    wal_file: Option<std::fs::File>,
     fsync_counter: u32,
     last_fsync: Instant,
 }
@@ -127,14 +128,49 @@ impl WalStateStore {
             .with_context(|| format!("creating data dir {:?}", config.data_dir))?;
         let wal_path = config.data_dir.join("transactions.wal");
         let snapshot_path = config.data_dir.join("state.snapshot");
+        // Open the WAL file once at startup and hold the handle open.
+        // Reopening on every flush creates a window where the directory entry
+        // can be unlinked by another operation (e.g. snapshot rotation),
+        // leaving writes going to a phantom inode.  Holding the handle
+        // prevents unlink from releasing the inode.
+        let wal_file = match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal_path)
+        {
+            Ok(f) => {
+                info!("WAL file opened at {:?}", wal_path);
+                Some(f)
+            }
+            Err(e) => {
+                warn!(
+                    error = %e, path = %wal_path.display(),
+                    "Could not open WAL file — persistence will not write transactions"
+                );
+                None
+            }
+        };
         Ok(Self {
             config,
             wal_path,
             snapshot_path,
             wal_buffer: Vec::new(),
+            wal_file,
             fsync_counter: 0,
             last_fsync: Instant::now(),
         })
+    }
+
+    fn open_wal(&mut self) -> Result<&mut std::fs::File> {
+        if self.wal_file.is_none() {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.wal_path)
+                .with_context(|| format!("opening WAL at {:?}", self.wal_path))?;
+            self.wal_file = Some(file);
+        }
+        Ok(self.wal_file.as_mut().unwrap())
     }
 
     fn should_fsync(&self) -> bool {
@@ -146,11 +182,10 @@ impl WalStateStore {
 
     fn flush_wal(&mut self) -> Result<()> {
         if !self.wal_buffer.is_empty() {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.wal_path)?;
-            file.write_all(&self.wal_buffer)?;
+            // Clone buffer to avoid borrow conflict with open_wal().
+            let buf = self.wal_buffer.clone();
+            let file = self.open_wal()?;
+            file.write_all(&buf)?;
             file.sync_all()?;
             // Also sync the parent directory so the file metadata (size,
             // inode) is on disk before we return.  kill -9 between the
@@ -257,13 +292,13 @@ impl StateStore for WalStateStore {
             Err(e) => return Err(e.into()),
         };
 
-        // 2. Replay WAL
-        self.flush_wal()?;
+        // 2. Replay WAL — read directly from path, not from the open handle.
+        //    The handle is for append-mode writes; rewind() + read_to_end()
+        //    can produce "Bad file descriptor" on some kernels when the fd
+        //    is in append mode.
         let mut wal_data = Vec::new();
-        match OpenOptions::new().read(true).open(&self.wal_path) {
-            Ok(mut f) => {
-                f.read_to_end(&mut wal_data)?;
-            }
+        match std::fs::read(&self.wal_path) {
+            Ok(bytes) => wal_data = bytes,
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
                 info!("No WAL found, starting from snapshot only");
                 return Ok(state);

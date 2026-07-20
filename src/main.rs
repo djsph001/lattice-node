@@ -242,6 +242,13 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     force_era_two: bool,
 
+    /// Round 2 Synthesizer: require a witness-panel QC for
+    /// RatificationBlocks. When true, empty or insufficient panel
+    /// signatures are rejected. Default false preserves Round 1
+    /// (single-producer, advisory QC) behavior for the pilot.
+    #[arg(long, default_value_t = false)]
+    require_rb_qc: bool,
+
     // ── Phase 9: agent execution backends ─────────────────────
     /// OpenAI API key (or any OpenAI-compatible key). Enables the
     /// `openai:*` model backend for agent tasks.
@@ -345,6 +352,7 @@ async fn main() -> Result<()> {
         cli.openai_endpoint.clone(),
         cli.ntp_server.clone(),
         cli.skip_ntp_check,
+        cli.require_rb_qc,
     )?;
 
     info!(

@@ -337,6 +337,8 @@ pub struct LatticeNode {
     /// Force Era Two block production regardless of bootstrap state.
     /// Bypasses is_bootstrap_ended() gate for testing/development.
     force_era_two: bool,
+    /// Enforce witness-panel QC for RatificationBlocks (Round 2).
+    require_rb_qc: bool,
     /// NTP servers for runtime clock verification. None = defaults.
     ntp_servers: Option<Vec<String>>,
     /// Skip runtime NTP checks (implied by --skip-ntp-check).
@@ -412,6 +414,7 @@ impl LatticeNode {
         openai_endpoint: Option<String>,
         ntp_servers: Option<Vec<String>>,
         skip_ntp_check: bool,
+        require_rb_qc: bool,
     ) -> Result<Self> {
         let key_path = resolve_identity_path(identity_dir)?;
         let local_key = load_or_generate_identity(&key_path, fresh_identity)?;
@@ -654,6 +657,7 @@ impl LatticeNode {
             vram_bytes,
             no_economics,
             force_era_two,
+            require_rb_qc,
             ntp_servers: ntp_servers.clone(),
             skip_ntp_check,
             refuse_to_sign: false,

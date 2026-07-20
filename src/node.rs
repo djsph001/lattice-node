@@ -1968,6 +1968,7 @@ impl LatticeNode {
                     &self.seen_nonces,
                     &self.ledger.balances,
                     &self.ledger.thickness_graph,
+                    self.tx_nonce,
                 );
                 if let Err(e) = store.take_snapshot(&snapshot) {
                     warn!(error = %e, "Failed to save economic snapshot");
@@ -2272,7 +2273,7 @@ impl LatticeNode {
         use crate::ledger::persistence::{PersistentEconomicState, StateStore, WalStateStore, WalStateStoreConfig};
         let config = WalStateStoreConfig {
             data_dir: data_dir.join("persistence"),
-            fsync_batch_size: 100,
+            fsync_batch_size: 1,
             fsync_interval: Duration::from_millis(100),
         };
         let mut store = WalStateStore::new(config)?;
@@ -2331,13 +2332,18 @@ impl LatticeNode {
             }
         }
 
-        // Recover tx_nonce: use the local node's own recovered nonce so
-        // new transactions pass the `nonce == last_seen[own_id] + 1` rule.
-        // Using a global max would fail when a peer's nonce exceeds ours.
-        let own_nonce = state.seen_nonces.get(&self.local_peer_id.to_base58()).copied().unwrap_or(0);
-        if own_nonce >= self.tx_nonce {
-            self.tx_nonce = own_nonce + 1;
-            info!(tx_nonce = self.tx_nonce, own_nonce, "Recovered tx_nonce from persistence");
+        // Recover tx_nonce from self_tx_nonce field (persisted directly
+        // in the snapshot, not derived from seen_nonces[self]).
+        // Using seen_nonces[self] was fragile: the identity may have been
+        // regenerated (rm -rf ~/.lattice) or no self-tx recorded yet.
+        let recovered_tx_nonce = state.self_tx_nonce;
+        if recovered_tx_nonce >= self.tx_nonce {
+            self.tx_nonce = recovered_tx_nonce + 1;
+            info!(
+                tx_nonce = self.tx_nonce,
+                recovered_tx_nonce,
+                "Recovered tx_nonce from persistence"
+            );
         }
 
         Ok(())

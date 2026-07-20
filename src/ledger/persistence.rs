@@ -25,6 +25,10 @@ pub struct PersistentEconomicState {
     /// Thickness graph edges, keyed by base58 PeerId string.
     /// Each edge is CBOR-encoded ThicknessEdge bytes.
     pub thickness_edges: HashMap<String, Vec<Vec<u8>>>,
+    /// The local node's own tx_nonce at snapshot time.
+    /// Recovered directly instead of derived from seen_nonces[self],
+    /// which may be missing or stale if no self-tx was recorded.
+    pub self_tx_nonce: u64,
 }
 
 impl PersistentEconomicState {
@@ -33,6 +37,7 @@ impl PersistentEconomicState {
             seen_nonces: HashMap::new(),
             balances: HashMap::new(),
             thickness_edges: HashMap::new(),
+            self_tx_nonce: 0,
         }
     }
 
@@ -41,6 +46,7 @@ impl PersistentEconomicState {
         nonces: &HashMap<PeerId, u64>,
         balances: &HashMap<PeerId, DigitalUtilityUnit>,
         thickness: &ThicknessGraph,
+        self_tx_nonce: u64,
     ) -> Self {
         Self {
             seen_nonces: nonces.iter().map(|(k, v)| (k.to_base58(), *v)).collect(),
@@ -53,6 +59,7 @@ impl PersistentEconomicState {
                     (k, encoded)
                 })
                 .collect(),
+            self_tx_nonce,
         }
     }
 
@@ -145,6 +152,15 @@ impl WalStateStore {
                 .open(&self.wal_path)?;
             file.write_all(&self.wal_buffer)?;
             file.sync_all()?;
+            // Also sync the parent directory so the file metadata (size,
+            // inode) is on disk before we return.  kill -9 between the
+            // write and the directory sync can lose the last entries even
+            // after file.sync_all().
+            if let Some(parent) = self.wal_path.parent() {
+                if let Ok(dir) = std::fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
             self.wal_buffer.clear();
             self.fsync_counter = 0;
             self.last_fsync = Instant::now();

@@ -261,25 +261,25 @@ impl WalStateStore {
             Err(_) => return,
         };
         let nonce = tx.transaction.nonce();
+        // Check ordering BEFORE inserting: WAL entries must be
+        // exactly `last_seen + 1`.  A gap means the WAL is out of
+        // sync with the snapshot — skip the entry without creating a
+        // 0-entry that would pollute the state and trigger Fix 5
+        // false positives on the WAL-only comparison.
+        let expected = state.seen_nonces.get(&signer).copied().unwrap_or(0) + 1;
+        if nonce != expected {
+            warn!(
+                "WAL replay gap detected — skipping out-of-order entry. \
+                 expected={expected} got={nonce} signer={signer}"
+            );
+            return;
+        }
         let entry = state.seen_nonces.entry(signer.clone()).or_insert(0);
         if nonce <= *entry {
             return; // Already in snapshot — skip double-apply
         }
-        // Enforce strict ordering: WAL entries must be exactly `last_seen + 1`.
-        // A `>` gap means a WAL entry was lost or reordered — don't silently
-        // apply under a permissive rule.  Aligns replay with consensus
-        // (`nonce == last_seen + 1` in validation.rs).
-        if nonce != *entry + 1 {
-            warn!(
-                expected = *entry + 1,
-                got = nonce,
-                signer = %signer,
-                "WAL replay gap detected — skipping out-of-order entry. \
-                 The WAL may be corrupted or truncated."
-            );
-            return;
-        }
         *entry = nonce;
+
         // Apply economic effects only for NEW transactions (not yet in snapshot).
         match &tx.transaction {
                 crate::ledger::types::Transaction::Mint { to, amount, .. } => {

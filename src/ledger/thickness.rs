@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use libp2p::PeerId;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 /// Identifies a specific verified receipt (the Blake3 message_hash).
 pub type ReceiptId = [u8; 32];
@@ -60,6 +61,118 @@ pub enum ThicknessSource {
     },
 }
 
+// ── Custom serde for ThicknessSource (PeerId doesn't impl serde) ──
+impl Serialize for ThicknessSource {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        match self {
+            ThicknessSource::VerifiedContribution { receipt_id, amount } => {
+                let mut st = s.serialize_struct("ThicknessSource", 3)?;
+                st.serialize_field("variant", "VerifiedContribution")?;
+                st.serialize_field("receipt_id", &hex::encode(receipt_id))?;
+                st.serialize_field("amount", amount)?;
+                st.end()
+            }
+            ThicknessSource::Genesis { original_amount, amortize_over } => {
+                let mut st = s.serialize_struct("ThicknessSource", 3)?;
+                st.serialize_field("variant", "Genesis")?;
+                st.serialize_field("original_amount", original_amount)?;
+                st.serialize_field("amortize_over", amortize_over)?;
+                st.end()
+            }
+            ThicknessSource::Vouch { voucher, vouch_nonce, stake_bps, expiration_epoch } => {
+                let mut st = s.serialize_struct("ThicknessSource", 5)?;
+                st.serialize_field("variant", "Vouch")?;
+                st.serialize_field("voucher", &voucher.to_base58())?;
+                st.serialize_field("vouch_nonce", vouch_nonce)?;
+                st.serialize_field("stake_bps", stake_bps)?;
+                st.serialize_field("expiration_epoch", expiration_epoch)?;
+                st.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ThicknessSource {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de;
+
+        #[derive(Deserialize)]
+        struct ThicknessSourceHelper {
+            variant: String,
+            receipt_id: Option<String>,
+            amount: Option<f64>,
+            original_amount: Option<f64>,
+            amortize_over: Option<Option<u64>>,
+            voucher: Option<String>,
+            vouch_nonce: Option<u64>,
+            stake_bps: Option<u32>,
+            expiration_epoch: Option<Option<u64>>,
+        }
+
+        let helper = ThicknessSourceHelper::deserialize(d)?;
+        match helper.variant.as_str() {
+            "VerifiedContribution" => {
+                let receipt_id = helper.receipt_id.ok_or_else(|| de::Error::missing_field("receipt_id"))?;
+                let receipt_id_bytes = hex::decode(&receipt_id)
+                    .map_err(|e| de::Error::custom(format!("invalid hex receipt_id: {e}")))?;
+                if receipt_id_bytes.len() != 32 {
+                    return Err(de::Error::custom("receipt_id must be 32 bytes"));
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&receipt_id_bytes);
+                Ok(ThicknessSource::VerifiedContribution {
+                    receipt_id: arr,
+                    amount: helper.amount.ok_or_else(|| de::Error::missing_field("amount"))?,
+                })
+            }
+            "Genesis" => {
+                Ok(ThicknessSource::Genesis {
+                    original_amount: helper.original_amount.ok_or_else(|| de::Error::missing_field("original_amount"))?,
+                    amortize_over: helper.amortize_over.flatten(),
+                })
+            }
+            "Vouch" => {
+                let voucher_str = helper.voucher.ok_or_else(|| de::Error::missing_field("voucher"))?;
+                let voucher: PeerId = voucher_str.parse()
+                    .map_err(|e| de::Error::custom(format!("invalid PeerId: {e}")))?;
+                Ok(ThicknessSource::Vouch {
+                    voucher,
+                    vouch_nonce: helper.vouch_nonce.ok_or_else(|| de::Error::missing_field("vouch_nonce"))?,
+                    stake_bps: helper.stake_bps.ok_or_else(|| de::Error::missing_field("stake_bps"))?,
+                    expiration_epoch: helper.expiration_epoch.flatten(),
+                })
+            }
+            other => Err(de::Error::unknown_variant(other, &["VerifiedContribution", "Genesis", "Vouch"])),
+        }
+    }
+}
+
+impl Serialize for ThicknessEdge {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("ThicknessEdge", 2)?;
+        st.serialize_field("source", &self.source)?;
+        st.serialize_field("created", &self.created)?;
+        st.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ThicknessEdge {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct ThicknessEdgeHelper {
+            source: ThicknessSource,
+            created: chrono::DateTime<chrono::Utc>,
+        }
+        let helper = ThicknessEdgeHelper::deserialize(d)?;
+        Ok(ThicknessEdge {
+            source: helper.source,
+            created: helper.created,
+        })
+    }
+}
+
 /// A single edge in the provenance graph.
 #[derive(Debug, Clone)]
 pub struct ThicknessEdge {
@@ -91,27 +204,36 @@ impl ThicknessGraph {
     }
 
     /// Export edges for snapshot serialization.
-    /// Returns a map of peer-base58 → list of (source_debug, created_timestamp).
-    pub fn export_edges(&self) -> HashMap<String, Vec<(String, i64)>> {
+    /// Returns a map of peer-base58 → list of serializable ThicknessEdges.
+    pub fn export_edges(&self) -> HashMap<String, Vec<ThicknessEdge>> {
         self.edges
             .iter()
             .map(|(peer, edges)| {
-                let serialized: Vec<(String, i64)> = edges
-                    .iter()
-                    .map(|e| (format!("{:?}", e.source), e.created.timestamp()))
-                    .collect();
-                (peer.to_base58(), serialized)
+                (peer.to_base58(), edges.clone())
             })
             .collect()
     }
 
     /// Import edges from deserialized snapshot data.
-    pub fn import_edges(&mut self, _data: HashMap<String, Vec<(String, i64)>>) {
-        // TODO: reconstruct ThicknessEdge from serialized data.
-        // For now, edges are recovered via WAL replay — the snapshot
-        // is a performance optimization for faster startup.
-        // The full state is always recoverable from WAL alone.
-        warn!("ThicknessGraph snapshot import not yet implemented — recovering from WAL");
+    /// Reconstructs the in-memory ThicknessGraph from serializable edge data.
+    /// Clears existing edges first for idempotent re-import.
+    pub fn import_edges(&mut self, data: HashMap<String, Vec<ThicknessEdge>>) {
+        self.edges.clear();
+        self.genesis_used = false;
+        let mut imported_count = 0u64;
+        for (peer_str, edges) in data {
+            if let Ok(peer) = peer_str.parse::<PeerId>() {
+                let entry = self.edges.entry(peer).or_default();
+                for edge in edges {
+                    if matches!(edge.source, ThicknessSource::Genesis { .. }) {
+                        self.genesis_used = true;
+                    }
+                    entry.push(edge);
+                    imported_count += 1;
+                }
+            }
+        }
+        info!(imported_count, "Thickness edges restored from snapshot");
     }
 
     // ── Genesis ────────────────────────────────────────────

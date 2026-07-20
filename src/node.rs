@@ -2292,6 +2292,7 @@ impl LatticeNode {
             "Recovered {} peer nonces from persistence",
             self.seen_nonces.len()
         );
+        self.state_store = Some(Box::new(store));
 
         // Hydrate economic state: balances from snapshot
         let (_, balances) = state.export_state();
@@ -2302,7 +2303,32 @@ impl LatticeNode {
             info!(count = balances.len(), "Recovered balances from economic snapshot");
         }
 
-        self.state_store = Some(Box::new(store));
+        // Hydrate thickness graph from snapshot edges
+        if !state.thickness_edges.is_empty() {
+            use crate::ledger::thickness::ThicknessEdge;
+            let mut decoded_edges: HashMap<String, Vec<ThicknessEdge>> = HashMap::new();
+            for (peer_str, edge_blobs) in &state.thickness_edges {
+                let edges: Vec<ThicknessEdge> = edge_blobs.iter()
+                    .filter_map(|blob| serde_cbor::from_slice::<ThicknessEdge>(blob).ok())
+                    .collect();
+                if !edges.is_empty() {
+                    decoded_edges.insert(peer_str.clone(), edges);
+                }
+            }
+            if !decoded_edges.is_empty() {
+                self.ledger.thickness_graph.import_edges(decoded_edges);
+            }
+        }
+
+        // Recover tx_nonce: use the local node's own recovered nonce so
+        // new transactions pass the `nonce == last_seen[own_id] + 1` rule.
+        // Using a global max would fail when a peer's nonce exceeds ours.
+        let own_nonce = state.seen_nonces.get(&self.local_peer_id.to_base58()).copied().unwrap_or(0);
+        if own_nonce >= self.tx_nonce {
+            self.tx_nonce = own_nonce + 1;
+            info!(tx_nonce = self.tx_nonce, own_nonce, "Recovered tx_nonce from persistence");
+        }
+
         Ok(())
     }
 

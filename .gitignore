@@ -1,12 +1,16 @@
-# Rust build artifacts
-/target
 
-# Node identity secrets — never commit private keys
+.DS_Store
+# Editor / OS cruft
 *.key
 .lattice/
-
-# Editor / OS cruft
-*.swp
-.DS_Store
 lattice-simulation/
+lattice-storage*/
 lattice-storage/
+# Node identity secrets — never commit private keys
+relay.log
+# Rust build artifacts
+state.snapshot
+*.swp
+/target
+*.wal
+z4.log

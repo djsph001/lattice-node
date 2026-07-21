@@ -1924,7 +1924,8 @@ impl LatticeNode {
                 for (peer, nonce) in seen {
                     self.seen_nonces.insert(peer, nonce);
                 }
-                // Insert into outbound queue and flush (mint).
+                self.on_transaction_applied(&signed);
+                // Insert into outbound queue and flush.
                 self.outbound
                     .entry(self.local_peer_id)
                     .or_default()

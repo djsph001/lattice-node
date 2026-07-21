@@ -1890,20 +1890,21 @@ impl LatticeNode {
                 for (peer, nonce) in seen {
                     self.seen_nonces.insert(peer, nonce);
                 }
-                // Insert into outbound queue and flush (mint).
-                self.outbound
-                    .entry(self.local_peer_id)
-                    .or_default()
-                    .insert(self.tx_nonce, signed);
-                self.outbound_insertion_times.insert(
-                    (self.local_peer_id, self.tx_nonce), Instant::now(),
-                );
-                self.flush_outbound();
-                self.economic_engine.metrics.record_transaction_submitted();
             }
-        }
+            self.on_transaction_applied(&signed);
+            // Insert into outbound queue and flush (mint).
+            self.outbound
+                .entry(self.local_peer_id)
+                .or_default()
+                .insert(self.tx_nonce, signed);
+            self.outbound_insertion_times.insert(
+                (self.local_peer_id, self.tx_nonce), Instant::now(),
+            );
+            self.flush_outbound();
+            self.economic_engine.metrics.record_transaction_submitted();
+    }
 
-        // Sign and broadcast redistribution transfers.
+    // Sign and broadcast redistribution transfers.
         for mut transfer in epoch_txns.redistributions {
             self.tx_nonce += 1;
             set_transaction_nonce(&mut transfer, self.tx_nonce);
@@ -1924,18 +1925,23 @@ impl LatticeNode {
                 for (peer, nonce) in seen {
                     self.seen_nonces.insert(peer, nonce);
                 }
-                self.on_transaction_applied(&signed);
-                // Insert into outbound queue and flush.
-                self.outbound
-                    .entry(self.local_peer_id)
-                    .or_default()
-                    .insert(self.tx_nonce, signed);
-                self.outbound_insertion_times.insert(
-                    (self.local_peer_id, self.tx_nonce), Instant::now(),
-                );
-                self.flush_outbound();
-                self.economic_engine.metrics.record_transaction_submitted();
             }
+            // Persist to WAL regardless of validation outcome so the
+            // nonce is consumed and WAL-only replay reproduces the
+            // same skip.  Without this, a failed validation consumes
+            // tx_nonce without writing the entry, creating a hole
+            // that breaks nonce continuity on recovery.
+            self.on_transaction_applied(&signed);
+            // Insert into outbound queue and flush.
+            self.outbound
+                .entry(self.local_peer_id)
+                .or_default()
+                .insert(self.tx_nonce, signed);
+            self.outbound_insertion_times.insert(
+                (self.local_peer_id, self.tx_nonce), Instant::now(),
+            );
+            self.flush_outbound();
+            self.economic_engine.metrics.record_transaction_submitted();
         }
 
         // Sync heartbeats_sent from node into metrics.
@@ -2120,6 +2126,7 @@ impl LatticeNode {
         for (peer, nonce) in seen {
             self.seen_nonces.insert(peer, nonce);
         }
+        self.on_transaction_applied(&signed);
 
         // Broadcast so other nodes learn about it.
         self.broadcast_transaction(&signed)?;

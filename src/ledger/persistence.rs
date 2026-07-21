@@ -97,6 +97,8 @@ pub trait StateStore: Send {
     fn persist(&mut self, tx: &SignedTransaction) -> Result<()>;
     fn recover(&mut self) -> Result<PersistentEconomicState>;
     fn take_snapshot(&mut self, state: &PersistentEconomicState) -> Result<()>;
+    /// Returns (last_snapshot_epoch, wal_bytes, wal_entry_count).
+    fn get_stats(&self) -> (u64, u64, u64);
     /// Verify that the recovered state is consistent: replay the WAL from
     /// scratch (ignoring snapshot) and assert the result matches the
     /// snapshot+WAL recovery.  Returns Ok(()) on match or a detailed error
@@ -120,6 +122,7 @@ pub struct WalStateStore {
     wal_file: Option<std::fs::File>,
     fsync_counter: u32,
     last_fsync: Instant,
+    last_snapshot_epoch: u64,
 }
 
 impl WalStateStore {
@@ -158,6 +161,7 @@ impl WalStateStore {
             wal_file,
             fsync_counter: 0,
             last_fsync: Instant::now(),
+            last_snapshot_epoch: 0,
         })
     }
 
@@ -372,6 +376,19 @@ impl StateStore for WalStateStore {
         fs::rename(&tmp, &self.snapshot_path)?;
         info!("Snapshot saved");
         Ok(())
+    }
+
+    fn get_stats(&self) -> (u64, u64, u64) {
+        let size = std::fs::metadata(&self.wal_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        // Estimate entry count from WAL size (4-byte length prefix + CBOR overhead)
+        let est_entries = if size > 0 {
+            (size / 120).max(1)
+        } else {
+            0
+        };
+        (self.last_snapshot_epoch, size, est_entries)
     }
 
     fn verify_consistency(&mut self) -> Result<()> {

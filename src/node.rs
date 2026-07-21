@@ -5210,6 +5210,73 @@ impl LatticeNode {
                     message: format!("Unknown domain_tag: {}", domain_tag),
                 },
             },
+            // ── Read-only query API (v1) ──────────────────────────
+            ApiRequest::GetPeers => {
+                let peers: Vec<_> = self.peer_table.iter()
+                    .filter(|p| p.peer_id != self.local_peer_id)
+                    .map(|p| {
+                        let queue_depth = self.outbound
+                            .get(&p.peer_id)
+                            .map(|q| q.len() as u64)
+                            .unwrap_or(0);
+                        let dead = self.dead_peer_ids();
+                        crate::api::PeerInfo {
+                            peer_id: p.peer_id.to_base58(),
+                            name: None,
+                            heartbeats: 0,
+                            silence_secs: 0,
+                            is_dead: dead.contains(&p.peer_id),
+                            queue_depth,
+                        }
+                    })
+                    .collect();
+                ApiResponse::Peers { peers }
+            }
+            ApiRequest::GetEpochState => {
+                ApiResponse::EpochState {
+                    epoch: 0,
+                    ratio: 0.0,
+                    tax_calculated: 0,
+                    tax_collected: 0,
+                    minted: 0,
+                    redistributed_to: 0,
+                }
+            }
+            ApiRequest::GetEconomicState => {
+                let own_balance = self.ledger.balance_of(&self.local_peer_id);
+                let peers = Vec::new();
+                ApiResponse::EconomicState {
+                    own_balance: own_balance.0,
+                    own_nonce: self.tx_nonce,
+                    peers,
+                }
+            }
+            ApiRequest::GetNodeInfo => {
+                let genesis_id = self.genesis_root.as_ref()
+                    .map(|g| g.to_string())
+                    .unwrap_or_else(|| "auto".to_string());
+                ApiResponse::NodeInfo {
+                    peer_id: self.local_peer_id.to_base58(),
+                    name: self.node_name.clone(),
+                    genesis_root_id: genesis_id,
+                    chain_tip: self.commit_manager.height(),
+                    uptime_secs: std::time::Instant::now()
+                        .duration_since(self.start_time)
+                        .as_secs(),
+                    build_commit: env!("BUILD_COMMIT").to_string(),
+                }
+            }
+            ApiRequest::GetPersistenceState => {
+                let (snap_epoch, wal_bytes, wal_entries) = match &self.state_store {
+                    Some(store) => store.get_stats(),
+                    None => (0, 0, 0),
+                };
+                ApiResponse::PersistenceState {
+                    last_snapshot_epoch: snap_epoch,
+                    wal_bytes,
+                    wal_entries,
+                }
+            }
         };
 
         let _ = msg.reply.send(response);

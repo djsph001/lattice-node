@@ -21,6 +21,25 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info};
 
+/// A peer entry in the GetPeers response.
+#[derive(Debug, Serialize)]
+pub struct PeerInfo {
+    pub peer_id: String,
+    pub name: Option<String>,
+    pub heartbeats: u64,
+    pub silence_secs: u64,
+    pub is_dead: bool,
+    pub queue_depth: u64,
+}
+
+/// A peer balance entry in the GetEconomicState response.
+#[derive(Debug, Serialize)]
+pub struct PeerBalance {
+    pub peer_id: String,
+    pub balance: u64,
+    pub nonce: u64,
+}
+
 // ── Request / Response types ──────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -30,6 +49,11 @@ pub enum ApiRequest {
     GetBlock { height: u64 },
     GetCertificate { proposal_id: String },
     GetStats,
+    GetPeers,
+    GetEpochState,
+    GetEconomicState,
+    GetNodeInfo,
+    GetPersistenceState,
     /// Phase 8: Submit an agent task for distributed execution.
     AgentSubmit {
         task_id: String,
@@ -76,6 +100,40 @@ pub enum ApiResponse {
     Stats {
         height: u64,
         committed_count: u64,
+    },
+    /// Dashboard peers list — heartbeat liveness, silence, queue depth.
+    Peers {
+        peers: Vec<PeerInfo>,
+    },
+    /// Epoch state — last completed epoch's economic parameters.
+    EpochState {
+        epoch: u64,
+        ratio: f64,
+        tax_calculated: u64,
+        tax_collected: u64,
+        minted: u64,
+        redistributed_to: u64,
+    },
+    /// Economic state — balances, nonces.
+    EconomicState {
+        own_balance: u64,
+        own_nonce: u64,
+        peers: Vec<PeerBalance>,
+    },
+    /// Node identity and build info.
+    NodeInfo {
+        peer_id: String,
+        name: String,
+        genesis_root_id: String,
+        chain_tip: u64,
+        uptime_secs: u64,
+        build_commit: String,
+    },
+    /// Persistence state — WAL and snapshot status.
+    PersistenceState {
+        last_snapshot_epoch: u64,
+        wal_bytes: u64,
+        wal_entries: u64,
     },
     Error {
         message: String,

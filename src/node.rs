@@ -5223,8 +5223,13 @@ impl LatticeNode {
                         crate::api::PeerInfo {
                             peer_id: p.peer_id.to_base58(),
                             name: None,
-                            heartbeats: 0,
-                            silence_secs: 0,
+                            heartbeats: p.heartbeats_received,
+                            silence_secs: {
+                                let elapsed = chrono::Utc::now()
+                                    .signed_duration_since(p.last_seen)
+                                    .num_seconds();
+                                if elapsed > 0 { elapsed as u64 } else { 0 }
+                            },
                             is_dead: dead.contains(&p.peer_id),
                             queue_depth,
                         }

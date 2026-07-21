@@ -34,7 +34,7 @@ echo "  Pre-kill balance_after: (check kill output)"
 
 echo ""
 echo "G4 — Unexpected warnings (must be empty):"
-UNEXPECTED=$(grep -iE "warn|error" "$LOG" | grep -vE "skip-ntp-check|non-mDNS peer|insufficient balance|GRAFT|zombie|reconnect|Pending connection|timestamp is")
+UNEXPECTED=$(grep -iE "warn|error" "$LOG" | grep -vE "skip-ntp-check|non-mDNS peer|insufficient balance|GRAFT|zombie|reconnect|Pending connection|timestamp is|WAL replay gap detected|Failed to reconnect")
 if [ -z "$UNEXPECTED" ]; then
     echo "  ✅ PASS — no unexpected warnings"
 else

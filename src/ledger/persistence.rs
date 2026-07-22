@@ -96,7 +96,7 @@ impl PersistentEconomicState {
 pub trait StateStore: Send {
     fn persist(&mut self, tx: &SignedTransaction) -> Result<()>;
     fn recover(&mut self) -> Result<PersistentEconomicState>;
-    fn take_snapshot(&mut self, state: &PersistentEconomicState) -> Result<()>;
+    fn take_snapshot(&mut self, epoch: u64, state: &PersistentEconomicState) -> Result<()>;
     /// Returns (last_snapshot_epoch, wal_bytes, wal_entry_count).
     fn get_stats(&self) -> (u64, u64, u64);
     /// Verify that the recovered state is consistent: replay the WAL from
@@ -368,13 +368,14 @@ impl StateStore for WalStateStore {
         Ok(state)
     }
 
-    fn take_snapshot(&mut self, state: &PersistentEconomicState) -> Result<()> {
+    fn take_snapshot(&mut self, epoch: u64, state: &PersistentEconomicState) -> Result<()> {
         self.flush_wal()?;
         let bytes = serde_cbor::to_vec(state)?;
         let tmp = self.snapshot_path.with_extension("tmp");
         fs::write(&tmp, &bytes)?;
         fs::rename(&tmp, &self.snapshot_path)?;
-        info!("Snapshot saved");
+        self.last_snapshot_epoch = epoch;
+        info!(epoch, "Snapshot saved");
         Ok(())
     }
 
@@ -494,10 +495,13 @@ mod tests {
         let mut state = PersistentEconomicState::new();
         state.seen_nonces.insert("test-peer".into(), 42);
         state.balances.insert("test-peer".into(), 1000);
-        store.take_snapshot(&state).unwrap();
+        store.take_snapshot(1, &state).unwrap();
         let recovered = store.recover().unwrap();
         assert_eq!(recovered.seen_nonces.get("test-peer"), Some(&42));
         assert_eq!(recovered.balances.get("test-peer"), Some(&1000));
+        // Verify last_snapshot_epoch is wired (was always 0 before fix)
+        let (snap_epoch, _, _) = store.get_stats();
+        assert_eq!(snap_epoch, 1, "get_stats must report epoch passed to take_snapshot");
     }
 
     /// Round-trip test: persist Mint + Transfer transactions, take snapshot,
@@ -544,7 +548,7 @@ mod tests {
         snap.seen_nonces.insert(peer.to_base58(), 2);
         snap.balances.insert(peer.to_base58(), 4800); // 5000 - 200
         // Thickness edges don't apply to Mint/Transfer, but verify they're empty test
-        store.take_snapshot(&snap).unwrap();
+        store.take_snapshot(5, &snap).unwrap();
         let _wal_path = store.wal_path.clone();
 
         // ── Phase 3: recover into fresh store ──────────────
@@ -645,9 +649,7 @@ mod tests {
         };
         let vouch_bytes = serde_cbor::to_vec(&vouch_edge).unwrap();
         snap.thickness_edges.insert(vouchee.to_base58(), vec![vouch_bytes]);
-        store.take_snapshot(&snap).unwrap();
-
-        // ── Recover and verify ─────────────────────────────
+        store.take_snapshot(10, &snap).unwrap();
         let cfg2 = WalStateStoreConfig {
             data_dir: dir.path().to_path_buf(),
             fsync_batch_size: 100,
@@ -686,7 +688,7 @@ mod tests {
         let mut snap = PersistentEconomicState::new();
         snap.seen_nonces.insert(own_peer.to_base58(), 3);
         snap.seen_nonces.insert(peer_peer.to_base58(), 99);
-        store.take_snapshot(&snap).unwrap();
+        store.take_snapshot(3, &snap).unwrap();
 
         // Recover
         let mut recovered = store.recover().unwrap();
@@ -726,7 +728,7 @@ mod tests {
         let peer_str = "12D3KooWTest00000000000000000000000000000000000000000";
         snap.seen_nonces.insert(peer_str.into(), 5);
         snap.balances.insert(peer_str.into(), 1000);
-        store.take_snapshot(&snap).unwrap();
+        store.take_snapshot(2, &snap).unwrap();
 
         // Corrupt the snapshot: flip a byte in the CBOR file
         let snap_path = dir.path().join("state.snapshot");
@@ -774,7 +776,7 @@ mod tests {
         let mut snap = PersistentEconomicState::new();
         snap.seen_nonces.insert(alice.to_base58(), 1);
         snap.balances.insert(alice.to_base58(), 5000);
-        store.take_snapshot(&snap).unwrap();
+        store.take_snapshot(7, &snap).unwrap();
 
         // ── Phase 3: post-snapshot transactions ─────────────
         let transfer = Transaction::Transfer {

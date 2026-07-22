@@ -1977,7 +1977,7 @@ impl LatticeNode {
                     &self.ledger.thickness_graph,
                     self.tx_nonce,
                 );
-                if let Err(e) = store.take_snapshot(&snapshot) {
+                if let Err(e) = store.take_snapshot(epoch, &snapshot) {
                     warn!(error = %e, "Failed to save economic snapshot");
                 }
             }

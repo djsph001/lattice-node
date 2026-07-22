@@ -5239,7 +5239,7 @@ impl LatticeNode {
             }
             ApiRequest::GetEpochState => {
                 ApiResponse::EpochState {
-                    epoch: 0,
+                    epoch: self.economic_engine.epoch_count(),
                     ratio: 0.0,
                     tax_calculated: 0,
                     tax_collected: 0,
@@ -5249,7 +5249,21 @@ impl LatticeNode {
             }
             ApiRequest::GetEconomicState => {
                 let own_balance = self.ledger.balance_of(&self.local_peer_id);
-                let peers = Vec::new();
+                let peers: Vec<_> = self.peer_table.iter()
+                    .filter(|p| p.peer_id != self.local_peer_id)
+                    .map(|p| {
+                        let nonce = self.seen_nonces
+                            .get(&p.peer_id)
+                            .copied()
+                            .unwrap_or(0);
+                        let bal = self.ledger.balance_of(&p.peer_id);
+                        crate::api::PeerBalance {
+                            peer_id: p.peer_id.to_base58(),
+                            balance: bal.0,
+                            nonce,
+                        }
+                    })
+                    .collect();
                 ApiResponse::EconomicState {
                     own_balance: own_balance.0,
                     own_nonce: self.tx_nonce,

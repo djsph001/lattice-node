@@ -512,37 +512,6 @@ impl LatticeNode {
                     .subscribe(&block_topic)
                     .map_err(|e| anyhow::anyhow!("gossipsub block subscribe: {e}"))?;
 
-                // ── Cell Network: topic subscriptions ──────────
-                // Passive receive only — no relationships, trust, or
-                // truth judgments are inferred from message receipt.
-                let cell_rel_topic = gossipsub::IdentTopic::new(
-                    crate::message::types::TOPIC_CELL_RELATIONSHIP,
-                );
-                gossipsub
-                    .subscribe(&cell_rel_topic)
-                    .map_err(|e| anyhow::anyhow!("gossipsub cell-relationship subscribe: {e}"))?;
-
-                let cell_exp_topic = gossipsub::IdentTopic::new(
-                    crate::message::types::TOPIC_CELL_EXPERIMENT,
-                );
-                gossipsub
-                    .subscribe(&cell_exp_topic)
-                    .map_err(|e| anyhow::anyhow!("gossipsub cell-experiment subscribe: {e}"))?;
-
-                let cell_refl_topic = gossipsub::IdentTopic::new(
-                    crate::message::types::TOPIC_CELL_REFLECTION,
-                );
-                gossipsub
-                    .subscribe(&cell_refl_topic)
-                    .map_err(|e| anyhow::anyhow!("gossipsub cell-reflection subscribe: {e}"))?;
-
-                let cell_disc_topic = gossipsub::IdentTopic::new(
-                    crate::message::types::TOPIC_CELL_DISCOVERY,
-                );
-                gossipsub
-                    .subscribe(&cell_disc_topic)
-                    .map_err(|e| anyhow::anyhow!("gossipsub cell-discovery subscribe: {e}"))?;
-
                 let rpc = request_response::Behaviour::new(
                     [(LatticeProtocol, request_response::ProtocolSupport::Full)],
                     request_response::Config::default(),
@@ -3983,27 +3952,9 @@ impl LatticeNode {
                 }
             }
 
-            // ── Cell Network: passive handlers ─────────────────
-            LatticeMessage::CellRelationship(rel) => {
-                info!("Cell relationship message received (provenance recorded)");
             }
-            LatticeMessage::CellExperiment(exp) => {
-                info!(
-                    cell = %exp.cell.to_base58(),
-                    experiment = %hex::encode(exp.experiment_id),
-                    "Cell experiment message received (provenance recorded)"
-                );
-            }
-            LatticeMessage::CellReflection(_) => {
-                info!("Cell reflection message received (provenance recorded)");
-            }
-        }
 
-        // Phase 6: issue a relay receipt to the delivering peer —
-        // but ONLY when the message originated from someone else.
-        // A receipt attests: "you carried someone else's traffic."
-        // If the message originated from the same peer that delivered it,
-        // there's no relay work to attest — they're just talking to us.
+            // there's no relay work to attest — they're just talking to us.
         let is_relay = Self::is_relay_work(message_source, &propagation_source);
         if is_relay {
             let msg_hash = *message_hash.as_bytes();
@@ -6127,9 +6078,6 @@ mod zombie_eviction_tests {
             last_seen: Utc::now(),
             heartbeats_received: 1,
             last_heartbeat_epoch: 0, // never seen a heartbeat since epoch tracking started
-            cell_participations: Vec::new(),
-            is_infrastructure: false,
-            declared_purpose: None,
         };
 
         // At epoch 31, 31-0 = 31 > 30 → zombie
@@ -6186,9 +6134,6 @@ mod zombie_eviction_tests {
             last_seen: Utc::now(),
             heartbeats_received: 10,
             last_heartbeat_epoch: 5, // just received a heartbeat
-            cell_participations: Vec::new(),
-            is_infrastructure: false,
-            declared_purpose: None,
         };
 
         // 5 - 5 = 0 → not zombie

@@ -22,19 +22,6 @@ pub enum LatticeMessage {
 
     /// Phase 8: Agent task submission.
     AgentTask(AgentTaskMsg),
-
-    // ── Cell Network: domain-layer messages ──────────────────
-    /// Cell relationship lifecycle (propose/accept/reject/terminate).
-    /// Topic: lattice/cell/relationship/v1
-    CellRelationship(CellRelationshipMsg),
-
-    /// Experiment announcement from a Prototype Cell.
-    /// Topic: lattice/cell/experiment/v1
-    CellExperiment(CellExperimentMsg),
-
-    /// Knowledge sharing — reflection or insight from a cell.
-    /// Topic: lattice/cell/reflection/v1
-    CellReflection(CellReflectionMsg),
 }
 
 /// Lightweight liveness signal broadcast at regular intervals.
@@ -397,16 +384,6 @@ impl RatificationBlock {
 // Three topics, one source of truth for topic name strings.
 
 /// Gossipsub topic for cell relationship lifecycle (Propose/Accept/Reject/Terminate).
-pub const TOPIC_CELL_RELATIONSHIP: &str = "lattice/cell/relationship/v1";
-
-/// Gossipsub topic for experiment announcements from Prototype Cells.
-pub const TOPIC_CELL_EXPERIMENT: &str = "lattice/cell/experiment/v1";
-
-/// Gossipsub topic for knowledge sharing (reflections and insights).
-pub const TOPIC_CELL_REFLECTION: &str = "lattice/cell/reflection/v1";
-
-/// Gossipsub topic for cell announcement and discovery.
-pub const TOPIC_CELL_DISCOVERY: &str = "lattice/cell/discovery/v1";
 
 // ── Witness RPC: request-response types ─────────────────────
 // Protocol: /lattice/witness/v1
@@ -449,94 +426,3 @@ pub struct WitnessResponse {
     pub decline_reason: Option<String>,
 }
 
-/// A cell declaring a relationship with another cell.
-/// Not a peer-table mutation — relationships are attested claims
-/// about a social topology on top of the liveness topology.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum CellRelationshipMsg {
-    /// Cell A proposes a relationship with Cell B.
-    Propose {
-        from: PeerId,
-        to: PeerId,
-        rel_type: CellRelType,
-        rationale: String,
-    },
-    /// Cell B accepts the proposal.
-    Accept {
-        /// Blake3 hash of the original Propose message, for pairing.
-        proposal_hash: [u8; 32],
-    },
-    /// Cell B rejects the proposal.
-    Reject {
-        proposal_hash: [u8; 32],
-        reason: String,
-    },
-    /// Either cell terminates an established relationship.
-    Terminate {
-        target: PeerId,
-        reason: String,
-    },
-}
-
-/// The type of relationship between two cells.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum CellRelType {
-    /// Two Prototype Cells collaborating on experiments.
-    Collaboration,
-    /// A cell witnessing another cell's experiments.
-    WitnessPair,
-    /// Cells sharing observations without formal collaboration.
-    Observer,
-}
-
-/// The kind of cell a mesh peer declares itself to be.
-/// `None` in heartbeat = plain mesh node (not a cell).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum CellType {
-    /// A full Prototype Cell — conducts experiments, forms relationships,
-    /// submits claims. The primary cell type.
-    PrototypeCell,
-    /// An Observer Cell — observes experiments and submits evidence
-    /// but does not initiate its own.
-    ObserverCell,
-    /// A Witness Cell — exists primarily to witness and attest claims.
-    /// No experiment activity.
-    WitnessCell,
-}
-
-/// An experiment announcement from a Prototype Cell.
-/// The experiment payload lives in blob storage; this is the pointer + attestation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CellExperimentMsg {
-    /// The cell conducting the experiment.
-    pub cell: PeerId,
-    /// Unique experiment identifier.
-    pub experiment_id: [u8; 32],
-    /// Blob storage reference to the experiment payload.
-    /// Format: "mesh://blob/<blake3_hash>"
-    pub payload_ref: String,
-    /// Type of experiment (maps to Replicator type in the Cell Network).
-    pub experiment_type: String,
-    /// The epoch at which the experiment was initiated.
-    pub initiated_at_epoch: u64,
-    /// Ed25519 signature over (experiment_id || payload_ref || experiment_type).
-    pub signature: Vec<u8>,
-}
-
-/// A knowledge-sharing message — insight or reflection from a cell.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CellReflectionMsg {
-    /// The cell sharing the reflection.
-    pub cell: PeerId,
-    /// Unique identifier for this reflection.
-    pub reflection_id: [u8; 32],
-    /// The experiment this reflection is based on (if any).
-    pub based_on_experiment: Option<[u8; 32]>,
-    /// The insight content (stored in blob, referenced by hash).
-    pub content_ref: String,
-    /// The epoch when this reflection was produced.
-    pub produced_at_epoch: u64,
-    /// Ed25519 signature.
-    pub signature: Vec<u8>,
-}

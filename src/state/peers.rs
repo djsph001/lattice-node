@@ -176,7 +176,7 @@ mod tests {
         let pid = test_peer_id();
         let addr = test_addr();
 
-        table.add_peer(pid, addr.clone());
+        table.add_peer(pid, addr.clone(), 0);
 
         assert_eq!(table.len(), 1);
         let info = table.get(&pid).unwrap();
@@ -188,7 +188,7 @@ mod tests {
     fn remove_peer() {
         let mut table = PeerTable::new();
         let pid = test_peer_id();
-        table.add_peer(pid, test_addr());
+        table.add_peer(pid, test_addr(), 0);
         table.remove_peer(&pid);
         assert!(table.is_empty());
     }
@@ -197,7 +197,7 @@ mod tests {
     fn record_heartbeat_increments() {
         let mut table = PeerTable::new();
         let pid = test_peer_id();
-        table.add_peer(pid, test_addr());
+        table.add_peer(pid, test_addr(), 0);
         table.record_heartbeat(&pid);
         table.record_heartbeat(&pid);
 

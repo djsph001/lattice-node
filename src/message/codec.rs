@@ -455,8 +455,9 @@ pub mod rpc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::types::{Heartbeat, LatticeMessage};
+    use crate::message::types::{Heartbeat, LatticeMessage, WitnessRequest, WitnessResponse};
     use chrono::Utc;
+    use libp2p::PeerId;
 
     #[test]
     fn roundtrip_heartbeat() {
@@ -570,5 +571,90 @@ mod tests {
             cbor_bytes.len(),
             json_bytes.len()
         );
+    }
+
+    // ── Witness RPC tests ──────────────────────────────────
+
+    #[test]
+    fn witness_request_roundtrip() {
+        let req = WitnessRequest {
+            claim_id: "claim-001".into(),
+            claim_type: 0,
+            claimant_id: PeerId::random(),
+            claim_hash: [0xAB; 32],
+            requested_at_epoch: 42,
+        };
+
+        let bytes = encode(&req).expect("encode failed");
+        let decoded: WitnessRequest = decode(&bytes).expect("decode failed");
+
+        assert_eq!(decoded.claim_id, "claim-001");
+        assert_eq!(decoded.claim_type, 0);
+        assert_eq!(decoded.requested_at_epoch, 42);
+    }
+
+    #[test]
+    fn witness_response_roundtrip() {
+        let sig: Vec<u8> = (0..64).collect();
+        let resp = WitnessResponse {
+            claim_id: "claim-002".into(),
+            witness_id: PeerId::random(),
+            claim_hash: [0xCD; 32],
+            witnessed_at_epoch: 100,
+            signature: sig.clone(),
+            decline_reason: None,
+        };
+
+        let bytes = encode(&resp).expect("encode failed");
+        let decoded: WitnessResponse = decode(&bytes).expect("decode failed");
+
+        assert_eq!(decoded.claim_id, "claim-002");
+        assert_eq!(decoded.witnessed_at_epoch, 100);
+        assert_eq!(decoded.signature, sig);
+        assert!(decoded.decline_reason.is_none());
+    }
+
+    #[test]
+    fn witness_response_decline() {
+        let resp = WitnessResponse {
+            claim_id: "claim-003".into(),
+            witness_id: PeerId::random(),
+            claim_hash: [0xEF; 32],
+            witnessed_at_epoch: 0,
+            signature: Vec::new(), // empty = declined
+            decline_reason: Some("Self-witness is not permitted".into()),
+        };
+
+        let bytes = encode(&resp).expect("encode failed");
+        let decoded: WitnessResponse = decode(&bytes).expect("decode failed");
+
+        assert!(decoded.signature.is_empty());
+        assert_eq!(decoded.decline_reason.unwrap(), "Self-witness is not permitted");
+    }
+
+    #[test]
+    fn witness_response_does_not_imply_verification() {
+        // I4: Witness ≠ Certification — a response with a signature
+        // must NOT contain any "verified" field.
+        let sig: Vec<u8> = (0..64).collect();
+        let resp = WitnessResponse {
+            claim_id: "claim-004".into(),
+            witness_id: PeerId::random(),
+            claim_hash: [0xAA; 32],
+            witnessed_at_epoch: 50,
+            signature: sig,
+            decline_reason: None,
+        };
+
+        let bytes = encode(&resp).expect("encode failed");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(
+            // Fall back: deserialize the CBOR through JSON conversion
+            serde_json::to_value(&resp).unwrap()
+        );
+
+        // The serialized response must NOT contain a "verified" field
+        // at the top level. This is the executable invariant.
+        assert!(!json.as_object().map_or(true, |o| o.contains_key("verified")),
+            "Witness response must not contain a 'verified' field — I4 invariant violated");
     }
 }

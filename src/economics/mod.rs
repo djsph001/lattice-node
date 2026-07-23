@@ -27,6 +27,17 @@ use crate::state::peers::PeerTable;
 use self::metrics::NodeMetrics;
 use self::tax::{EpochTransactions, TaxEngine};
 
+/// Summary of one completed epoch's economic outcome.
+/// Returned by `EconomicEngine::last_epoch_summary()`.
+#[derive(Debug, Clone)]
+pub struct EpochSummary {
+    pub ratio: f64,
+    pub tax_calculated: u64,
+    pub tax_collected: u64,
+    pub minted: u64,
+    pub redistributed_to: u64,
+}
+
 /// The economic engine — measurement, minting, and taxation.
 ///
 /// Created once at node startup and called on every epoch tick.
@@ -39,6 +50,9 @@ pub struct EconomicEngine {
 
     /// Number of completed epochs.
     epoch_count: u64,
+
+    /// Summary of the last completed epoch (None before first run).
+    last_epoch_summary: Option<EpochSummary>,
 }
 
 impl EconomicEngine {
@@ -48,6 +62,7 @@ impl EconomicEngine {
             metrics: NodeMetrics::new(),
             epoch_metrics: NodeMetrics::new(),
             epoch_count: 0,
+            last_epoch_summary: None,
         }
     }
 
@@ -143,6 +158,15 @@ impl EconomicEngine {
             base_tax_rate_pct,
         );
 
+        // Store summary of this epoch for the API.
+        self.last_epoch_summary = Some(EpochSummary {
+            ratio: result.ratio,
+            tax_calculated: result.tax_calculated,
+            tax_collected: result.tax_collected,
+            minted: result.minted,
+            redistributed_to: result.redistributed_to,
+        });
+
         // ── Snapshot current metrics for next epoch ───────
         self.epoch_metrics = self.metrics.clone();
 
@@ -152,6 +176,12 @@ impl EconomicEngine {
     /// Number of epochs completed so far.
     pub fn epoch_count(&self) -> u64 {
         self.epoch_count
+    }
+
+    /// Summary of the most recently completed epoch, or None if no
+    /// epoch has completed yet.
+    pub fn last_epoch_summary(&self) -> Option<&EpochSummary> {
+        self.last_epoch_summary.as_ref()
     }
 }
 

@@ -39,6 +39,7 @@ use crate::network::protocol::{
 use crate::agent::codec::AGENT_STATE_PROTOCOL;
 use crate::state::peers::PeerTable;
 use crate::economics::EconomicEngine;
+use crate::economics::EpochSummary;
 use crate::economics::receipts::{RelayReceipt, SignedReceipt, validate_receipt};
 use crate::storage::ProofEngine;
 
@@ -71,6 +72,15 @@ const ZOMBIE_WARN_THRESHOLD_SECS: u64 = 30;
 /// 90s = 9× heartbeat interval. Well beyond any legitimate network
 /// hiccup, short enough that the half-open connection doesn't persist.
 const ZOMBIE_EVICT_THRESHOLD_SECS: u64 = 90;
+
+/// Grace window for cold-start peers (heartbeats_received == 0).  Protects
+/// against both wall-clock silence (Layer 1) and epoch-based heartbeat
+/// silence (Layer 2a, which had an additional init bug: last_heartbeat_epoch
+/// started at 0, making any fresh peer on a mesh aged >30 epochs instantly
+/// evictable).  After the first heartbeat, standard rules apply.
+/// Set at ~20× the observed worst-case connection-to-first-heartbeat
+/// interval (~15s) from the Jul 22 soak data.
+const COLD_START_GRACE_SECS: u64 = 300;
 
 /// How long to wait for reconnect after eviction before logging ERROR.
 const RECONNECT_TIMEOUT_SECS: u64 = 30;
@@ -2396,7 +2406,7 @@ impl LatticeNode {
                 let mut new_peers = false;
                 for (peer_id, addr) in peers {
                     info!(peer = %peer_id, addr = %addr, "Peer discovered");
-                    self.peer_table.add_peer(peer_id, addr.clone());
+                    self.peer_table.add_peer(peer_id, addr.clone(), self.economic_engine.epoch_count());
                     self.mdns_peers.insert(peer_id);
                     self.swarm
                         .behaviour_mut()
@@ -2791,7 +2801,7 @@ impl LatticeNode {
                                 for info in peers {
                                     if self.peer_table.get(&info.peer_id).is_none() {
                                         info!(peer = %info.peer_id, "Discovered peer via Kademlia DHT");
-                                        self.peer_table.insert_peer(info.peer_id);
+                                        self.peer_table.insert_peer(info.peer_id, self.economic_engine.epoch_count());
                                     }
                                 }
                             }
@@ -3208,10 +3218,17 @@ impl LatticeNode {
                 longest_silence = elapsed;
             }
 
+            // ── Grace window: cold-start protection ──────────────────
+            // Defined once so both eviction layers (Layer 1 wall-clock,
+            // Layer 2a epoch heartbeat) read the same computation.
+            // Twin of the same guard in dead_peer_ids().
+            let age = (Utc::now() - info.first_seen).num_seconds().max(0) as u64;
+            let in_grace = info.heartbeats_received == 0 && age < COLD_START_GRACE_SECS;
+
             // ── Layer 2: epoch-based heartbeat silence ─────────
             let epochs_since_heartbeat =
                 current_epoch.saturating_sub(info.last_heartbeat_epoch);
-            if epochs_since_heartbeat > ZOMBIE_EPOCH_THRESHOLD {
+            if !in_grace && epochs_since_heartbeat > ZOMBIE_EPOCH_THRESHOLD {
                 to_evict.push((*peer_id, format!(
                     "heartbeat silence: {} epochs since last heartbeat (threshold {})",
                     epochs_since_heartbeat, ZOMBIE_EPOCH_THRESHOLD
@@ -3242,6 +3259,9 @@ impl LatticeNode {
 
             // ── Layer 1: wall-clock (fast path for half-open connections) ─
             if elapsed > ZOMBIE_EVICT_THRESHOLD_SECS {
+                // Grace window: a silent cold-start peer is not evicted.
+                if in_grace { continue; }
+
                 // Circuit breaker check
                 let recent = self.evictions_last_minute.len();
                 if recent >= CIRCUIT_BREAKER_LIMIT {
@@ -3327,9 +3347,15 @@ impl LatticeNode {
             if info.peer_id == self.local_peer_id {
                 continue;
             }
+
+            // ── Grace window: cold-start protection ──────────────────
+            // Twin of the same guard in check_peer_liveness().
+            let age = (Utc::now() - info.first_seen).num_seconds().max(0) as u64;
+            let in_grace = info.heartbeats_received == 0 && age < COLD_START_GRACE_SECS;
+
             // Heartbeat silence
             let epochs_since_hb = current_epoch.saturating_sub(info.last_heartbeat_epoch);
-            if epochs_since_hb > ZOMBIE_EPOCH_THRESHOLD {
+            if !in_grace && epochs_since_hb > ZOMBIE_EPOCH_THRESHOLD {
                 dead.insert(info.peer_id);
                 continue;
             }
@@ -3507,7 +3533,7 @@ impl LatticeNode {
                     Ok(peer_id) => {
                         if self.peer_table.get(&peer_id).is_none() {
                             info!(peer = %peer_id, from = %hb.node_name, "Inserting peer from gossip");
-                            self.peer_table.insert_peer(peer_id);
+                            self.peer_table.insert_peer(peer_id, self.economic_engine.epoch_count());
                         }
                         self.peer_table.record_heartbeat_epoch(
                             &peer_id,
@@ -3879,7 +3905,7 @@ impl LatticeNode {
             request_response::Message::Response { response, .. } => {
                 if self.peer_table.get(&peer).is_none() {
                     info!(peer = %peer, from = %response.node_name, "Inserting peer from RPC");
-                    self.peer_table.insert_peer(peer);
+                    self.peer_table.insert_peer(peer, self.economic_engine.epoch_count());
                 }
                 // Phase 10a: update peer's capability (model size + VRAM) from status response.
                 self.agent_peers
@@ -5238,13 +5264,14 @@ impl LatticeNode {
                 ApiResponse::Peers { peers }
             }
             ApiRequest::GetEpochState => {
+                let summary = self.economic_engine.last_epoch_summary();
                 ApiResponse::EpochState {
                     epoch: self.economic_engine.epoch_count(),
-                    ratio: 0.0,
-                    tax_calculated: 0,
-                    tax_collected: 0,
-                    minted: 0,
-                    redistributed_to: 0,
+                    ratio: summary.map(|s| s.ratio),
+                    tax_calculated: summary.map(|s| s.tax_calculated),
+                    tax_collected: summary.map(|s| s.tax_collected),
+                    minted: summary.map(|s| s.minted),
+                    redistributed_to: summary.map(|s| s.redistributed_to),
                 }
             }
             ApiRequest::GetEconomicState => {
@@ -5976,7 +6003,7 @@ mod zombie_eviction_tests {
         let mut table = PeerTable::new();
 
         // First connection — peer appears
-        table.add_peer(pid, addr.clone());
+        table.add_peer(pid, addr.clone(), 0);
         table.record_heartbeat_epoch(&pid, 1);
         assert_eq!(table.len(), 1);
 
@@ -5985,7 +6012,7 @@ mod zombie_eviction_tests {
         assert_eq!(table.len(), 0);
 
         // Peer reconnects — re-added as fresh peer
-        table.add_peer(pid, addr.clone());
+        table.add_peer(pid, addr.clone(), 0);
         assert_eq!(table.len(), 1);
 
         let info = table.get(&pid).unwrap();
@@ -6087,7 +6114,7 @@ mod outbound_sweep_tests {
 
         let pid = test_peer();
         let mut table = PeerTable::new();
-        table.add_peer(pid, "/ip4/1.2.3.4/tcp/4001".parse().unwrap());
+        table.add_peer(pid, "/ip4/1.2.3.4/tcp/4001".parse().unwrap(), 0);
 
         // Set last heartbeat to epoch 0, current epoch is 35
         // 35 - 0 = 35 > 30 → dead

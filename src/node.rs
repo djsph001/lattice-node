@@ -32,6 +32,7 @@ use crate::message::types::{TransactionRequest, TransactionResponse};
 use crate::message::types::{ChainRangeRequest, ChainRangeResponse};
 use crate::message::types::WireBlock;
 use crate::message::types::{VerifyRequest, VerifyResponse};
+use crate::message::types::{WitnessRequest, WitnessResponse};
 use crate::message::types::{RatificationBlock, ERA_ONE_BLOCK_MARKER, ERA_TWO_BLOCK_MARKER};
 use crate::network::protocol::{
     LatticeBehaviour, LatticeBehaviourEvent, LATTICE_HEARTBEAT_TOPIC, LATTICE_KAD_PROTOCOL,
@@ -2250,7 +2251,19 @@ impl LatticeNode {
         Ok(())
     }
 
-    /// Sign a transaction with the node's keypair.
+    /// Send a direct witness request to a specific peer over the
+    /// request-response protocol. Returns a RequestId for correlation.
+    /// The witness will sign the claim_hash (Model A) — they sign what
+    /// they receive, not a claim they independently verified.
+    pub fn send_witness_request(
+        &mut self,
+        peer: PeerId,
+        request: WitnessRequest,
+    ) -> libp2p::request_response::OutboundRequestId {
+        self.swarm.behaviour_mut().witness_rpc.send_request(&peer, request)
+    }
+
+    /// Sign a transaction with the node's Ed25519 keypair.
     fn sign_transaction(&self, tx: &Transaction) -> Result<SignedTransaction> {
         if self.refuse_to_sign {
             bail!(
@@ -2848,6 +2861,105 @@ impl LatticeNode {
             )) => {
                 warn!(peer = %peer, error = ?error, "[chain-sync] Request failed");
                 self.outstanding_chain_requests_by_peer.remove(&peer);
+            }
+
+            // ── Witness RPC ──────────────────────────────────────
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::WitnessRpc(
+                request_response::Event::Message { peer, message },
+            )) => {
+                match message {
+                    request_response::Message::Request {
+                        request_id: _, request, channel,
+                    } => {
+                        // Responder side: examine the witness request
+                        let witness_peer_id = PeerId::from(self.local_key.public());
+
+                        // I7: Discovery ≠ Recognition — receiving a request
+                        // does not create a relationship or modify trust.
+                        // I4: Witness ≠ Certification — signing the hash
+                        // does not mark the claim as verified.
+
+                        // Reject self-witness (claimant cannot witness own claim)
+                        let response = if request.claimant_id == witness_peer_id {
+                            warn!(claimant = %request.claimant_id,
+                                "Self-witness request rejected");
+                            WitnessResponse {
+                                claim_id: request.claim_id,
+                                witness_id: witness_peer_id,
+                                claim_hash: request.claim_hash,
+                                witnessed_at_epoch: self.economic_engine.epoch_count(),
+                                signature: Vec::new(), // empty = declined
+                                decline_reason: Some("Self-witness is not permitted".into()),
+                            }
+                        } else {
+                            // Model A: sign the hash we received, not a claim we independently verified.
+                            let witness_id_bytes = witness_peer_id.to_bytes();
+                            let epoch_bytes = self.economic_engine.epoch_count().to_le_bytes();
+                            let mut payload = Vec::with_capacity(32 + witness_id_bytes.len() + 8);
+                            payload.extend_from_slice(&request.claim_hash);
+                            payload.extend_from_slice(&witness_id_bytes);
+                            payload.extend_from_slice(&epoch_bytes);
+
+                            match self.local_key.sign(&payload) {
+                                Ok(sig) => {
+                                    info!(
+                                        claim_id = %request.claim_id,
+                                        witness = %witness_peer_id,
+                                        sig_len = sig.len(),
+                                        "Witness signature issued (Model A)"
+                                    );
+                                    WitnessResponse {
+                                        claim_id: request.claim_id,
+                                        witness_id: witness_peer_id,
+                                        claim_hash: request.claim_hash,
+                                        witnessed_at_epoch: self.economic_engine.epoch_count(),
+                                        signature: sig,
+                                        decline_reason: None,
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Failed to sign witness response");
+                                    WitnessResponse {
+                                        claim_id: request.claim_id,
+                                        witness_id: witness_peer_id,
+                                        claim_hash: request.claim_hash,
+                                        witnessed_at_epoch: self.economic_engine.epoch_count(),
+                                        signature: Vec::new(),
+                                        decline_reason: Some(format!("Signing failed: {e}")),
+                                    }
+                                }
+                            }
+                        };
+
+                        // I4: Witness ≠ Certification — the response is sent
+                        // but the claim is NOT marked as verified.
+                        let _ = self.swarm.behaviour_mut().witness_rpc
+                            .send_response(channel, response);
+                    }
+                    request_response::Message::Response { response, .. } => {
+                        // Requester side: a witness responded
+                        if response.signature.is_empty() {
+                            info!(
+                                claim_id = %response.claim_id,
+                                witness = %response.witness_id,
+                                reason = ?response.decline_reason,
+                                "Witness declined"
+                            );
+                        } else {
+                            info!(
+                                claim_id = %response.claim_id,
+                                witness = %response.witness_id,
+                                sig_len = response.signature.len(),
+                                "Witness signature received"
+                            );
+                        }
+                    }
+                }
+            }
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::WitnessRpc(
+                request_response::Event::OutboundFailure { peer, error, .. },
+            )) => {
+                warn!(peer = %peer, error = ?error, "[witness] Request failed");
             }
 
             // ── Kademlia events ──────────────────────────────

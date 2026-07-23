@@ -15,6 +15,10 @@ pub struct PeerInfo {
     /// The epoch when the last heartbeat was received from this peer.
     /// 0 = never received a heartbeat.
     pub last_heartbeat_epoch: u64,
+    /// What kind of cell this peer is (None = plain mesh node).
+    pub cell_type: Option<crate::message::types::CellType>,
+    /// Human-readable declared purpose (appears in dashboard).
+    pub declared_purpose: Option<String>,
 }
 
 /// In-memory peer table tracking all known nodes in the mesh.
@@ -54,6 +58,8 @@ impl PeerTable {
                     last_seen: now,
                     heartbeats_received: 0,
                     last_heartbeat_epoch: current_epoch,
+                    cell_type: None,
+                    declared_purpose: None,
                 }
             });
     }
@@ -76,6 +82,8 @@ impl PeerTable {
                 last_seen: now,
                 heartbeats_received: 0,
                 last_heartbeat_epoch: current_epoch,
+                cell_type: None,
+                declared_purpose: None,
             },
         );
     }

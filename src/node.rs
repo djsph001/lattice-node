@@ -5959,6 +5959,8 @@ mod zombie_eviction_tests {
             last_seen: Utc::now(),
             heartbeats_received: 1,
             last_heartbeat_epoch: 0, // never seen a heartbeat since epoch tracking started
+            cell_type: None,
+            declared_purpose: None,
         };
 
         // At epoch 31, 31-0 = 31 > 30 → zombie
@@ -6015,6 +6017,8 @@ mod zombie_eviction_tests {
             last_seen: Utc::now(),
             heartbeats_received: 10,
             last_heartbeat_epoch: 5, // just received a heartbeat
+            cell_type: None,
+            declared_purpose: None,
         };
 
         // 5 - 5 = 0 → not zombie

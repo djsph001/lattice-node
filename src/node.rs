@@ -5959,7 +5959,8 @@ mod zombie_eviction_tests {
             last_seen: Utc::now(),
             heartbeats_received: 1,
             last_heartbeat_epoch: 0, // never seen a heartbeat since epoch tracking started
-            cell_type: None,
+            cell_participations: Vec::new(),
+            is_infrastructure: false,
             declared_purpose: None,
         };
 
@@ -6017,7 +6018,8 @@ mod zombie_eviction_tests {
             last_seen: Utc::now(),
             heartbeats_received: 10,
             last_heartbeat_epoch: 5, // just received a heartbeat
-            cell_type: None,
+            cell_participations: Vec::new(),
+            is_infrastructure: false,
             declared_purpose: None,
         };
 

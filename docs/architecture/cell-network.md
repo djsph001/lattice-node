@@ -80,9 +80,10 @@ changes increment the version number.
 
 ## Current constraints (documented, not baked)
 
-1. One peer = one cell type. Multi-cell participation is deferred.
-2. All three cell types use the same `PeerInfo` structure; differentiation
-   is at the application layer.
+1. `cell_participations` is a `Vec<CellType>` supporting multiple cells
+   from day one. Empty = plain mesh node.
+2. `is_infrastructure` distinguishes infrastructure operators from
+   cell participants.
 3. Cell identity is self-declared in heartbeat metadata, not verified
    by any authority. The system records the declaration; the network
    decides whether to recognize it.

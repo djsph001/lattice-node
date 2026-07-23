@@ -15,8 +15,15 @@ pub struct PeerInfo {
     /// The epoch when the last heartbeat was received from this peer.
     /// 0 = never received a heartbeat.
     pub last_heartbeat_epoch: u64,
-    /// What kind of cell this peer is (None = plain mesh node).
-    pub cell_type: Option<crate::message::types::CellType>,
+    /// Which cells this peer participates in.
+    /// Empty = not a member of any cell (plain mesh node).
+    /// Multiple entries = peer participates in multiple cells.
+    /// This field records *declared participation* only — no trust,
+    /// no authorization, no relationship is implied by its presence.
+    pub cell_participations: Vec<crate::message::types::CellType>,
+    /// Whether this peer operates Cell Network infrastructure
+    /// (e.g. a relay or witness node that is not itself a cell).
+    pub is_infrastructure: bool,
     /// Human-readable declared purpose (appears in dashboard).
     pub declared_purpose: Option<String>,
 }
@@ -58,7 +65,8 @@ impl PeerTable {
                     last_seen: now,
                     heartbeats_received: 0,
                     last_heartbeat_epoch: current_epoch,
-                    cell_type: None,
+                    cell_participations: Vec::new(),
+                    is_infrastructure: false,
                     declared_purpose: None,
                 }
             });
@@ -82,7 +90,8 @@ impl PeerTable {
                 last_seen: now,
                 heartbeats_received: 0,
                 last_heartbeat_epoch: current_epoch,
-                cell_type: None,
+                cell_participations: Vec::new(),
+                is_infrastructure: false,
                 declared_purpose: None,
             },
         );

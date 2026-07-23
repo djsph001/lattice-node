@@ -15,6 +15,8 @@ libp2p = { version = "0.54", features = [
     "noise",
     "tcp",
     "yamux",
+    "serde",
+    "dns",
     "mdns",
     "gossipsub",
     "request-response",

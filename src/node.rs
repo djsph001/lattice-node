@@ -1986,6 +1986,8 @@ impl LatticeNode {
                     &self.ledger.balances,
                     &self.ledger.thickness_graph,
                     self.tx_nonce,
+                    // TODO(witnessed-claims): thread accepted_claims from EconomicEngine
+                    Vec::new(),
                 );
                 if let Err(e) = store.take_snapshot(epoch, &snapshot) {
                     warn!(error = %e, "Failed to save economic snapshot");

@@ -29,6 +29,9 @@ pub struct PersistentEconomicState {
     /// Recovered directly instead of derived from seen_nonces[self],
     /// which may be missing or stale if no self-tx was recorded.
     pub self_tx_nonce: u64,
+    /// Accepted WitnessedClaims that have been credited to thickness.
+    /// Rebuilt into the claim-nonce map on restart.
+    pub accepted_claims: Vec<crate::claims::WitnessedClaim>,
 }
 
 impl PersistentEconomicState {
@@ -38,6 +41,7 @@ impl PersistentEconomicState {
             balances: HashMap::new(),
             thickness_edges: HashMap::new(),
             self_tx_nonce: 0,
+            accepted_claims: Vec::new(),
         }
     }
 
@@ -47,6 +51,7 @@ impl PersistentEconomicState {
         balances: &HashMap<PeerId, DigitalUtilityUnit>,
         thickness: &ThicknessGraph,
         self_tx_nonce: u64,
+        accepted_claims: Vec<crate::claims::WitnessedClaim>,
     ) -> Self {
         Self {
             seen_nonces: nonces.iter().map(|(k, v)| (k.to_base58(), *v)).collect(),
@@ -60,6 +65,7 @@ impl PersistentEconomicState {
                 })
                 .collect(),
             self_tx_nonce,
+            accepted_claims,
         }
     }
 

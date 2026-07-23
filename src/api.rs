@@ -108,11 +108,11 @@ pub enum ApiResponse {
     /// Epoch state — last completed epoch's economic parameters.
     EpochState {
         epoch: u64,
-        ratio: f64,
-        tax_calculated: u64,
-        tax_collected: u64,
-        minted: u64,
-        redistributed_to: u64,
+        ratio: Option<f64>,
+        tax_calculated: Option<u64>,
+        tax_collected: Option<u64>,
+        minted: Option<u64>,
+        redistributed_to: Option<u64>,
     },
     /// Economic state — balances, nonces.
     EconomicState {

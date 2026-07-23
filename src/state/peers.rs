@@ -35,7 +35,7 @@ impl PeerTable {
     }
 
     /// Add or update a peer when discovered.
-    pub fn add_peer(&mut self, peer_id: PeerId, addr: Multiaddr) {
+    pub fn add_peer(&mut self, peer_id: PeerId, addr: Multiaddr, current_epoch: u64) {
         let now = Utc::now();
         self.peers
             .entry(peer_id)
@@ -53,7 +53,7 @@ impl PeerTable {
                     first_seen: now,
                     last_seen: now,
                     heartbeats_received: 0,
-                    last_heartbeat_epoch: 0,
+                    last_heartbeat_epoch: current_epoch,
                 }
             });
     }
@@ -61,7 +61,7 @@ impl PeerTable {
     /// Insert a peer with no known address — used when a peer is discovered
     /// via Kademlia or gossip before a direct connection. Addresses populate
     /// later via Identify or on connection.
-    pub fn insert_peer(&mut self, peer_id: PeerId) {
+    pub fn insert_peer(&mut self, peer_id: PeerId, current_epoch: u64) {
         if self.peers.contains_key(&peer_id) {
             return;
         }
@@ -75,7 +75,7 @@ impl PeerTable {
                 first_seen: now,
                 last_seen: now,
                 heartbeats_received: 0,
-                last_heartbeat_epoch: 0,
+                last_heartbeat_epoch: current_epoch,
             },
         );
     }

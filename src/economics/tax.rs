@@ -54,6 +54,17 @@ pub struct EpochTransactions {
     pub mint: Option<Transaction>,
     /// Transfer transactions for redistribution (one per known peer).
     pub redistributions: Vec<Transaction>,
+    /// Contribution ratio for this epoch (0.0–2.0).
+    pub ratio: f64,
+    /// Tax amount calculated (owed) for this epoch.
+    pub tax_calculated: u64,
+    /// Tax amount actually collected (may differ from calculated
+    /// when peers exist but shares are below split threshold).
+    pub tax_collected: u64,
+    /// Amount minted as contribution reward.
+    pub minted: u64,
+    /// Number of peers redistributed to (count, not summed amount).
+    pub redistributed_to: u64,
 }
 
 /// The Georgist tax and redistribution engine.
@@ -115,7 +126,10 @@ impl TaxEngine {
         };
 
         // ── 4. Build redistribution transfers ────────────
-        let peers: Vec<PeerId> = peer_table.iter().map(|p| p.peer_id).collect();
+        let peers: Vec<PeerId> = peer_table.iter()
+            .filter(|p| p.heartbeats_received > 0)
+            .map(|p| p.peer_id)
+            .collect();
         let peer_count = peers.len();
 
         let mut redistributions = Vec::new();
@@ -169,6 +183,11 @@ impl TaxEngine {
         EpochTransactions {
             mint,
             redistributions,
+            ratio,
+            tax_calculated: tax_owed,
+            tax_collected: actual_collected,
+            minted: mint_amount,
+            redistributed_to: peer_count as u64,
         }
     }
 }

@@ -8,6 +8,20 @@
 //! PeerInfo tables. Accepted claims add thickness edges to the graph,
 //! subject to per-pair diminishing weight (1/sqrt(n)) and per-epoch
 //! decay (30-day half-life at 64s/epoch).
+//!
+//! ── Thickness is local view, not consensus state ─────────────
+//!
+//! Each node maintains its own ThicknessGraph based on claims it has
+//! independently accepted.  Nodes converge via gossip of accepted
+//! claims, but nothing that reads thickness (Layer 2b eviction,
+//! economic gating, witness eligibility) is consensus-critical —
+//! each node decides for itself.  A one-epoch divergence between
+//! nodes accepting the same claim at different epoch boundaries is
+//! benign: a peer evicted by a slower node one epoch early re-
+//! establishes on the next heartbeat.
+//!
+//! If thickness ever gates a consensus-critical function (sortition
+//! selection, quorum weights), this assumption must be revisited.
 
 mod acceptance;
 mod old;

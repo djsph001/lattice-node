@@ -1978,6 +1978,35 @@ impl LatticeNode {
             "Epoch complete"
         );
 
+        // ── Credit accepted claims to thickness, then decay ─────
+        // Order: credit before decay, so a claim credited this epoch
+        // gets its first decay at the next epoch boundary.
+        let unapplied = self.economic_engine.take_unapplied_claims();
+        if !unapplied.is_empty() {
+            let mut indices = Vec::with_capacity(unapplied.len());
+            for (idx, claim) in &unapplied {
+                let credit: f64 = claim.witnesses.iter()
+                    .map(|w| w.observed_heartbeats as f64 * 0.001)
+                    .sum();
+                self.ledger.thickness_graph.add_verified_contribution(
+                    &claim.claimant,
+                    [0u8; 32],
+                    credit,
+                );
+                indices.push(*idx);
+            }
+            self.economic_engine.mark_applied(&indices, epoch);
+            info!(
+                claims = unapplied.len(),
+                "Credited service attestations to thickness graph"
+            );
+        }
+
+        // Apply per-epoch decay to all thickness edges.
+        self.ledger.thickness_graph.apply_edge_decay(
+            crate::claims::DECAY_PER_EPOCH
+        );
+
         // Save economic snapshot every 10 epochs (balances + thickness survive restart)
         if epoch % 10 == 0 {
             if let Some(ref mut store) = self.state_store {
@@ -1986,8 +2015,7 @@ impl LatticeNode {
                     &self.ledger.balances,
                     &self.ledger.thickness_graph,
                     self.tx_nonce,
-                    // TODO(witnessed-claims): thread accepted_claims from EconomicEngine
-                    Vec::new(),
+                    self.economic_engine.take_accepted_claims(),
                 );
                 if let Err(e) = store.take_snapshot(epoch, &snapshot) {
                     warn!(error = %e, "Failed to save economic snapshot");

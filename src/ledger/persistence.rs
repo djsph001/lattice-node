@@ -14,6 +14,18 @@ use super::types::{DigitalUtilityUnit, SignedTransaction};
 
 // ── Persistent state (serializable) ──────────────────────────────
 
+/// A claim that has been persisted in the snapshot.
+/// `applied_at_epoch: None` means the claim was accepted but not yet
+/// credited to the thickness graph — it will be processed at the next
+/// epoch boundary.  `Some(e)` means it was credited at epoch e.
+/// This is the one source of truth for both pending and applied claims;
+/// on recovery, `None` entries are re-queued for the next boundary.
+#[derive(Serialize, Deserialize)]
+pub struct StoredClaim {
+    pub claim: crate::claims::WitnessedClaim,
+    pub applied_at_epoch: Option<u64>,
+}
+
 /// Components of economic state that survive restarts.
 /// Transient buffers (tx_store, pending, outbound) repopulate from gossip.
 #[derive(Serialize, Deserialize)]
@@ -29,9 +41,13 @@ pub struct PersistentEconomicState {
     /// Recovered directly instead of derived from seen_nonces[self],
     /// which may be missing or stale if no self-tx was recorded.
     pub self_tx_nonce: u64,
-    /// Accepted WitnessedClaims that have been credited to thickness.
-    /// Rebuilt into the claim-nonce map on restart.
-    pub accepted_claims: Vec<crate::claims::WitnessedClaim>,
+    /// Accepted WitnessedClaims, each with an application-status marker.
+    /// This is the single source of truth for the claim queue: accepted
+    /// claims enter here immediately and survive crashes.
+    /// TODO(witnessed-claims): prune claim bodies older than the epoch
+    /// high-water mark — only StoredClaim.applied_at_epoch is needed for
+    /// overlap checks once a claim is superseded.
+    pub accepted_claims: Vec<StoredClaim>,
 }
 
 impl PersistentEconomicState {
@@ -51,7 +67,7 @@ impl PersistentEconomicState {
         balances: &HashMap<PeerId, DigitalUtilityUnit>,
         thickness: &ThicknessGraph,
         self_tx_nonce: u64,
-        accepted_claims: Vec<crate::claims::WitnessedClaim>,
+        accepted_claims: Vec<StoredClaim>,
     ) -> Self {
         Self {
             seen_nonces: nonces.iter().map(|(k, v)| (k.to_base58(), *v)).collect(),

@@ -54,11 +54,11 @@ pub struct EconomicEngine {
     /// Summary of the last completed epoch (None before first run).
     last_epoch_summary: Option<EpochSummary>,
 
-    /// Claims accepted but not yet credited (queued for next epoch boundary).
-    pending_claims: Vec<crate::claims::WitnessedClaim>,
-
-    /// Claims that have been credited and persisted.
-    accepted_claims: Vec<crate::claims::WitnessedClaim>,
+    /// Claims that have been accepted.
+    /// At epoch boundary, claims with `applied_at_epoch: None` are
+    /// credited to the thickness graph and marked `Some(current_epoch)`.
+    /// This is the single source of truth — no separate pending queue.
+    accepted_claims: Vec<crate::ledger::persistence::StoredClaim>,
 }
 
 impl EconomicEngine {
@@ -69,7 +69,6 @@ impl EconomicEngine {
             epoch_metrics: NodeMetrics::new(),
             epoch_count: 0,
             last_epoch_summary: None,
-            pending_claims: Vec::new(),
             accepted_claims: Vec::new(),
         }
     }
@@ -193,27 +192,42 @@ impl EconomicEngine {
     }
 
     /// Queue a claim for crediting at the next epoch boundary.
+    /// The claim is immediately stored in accepted_claims with
+    /// applied_at_epoch: None, ensuring it survives crashes via snapshot.
     pub fn queue_claim(&mut self, claim: crate::claims::WitnessedClaim) {
-        self.pending_claims.push(claim);
+        self.accepted_claims.push(
+            crate::ledger::persistence::StoredClaim {
+                claim,
+                applied_at_epoch: None,
+            }
+        );
     }
 
-    /// Take all pending claims for processing. Called at epoch boundary.
-    pub fn take_pending_claims(&mut self) -> Vec<crate::claims::WitnessedClaim> {
-        std::mem::take(&mut self.pending_claims)
+    /// Take all unapplied claims for processing at the epoch boundary.
+    /// Returns the claims to credit and their indices for marking applied.
+    pub fn take_unapplied_claims(&mut self) -> Vec<(usize, crate::claims::WitnessedClaim)> {
+        self.accepted_claims.iter().enumerate()
+            .filter(|(_, sc)| sc.applied_at_epoch.is_none())
+            .map(|(i, sc)| (i, sc.claim.clone()))
+            .collect()
     }
 
-    /// Mark claims as credited and persisted.
-    pub fn add_accepted_claims(&mut self, claims: Vec<crate::claims::WitnessedClaim>) {
-        self.accepted_claims.extend(claims);
+    /// Mark claims as applied at the given epoch.
+    pub fn mark_applied(&mut self, indices: &[usize], epoch: u64) {
+        for &i in indices {
+            if let Some(sc) = self.accepted_claims.get_mut(i) {
+                sc.applied_at_epoch = Some(epoch);
+            }
+        }
     }
 
     /// Take all accepted claims for snapshot persistence.
-    pub fn take_accepted_claims(&mut self) -> Vec<crate::claims::WitnessedClaim> {
+    pub fn take_accepted_claims(&mut self) -> Vec<crate::ledger::persistence::StoredClaim> {
         std::mem::take(&mut self.accepted_claims)
     }
 
     /// Import accepted claims on recovery (rebuild from snapshot).
-    pub fn import_accepted_claims(&mut self, claims: Vec<crate::claims::WitnessedClaim>) {
+    pub fn import_accepted_claims(&mut self, claims: Vec<crate::ledger::persistence::StoredClaim>) {
         self.accepted_claims = claims;
     }
 }

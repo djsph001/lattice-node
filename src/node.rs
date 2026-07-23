@@ -24,6 +24,7 @@ use crate::ledger::validation;
 use crate::message::codec::rpc::{BalanceCodec, BalanceProtocol, LatticeCodec, LatticeProtocol};
 use crate::message::codec::rpc::{TransactionCodec, TransactionProtocol, VerifyProtocol};
 use crate::message::codec::rpc::{ChainSyncCodec, ChainSyncProtocol};
+use crate::message::codec::rpc::{WitnessCodec, WitnessProtocol};
 use crate::message::types::{
     BalanceRequest, BalanceResponse, Heartbeat, LatticeMessage, StatusRequest, StatusResponse,
 };
@@ -618,6 +619,14 @@ impl LatticeNode {
                     request_response::Config::default(),
                 );
 
+                // Witness RPC channel — request-response for claim signing.
+                // Separate from gossipsub: RPC is for explicit interaction
+                // with a specific peer, not broadcast.
+                let witness_rpc = request_response::Behaviour::new(
+                    [(WitnessProtocol, request_response::ProtocolSupport::Full)],
+                    request_response::Config::default(),
+                );
+
                 Ok(LatticeBehaviour::new(
                     mdns,
                     gossipsub,
@@ -631,6 +640,7 @@ impl LatticeNode {
                     agent_rpc,
                     tx_rpc,
                     chain_sync_rpc,
+                    witness_rpc,
                 ))
             })?
             .with_swarm_config(|c| {

@@ -85,6 +85,8 @@ pub struct LatticeBehaviour {
     /// Phase 10: chain sync RPC — request a range of certificate-chain
     /// blocks from a peer to catch up when behind the mesh tip.
     pub chain_sync_rpc: request_response::Behaviour<ChainSyncCodec>,
+    /// Witness RPC for claim signing
+    pub witness_rpc: request_response::Behaviour<WitnessCodec>,
 }
 
 impl LatticeBehaviour {
@@ -101,6 +103,7 @@ impl LatticeBehaviour {
         agent_rpc: request_response::Behaviour<AgentStateCodec>,
         tx_rpc: request_response::Behaviour<TransactionCodec>,
         chain_sync_rpc: request_response::Behaviour<ChainSyncCodec>,
+        witness_rpc: request_response::Behaviour<WitnessCodec>,
     ) -> Self {
         Self {
             mdns,
@@ -115,6 +118,7 @@ impl LatticeBehaviour {
             agent_rpc,
             tx_rpc,
             chain_sync_rpc,
+            witness_rpc,
         }
     }
 }
@@ -142,6 +146,8 @@ pub enum LatticeBehaviourEvent {
     TxRpc(request_response::Event<TransactionRequest, TransactionResponse>),
     /// Phase 10: chain sync RPC events.
     ChainSyncRpc(request_response::Event<ChainRangeRequest, ChainRangeResponse>),
+    /// Witness RPC events — incoming witness requests and responses.
+    WitnessRpc(request_response::Event<WitnessRequest, WitnessResponse>),
 }
 
 impl From<mdns::Event> for LatticeBehaviourEvent {
@@ -235,5 +241,13 @@ impl From<request_response::Event<ChainRangeRequest, ChainRangeResponse>>
 {
     fn from(event: request_response::Event<ChainRangeRequest, ChainRangeResponse>) -> Self {
         LatticeBehaviourEvent::ChainSyncRpc(event)
+    }
+}
+
+impl From<request_response::Event<WitnessRequest, WitnessResponse>>
+    for LatticeBehaviourEvent
+{
+    fn from(event: request_response::Event<WitnessRequest, WitnessResponse>) -> Self {
+        LatticeBehaviourEvent::WitnessRpc(event)
     }
 }

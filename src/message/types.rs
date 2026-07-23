@@ -408,6 +408,47 @@ pub const TOPIC_CELL_REFLECTION: &str = "lattice/cell/reflection/v1";
 /// Gossipsub topic for cell announcement and discovery.
 pub const TOPIC_CELL_DISCOVERY: &str = "lattice/cell/discovery/v1";
 
+// ── Witness RPC: request-response types ─────────────────────
+// Protocol: /lattice/witness/v1
+
+/// A request for a specific peer to witness a claim.
+/// The witness signs the canonical `claim_hash`, binding the
+/// signature to the exact claim bytes they received.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WitnessRequest {
+    /// Unique identifier for the claim being witnessed.
+    pub claim_id: String,
+    /// Claim type (0 = ServiceAttestation, 1 = CellObservation, etc.).
+    pub claim_type: u32,
+    /// The peer requesting the witness.
+    pub claimant_id: PeerId,
+    /// Blake3 hash of the canonical claim payload.
+    /// The witness signs THIS hash, not the claim body, so the
+    /// signature is bound to the exact bytes they received.
+    pub claim_hash: [u8; 32],
+    /// When the witness request was created (epoch).
+    pub requested_at_epoch: u64,
+}
+
+/// Response to a witness request — acceptance or decline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WitnessResponse {
+    /// Echoed claim_id from the request.
+    pub claim_id: String,
+    /// The peer that received the witness request.
+    pub witness_id: PeerId,
+    /// Echoed claim_hash from the request — binds the signature
+    /// to the exact claim the witness was asked to sign.
+    pub claim_hash: [u8; 32],
+    /// When the witness responded (epoch).
+    pub witnessed_at_epoch: u64,
+    /// Ed25519 signature over (claim_hash || witness_id || witnessed_at_epoch).
+    /// Empty = witness declined.
+    pub signature: Vec<u8>,
+    /// Human-readable reason for declining (empty on acceptance).
+    pub decline_reason: Option<String>,
+}
+
 /// A cell declaring a relationship with another cell.
 /// Not a peer-table mutation — relationships are attested claims
 /// about a social topology on top of the liveness topology.

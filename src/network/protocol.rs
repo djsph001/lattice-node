@@ -5,12 +5,13 @@ use libp2p::{gossipsub, identify, kad, mdns, relay, request_response, swarm::Net
 use libp2p::swarm::behaviour::toggle::Toggle;
 
 use crate::message::codec::rpc::{ChainSyncCodec, BalanceCodec, LatticeCodec};
-use crate::message::codec::rpc::{TransactionCodec, VerifyCodec};
+use crate::message::codec::rpc::{TransactionCodec, VerifyCodec, WitnessCodec};
 use crate::message::types::{BalanceRequest, BalanceResponse, StatusRequest, StatusResponse};
 use crate::message::types::{TransactionRequest, TransactionResponse};
 use crate::message::types::WireBlock;
 use crate::message::types::{ChainRangeRequest, ChainRangeResponse};
 use crate::message::types::{VerifyRequest, VerifyResponse};
+use crate::message::types::{WitnessRequest, WitnessResponse};
 use crate::agent::codec::{AgentStateCodec, AGENT_STATE_PROTOCOL};
 use crate::agent::state::{AgentStateQuery, AgentStateReply};
 

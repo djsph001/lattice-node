@@ -510,6 +510,37 @@ impl LatticeNode {
                     .subscribe(&block_topic)
                     .map_err(|e| anyhow::anyhow!("gossipsub block subscribe: {e}"))?;
 
+                // ── Cell Network: topic subscriptions ──────────
+                // Passive receive only — no relationships, trust, or
+                // truth judgments are inferred from message receipt.
+                let cell_rel_topic = gossipsub::IdentTopic::new(
+                    crate::message::types::TOPIC_CELL_RELATIONSHIP,
+                );
+                gossipsub
+                    .subscribe(&cell_rel_topic)
+                    .map_err(|e| anyhow::anyhow!("gossipsub cell-relationship subscribe: {e}"))?;
+
+                let cell_exp_topic = gossipsub::IdentTopic::new(
+                    crate::message::types::TOPIC_CELL_EXPERIMENT,
+                );
+                gossipsub
+                    .subscribe(&cell_exp_topic)
+                    .map_err(|e| anyhow::anyhow!("gossipsub cell-experiment subscribe: {e}"))?;
+
+                let cell_refl_topic = gossipsub::IdentTopic::new(
+                    crate::message::types::TOPIC_CELL_REFLECTION,
+                );
+                gossipsub
+                    .subscribe(&cell_refl_topic)
+                    .map_err(|e| anyhow::anyhow!("gossipsub cell-reflection subscribe: {e}"))?;
+
+                let cell_disc_topic = gossipsub::IdentTopic::new(
+                    crate::message::types::TOPIC_CELL_DISCOVERY,
+                );
+                gossipsub
+                    .subscribe(&cell_disc_topic)
+                    .map_err(|e| anyhow::anyhow!("gossipsub cell-discovery subscribe: {e}"))?;
+
                 let rpc = request_response::Behaviour::new(
                     [(LatticeProtocol, request_response::ProtocolSupport::Full)],
                     request_response::Config::default(),

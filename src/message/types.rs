@@ -405,6 +405,9 @@ pub const TOPIC_CELL_EXPERIMENT: &str = "lattice/cell/experiment/v1";
 /// Gossipsub topic for knowledge sharing (reflections and insights).
 pub const TOPIC_CELL_REFLECTION: &str = "lattice/cell/reflection/v1";
 
+/// Gossipsub topic for cell announcement and discovery.
+pub const TOPIC_CELL_DISCOVERY: &str = "lattice/cell/discovery/v1";
+
 /// A cell declaring a relationship with another cell.
 /// Not a peer-table mutation — relationships are attested claims
 /// about a social topology on top of the liveness topology.

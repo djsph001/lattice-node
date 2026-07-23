@@ -3829,6 +3829,21 @@ impl LatticeNode {
                     );
                 }
             }
+
+            // ── Cell Network: passive handlers ─────────────────
+            LatticeMessage::CellRelationship(rel) => {
+                info!("Cell relationship message received (provenance recorded)");
+            }
+            LatticeMessage::CellExperiment(exp) => {
+                info!(
+                    cell = %exp.cell.to_base58(),
+                    experiment = %hex::encode(exp.experiment_id),
+                    "Cell experiment message received (provenance recorded)"
+                );
+            }
+            LatticeMessage::CellReflection(_) => {
+                info!("Cell reflection message received (provenance recorded)");
+            }
         }
 
         // Phase 6: issue a relay receipt to the delivering peer —

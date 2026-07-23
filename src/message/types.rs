@@ -23,9 +23,18 @@ pub enum LatticeMessage {
     /// Phase 8: Agent task submission.
     AgentTask(AgentTaskMsg),
 
-    // === Future phases ===
-    // /// Governance proposal or vote
-    // Governance(GovernanceAction),
+    // ── Cell Network: domain-layer messages ──────────────────
+    /// Cell relationship lifecycle (propose/accept/reject/terminate).
+    /// Topic: lattice/cell/relationship/v1
+    CellRelationship(CellRelationshipMsg),
+
+    /// Experiment announcement from a Prototype Cell.
+    /// Topic: lattice/cell/experiment/v1
+    CellExperiment(CellExperimentMsg),
+
+    /// Knowledge sharing — reflection or insight from a cell.
+    /// Topic: lattice/cell/reflection/v1
+    CellReflection(CellReflectionMsg),
 }
 
 /// Lightweight liveness signal broadcast at regular intervals.
@@ -385,10 +394,16 @@ impl RatificationBlock {
 
 // ── Cell Network: gossipsub message types ────────────────────
 //
-// Three topics, two phases:
-//   lattice/cell/cell-rel/v1    — Cell relationship lifecycle
-//   lattice/cell/experiment/v1  — Experiment announcements
-//   lattice/cell/reflection/v1  — Knowledge sharing
+// Three topics, one source of truth for topic name strings.
+
+/// Gossipsub topic for cell relationship lifecycle (Propose/Accept/Reject/Terminate).
+pub const TOPIC_CELL_RELATIONSHIP: &str = "lattice/cell/relationship/v1";
+
+/// Gossipsub topic for experiment announcements from Prototype Cells.
+pub const TOPIC_CELL_EXPERIMENT: &str = "lattice/cell/experiment/v1";
+
+/// Gossipsub topic for knowledge sharing (reflections and insights).
+pub const TOPIC_CELL_REFLECTION: &str = "lattice/cell/reflection/v1";
 
 /// A cell declaring a relationship with another cell.
 /// Not a peer-table mutation — relationships are attested claims

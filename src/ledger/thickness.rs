@@ -241,9 +241,15 @@ impl ThicknessGraph {
     }
 
     /// Apply per-epoch decay to all amount-bearing edges.
+    ///
+    /// Vouch edges do not decay — they represent a *present-tense relationship*
+    /// (basis points × voucher's current total) re-derived at every read.
+    /// They expire by revocation, not by time, so decay is not applicable.
+    /// This does not reopen the incumbency problem because vouch-derived
+    /// thickness is bounded by the voucher's own (decayed) contribution
+    /// thickness and the per-pair diminishing-weight cap on attestations.
     /// VerifiedContribution and Genesis edges are multiplied by `factor`
     /// (≈0.999983 per epoch for a 30-day half-life at 64s/epoch).
-    /// Vouch edges are re-derived at read time and need no explicit decay.
     /// Edges below MIN_THICKNESS are pruned during the pass.
     pub fn apply_edge_decay(&mut self, factor: f64) {
         let mut pruned = 0u64;

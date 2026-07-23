@@ -25,6 +25,10 @@ use chrono::{DateTime, Utc};
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
+
+/// Minimum thickness threshold — edges below this are pruned during decay.
+const MIN_THICKNESS: f64 = 0.001;
+
 /// Identifies a specific verified receipt (the Blake3 message_hash).
 pub type ReceiptId = [u8; 32];
 
@@ -233,7 +237,41 @@ impl ThicknessGraph {
                 }
             }
         }
-        info!(imported_count, "Thickness edges restored from snapshot");
+        debug!(count = imported_count, "Thickness edges imported");
+    }
+
+    /// Apply per-epoch decay to all amount-bearing edges.
+    /// VerifiedContribution and Genesis edges are multiplied by `factor`
+    /// (≈0.999983 per epoch for a 30-day half-life at 64s/epoch).
+    /// Vouch edges are re-derived at read time and need no explicit decay.
+    /// Edges below MIN_THICKNESS are pruned during the pass.
+    pub fn apply_edge_decay(&mut self, factor: f64) {
+        let mut pruned = 0u64;
+        for edges in self.edges.values_mut() {
+            let mut i = 0;
+            while i < edges.len() {
+                let keep = match &mut edges[i].source {
+                    ThicknessSource::VerifiedContribution { amount, .. } => {
+                        *amount *= factor;
+                        *amount >= MIN_THICKNESS
+                    }
+                    ThicknessSource::Genesis { original_amount, .. } => {
+                        *original_amount *= factor;
+                        *original_amount >= MIN_THICKNESS
+                    }
+                    ThicknessSource::Vouch { .. } => true,
+                };
+                if keep {
+                    i += 1;
+                } else {
+                    edges.swap_remove(i);
+                    pruned += 1;
+                }
+            }
+        }
+        if pruned > 0 {
+            debug!(pruned, "Thickness edges pruned below MIN_THICKNESS");
+        }
     }
 
     // ── Genesis ────────────────────────────────────────────

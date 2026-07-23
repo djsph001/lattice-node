@@ -53,6 +53,12 @@ pub struct EconomicEngine {
 
     /// Summary of the last completed epoch (None before first run).
     last_epoch_summary: Option<EpochSummary>,
+
+    /// Claims accepted but not yet credited (queued for next epoch boundary).
+    pending_claims: Vec<crate::claims::WitnessedClaim>,
+
+    /// Claims that have been credited and persisted.
+    accepted_claims: Vec<crate::claims::WitnessedClaim>,
 }
 
 impl EconomicEngine {
@@ -63,6 +69,8 @@ impl EconomicEngine {
             epoch_metrics: NodeMetrics::new(),
             epoch_count: 0,
             last_epoch_summary: None,
+            pending_claims: Vec::new(),
+            accepted_claims: Vec::new(),
         }
     }
 
@@ -182,6 +190,31 @@ impl EconomicEngine {
     /// epoch has completed yet.
     pub fn last_epoch_summary(&self) -> Option<&EpochSummary> {
         self.last_epoch_summary.as_ref()
+    }
+
+    /// Queue a claim for crediting at the next epoch boundary.
+    pub fn queue_claim(&mut self, claim: crate::claims::WitnessedClaim) {
+        self.pending_claims.push(claim);
+    }
+
+    /// Take all pending claims for processing. Called at epoch boundary.
+    pub fn take_pending_claims(&mut self) -> Vec<crate::claims::WitnessedClaim> {
+        std::mem::take(&mut self.pending_claims)
+    }
+
+    /// Mark claims as credited and persisted.
+    pub fn add_accepted_claims(&mut self, claims: Vec<crate::claims::WitnessedClaim>) {
+        self.accepted_claims.extend(claims);
+    }
+
+    /// Take all accepted claims for snapshot persistence.
+    pub fn take_accepted_claims(&mut self) -> Vec<crate::claims::WitnessedClaim> {
+        std::mem::take(&mut self.accepted_claims)
+    }
+
+    /// Import accepted claims on recovery (rebuild from snapshot).
+    pub fn import_accepted_claims(&mut self, claims: Vec<crate::claims::WitnessedClaim>) {
+        self.accepted_claims = claims;
     }
 }
 

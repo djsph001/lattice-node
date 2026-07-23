@@ -1,16 +1,11 @@
 use lattice_node::claims::{ClaimEvidence, ClaimType, WitnessSignature, WitnessedClaim};
 use lattice_node::ledger::persistence::{PersistentEconomicState, StoredClaim};
-use lattice_node::ledger::thickness::ThicknessGraph;
+use lattice_node::ledger::thickness::{ThicknessEdge, ThicknessGraph};
 use lattice_node::ledger::types::DigitalUtilityUnit;
 use libp2p::PeerId;
 use std::collections::HashMap;
 
-/// Kill-and-recover: both crash timings, with thickness assertions.
-///
-/// The critical property: thickness_edges and accepted_claims are in the
-/// same PersistentEconomicState (serialized as one CBOR unit). A crash
-/// between credit and snapshot loses BOTH — recovery re-queues the claim
-/// and re-credits once. No double credit.
+/// Kill-and-recover: both crash timings, with post-recovery thickness assertions.
 #[test]
 fn kill_and_recover_thickness() {
     let claimant = PeerId::random();
@@ -33,87 +28,62 @@ fn kill_and_recover_thickness() {
     };
 
     // ── Timing 1: Kill BEFORE epoch boundary ─────────────
-    // Claim queued but not credited. Thickness == 0.
-    let mut graph1 = ThicknessGraph::new();
-    let state1 = PersistentEconomicState::from_state(
-        &HashMap::new(),
-        &HashMap::new(),
-        &graph1,
-        0,
-        vec![StoredClaim {
-            claim: claim.clone(),
-            applied_at_epoch: None,
-        }],
+    let mut graph0 = ThicknessGraph::new();
+    let state0 = PersistentEconomicState::from_state(
+        &HashMap::new(), &HashMap::new(), &graph0, 0,
+        vec![StoredClaim { claim: claim.clone(), applied_at_epoch: None }],
     );
+    let snap0 = serde_cbor::to_vec(&state0).expect("snap0");
+    drop(state0);
 
-    let snap1 = serde_cbor::to_vec(&state1).expect("snap1");
-    drop(state1);
+    let recovered0: PersistentEconomicState =
+        serde_cbor::from_slice(&snap0).expect("snap0 recover");
 
-    let recovered1: PersistentEconomicState =
-        serde_cbor::from_slice(&snap1).expect("snap1 recover");
-
-    assert_eq!(recovered1.accepted_claims.len(), 1, "claim survives");
-    assert!(
-        recovered1.accepted_claims[0].applied_at_epoch.is_none(),
-        "queued claim stays queued"
-    );
-    // No edges serialized because no credit was applied
-    assert!(
-        recovered1.thickness_edges.is_empty(),
-        "no thickness edges without credit"
-    );
+    assert!(recovered0.accepted_claims[0].applied_at_epoch.is_none());
+    assert!(recovered0.thickness_edges.is_empty(),
+        "no edges — credit never applied");
 
     // ── Timing 2: Kill AFTER credit, BEFORE snapshot ─────
-    // Both thickness edge and applied marker serialize atomically
-    // in the same PersistentEconomicState. Recovery sees both
-    // or neither — no double credit possible.
+    // Credit applied to graph, edges + markers serialized atomically.
     let mut graph2 = ThicknessGraph::new();
     graph2.add_verified_contribution(&claimant, [0; 32], credit_amount);
-    let pre_snap_thickness = graph2.total_thickness(&claimant);
 
     let state2 = PersistentEconomicState::from_state(
-        &HashMap::new(),
-        &HashMap::new(),
-        &graph2,
-        0,
-        vec![StoredClaim {
-            claim,
-            applied_at_epoch: Some(100),
-        }],
+        &HashMap::new(), &HashMap::new(), &graph2, 0,
+        vec![StoredClaim { claim, applied_at_epoch: Some(100) }],
     );
-    assert!(
-        !state2.thickness_edges.is_empty(),
-        "thickness edges serialized"
-    );
-
     let snap2 = serde_cbor::to_vec(&state2).expect("snap2");
     drop(state2);
     drop(graph2);
 
+    // Simulate restart: deserialize from snapshot
     let recovered2: PersistentEconomicState =
         serde_cbor::from_slice(&snap2).expect("snap2 recover");
 
-    // Claim marker survived — StoredClaim with applied_at_epoch: Some(100)
-    assert_eq!(
-        recovered2.accepted_claims[0].applied_at_epoch,
-        Some(100),
-        "credited marker survives"
-    );
-    // Thickness edges survived — they're in the same serialized unit
+    // Rebuild thickness graph from recovered CBOR-encoded edges
+    let mut recovered_graph = ThicknessGraph::new();
+    let decoded_edges: HashMap<String, Vec<ThicknessEdge>> = recovered2.thickness_edges
+        .into_iter()
+        .map(|(peer_str, encoded_vec)| {
+            let decoded: Vec<ThicknessEdge> = encoded_vec
+                .into_iter()
+                .filter_map(|bytes| serde_cbor::from_slice(&bytes).ok())
+                .collect();
+            (peer_str, decoded)
+        })
+        .collect();
+    recovered_graph.import_edges(decoded_edges);
+
+    // Post-recovery thickness assertion — exact match, not range
+    let post_recovery_thickness = recovered_graph.total_thickness(&claimant);
     assert!(
-        !recovered2.thickness_edges.is_empty(),
-        "thickness edges survive (same CBOR unit)"
+        (post_recovery_thickness - credit_amount).abs() < 0.001,
+        "post-recovery thickness = {} (expected {}) — double credit would be {}",
+        post_recovery_thickness, credit_amount, credit_amount * 2.0
     );
 
-    // The critical assertion: thickness was exactly one credit's worth
-    // before the crash, and the snapshot preserved it atomically.
-    // No double credit possible because edges + markers are one unit.
-    // This assertion would fail if a separate persistence path existed.
-    assert!(
-        pre_snap_thickness > 0.0 && pre_snap_thickness < credit_amount * 2.0,
-        "thickness ({}) is between 0 and 2000 — single credit, not double",
-        pre_snap_thickness
-    );
+    // Claim marker also survived (same CBOR unit)
+    assert_eq!(recovered2.accepted_claims[0].applied_at_epoch, Some(100));
 
     // I4 enforced structurally: no 'verified' field on StoredClaim.
 }

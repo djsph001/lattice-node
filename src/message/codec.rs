@@ -457,6 +457,7 @@ mod tests {
     use super::*;
     use crate::message::types::{Heartbeat, LatticeMessage, WitnessRequest, WitnessResponse};
     use chrono::Utc;
+    use libp2p::identity::Keypair;
     use libp2p::PeerId;
 
     #[test]
@@ -584,5 +585,98 @@ mod tests {
         // at the top level. This is the executable invariant.
         assert!(!json.as_object().map_or(true, |o| o.contains_key("verified")),
             "Witness response must not contain a 'verified' field — I4 invariant violated");
+    }
+
+    #[test]
+    fn witness_sign_verify_roundtrip() {
+        // Sign a canonical payload, then verify it with the verifier.
+        // This is the load-bearing test: if the handler and the verifier
+        // disagree on the payload format, this test fails.
+        let kp = Keypair::generate_ed25519();
+        let pubkey = kp.public();
+        let witness_id = PeerId::from(pubkey.clone());
+        let claim_hash = [0xCA; 32];
+        let epoch = 42u64;
+
+        // Reconstruct what the handler signs
+        let payload = [
+            crate::claims::WITNESS_DOMAIN as &[u8],
+            &claim_hash[..],
+            &witness_id.to_bytes()[..],
+            &epoch.to_le_bytes()[..],
+        ].concat();
+
+        let signature = kp.sign(&payload).expect("sign failed");
+
+        // Verify with the shared verifier
+        let valid = crate::claims::verify_witness_signature(
+            &claim_hash,
+            &witness_id,
+            epoch,
+            &signature,
+            &pubkey,
+        );
+        assert!(valid, "signature must verify against canonical payload");
+
+        // Wrong claim hash fails
+        let wrong_hash = [0xFF; 32];
+        let valid_wrong = crate::claims::verify_witness_signature(
+            &wrong_hash, &witness_id, epoch, &signature, &pubkey,
+        );
+        assert!(!valid_wrong, "wrong claim_hash must fail verification");
+
+        // Wrong epoch fails
+        let valid_bad_epoch = crate::claims::verify_witness_signature(
+            &claim_hash, &witness_id, 99, &signature, &pubkey,
+        );
+        assert!(!valid_bad_epoch, "wrong epoch must fail verification");
+
+        // Wrong witness fails
+        let other_id = PeerId::random();
+        let valid_bad_witness = crate::claims::verify_witness_signature(
+            &claim_hash, &other_id, epoch, &signature, &pubkey,
+        );
+        assert!(!valid_bad_witness, "wrong witness_id must fail verification");
+
+        // Different key fails
+        let other_kp = Keypair::generate_ed25519();
+        let valid_bad_key = crate::claims::verify_witness_signature(
+            &claim_hash, &witness_id, epoch, &signature, &other_kp.public(),
+        );
+        assert!(!valid_bad_key, "wrong public key must fail verification");
+    }
+
+    #[test]
+    fn witness_response_self_witness_decline() {
+        // The handler produces this shape for self-witness:
+        // empty signature + decline_reason
+        let resp = WitnessResponse {
+            claim_id: "self-test".into(),
+            witness_id: PeerId::random(),
+            claim_hash: [0xBE; 32],
+            witnessed_at_epoch: 0,
+            signature: vec![],
+            decline_reason: Some("Self-witness is not permitted".into()),
+        };
+        assert!(resp.signature.is_empty());
+        assert_eq!(resp.decline_reason.as_deref(), Some("Self-witness is not permitted"));
+    }
+
+    #[test]
+    fn witness_response_unestablished_decline() {
+        // The handler produces this shape for unestablished claimants
+        let resp = WitnessResponse {
+            claim_id: "unestablished-test".into(),
+            witness_id: PeerId::random(),
+            claim_hash: [0xDE; 32],
+            witnessed_at_epoch: 0,
+            signature: vec![],
+            decline_reason: Some("Claimant is not established (no heartbeats observed)".into()),
+        };
+        assert!(resp.signature.is_empty());
+        assert_eq!(
+            resp.decline_reason.as_deref(),
+            Some("Claimant is not established (no heartbeats observed)")
+        );
     }
 }

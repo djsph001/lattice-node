@@ -119,6 +119,32 @@ pub const DECAY_PER_EPOCH: f64 = 0.999_982_885_4;
 /// Edges below this thickness are pruned during decay.
 pub const MIN_THICKNESS: f64 = 0.001;
 
+/// Domain separation prefix for witness signing.
+/// Both signer and verifier must use the same constant to reconstruct
+/// the canonical payload. Defined once, imported by both sides.
+pub const WITNESS_DOMAIN: &[u8; 18] = b"lattice/witness/v1";
+
+/// Verify a witness Ed25519 signature over the canonical payload:
+///   WITNESS_DOMAIN || claim_hash || witness_peer_id_bytes || witnessed_at_epoch_bytes
+///
+/// Returns true if the signature is valid for the given public key.
+pub fn verify_witness_signature(
+    claim_hash: &[u8; 32],
+    witness_peer_id: &PeerId,
+    witnessed_at_epoch: u64,
+    signature: &[u8],
+    signer_public_key: &libp2p::identity::PublicKey,
+) -> bool {
+    let payload = [
+        WITNESS_DOMAIN as &[u8],
+        &claim_hash[..],
+        &witness_peer_id.to_bytes()[..],
+        &witnessed_at_epoch.to_le_bytes()[..],
+    ]
+    .concat();
+    signer_public_key.verify(&payload, signature)
+}
+
 /// Number of epochs without an attestation before Layer 2b fires.
 /// Matches the existing ZOMBIE_ATTESTATION_SILENCE_EPOCHS.
 pub const ATTESTATION_SILENCE_EPOCHS: u64 = 10;

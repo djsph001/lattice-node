@@ -2882,7 +2882,7 @@ impl LatticeNode {
                             // The prefix prevents the same key from signing
                             // messages intended for other protocols.
                             let payload = [
-                                b"lattice/witness/v1" as &[u8],
+                                crate::claims::WITNESS_DOMAIN as &[u8],
                                 &request.claim_hash[..],
                                 &witness_peer_id.to_bytes()[..],
                                 &self.economic_engine.epoch_count().to_le_bytes()[..],

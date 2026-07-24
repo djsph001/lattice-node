@@ -376,6 +376,29 @@ impl ThicknessGraph {
         derive_usable(total, bps)
     }
 
+    /// Earned thickness: sum of all VerifiedContribution edges,
+    /// excluding Genesis and Vouch. This is what was actually
+    /// credited through work — witness claims, relay receipts,
+    /// service attestations.
+    ///
+    /// Returns 0.0 when no contributions have been credited.
+    /// VerifiedContribution edges are terminal (fixed amount, no
+    /// recursion) — no cycle risk, unlike total_thickness.
+    pub fn earned_thickness(&self, peer: &PeerId) -> f64 {
+        self.edges
+            .get(peer)
+            .map(|edges| {
+                edges
+                    .iter()
+                    .filter_map(|e| match &e.source {
+                        ThicknessSource::VerifiedContribution { amount, .. } => Some(*amount),
+                        _ => None,
+                    })
+                    .sum()
+            })
+            .unwrap_or(0.0)
+    }
+
     /// Total encumbered thickness: total × bps/10_000.
     /// Derived from integer bps — exact sum, order-independent.
     pub fn encumbered_for(&self, peer: &PeerId) -> f64 {
@@ -1390,5 +1413,39 @@ mod tests {
         // Bob vouching for Charlie is fine — no path C → B exists.
         let result = graph.stake_vouch(&bob, &charlie, 1000, 3, None);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn earned_thickness_independent_of_genesis_decay() {
+        let mut graph = ThicknessGraph::new();
+        let alice = PeerId::random();
+
+        // Genesis: 1000.0 amortized over 50 contributions
+        graph.add_genesis_thickness(&alice, 1000.0, Some(50)).unwrap();
+        // Earned: three claims at 1.0 each
+        graph.add_verified_contribution(&alice, [0x01; 32], 1.0);
+        graph.add_verified_contribution(&alice, [0x02; 32], 1.0);
+        graph.add_verified_contribution(&alice, [0x03; 32], 1.0);
+
+        // After 3 contributions: genesis = 1000*(47/50)=940, earned = 3
+        let total_before = graph.total_thickness(&alice);
+        let expected_total = 1000.0 * (47.0 / 50.0) + 3.0;
+        assert!((total_before - expected_total).abs() < 0.001,
+            "before amortization: expected {}, got {}", expected_total, total_before);
+        assert!((graph.earned_thickness(&alice) - 3.0).abs() < 0.001,
+            "earned must be exactly 3.0 before amortization");
+
+        // After 30 more contributions to OTHER peers, genesis = 1000*(17/50)=340
+        // Earned must still be exactly 3.0 — independent of genesis decay.
+        for _ in 0..30 {
+            let peer = PeerId::random();
+            graph.add_verified_contribution(&peer, [0xAA; 32], 1.0);
+        }
+        let total_after = graph.total_thickness(&alice);
+        let earned_after = graph.earned_thickness(&alice);
+        assert!((earned_after - 3.0).abs() < 0.001,
+            "earned must be independent of genesis decay: expected 3.0, got {}", earned_after);
+        assert!(total_after < total_before,
+            "total must have decreased (genesis amortized from {} to {})", total_before, total_after);
     }
 }

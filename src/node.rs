@@ -2857,17 +2857,36 @@ impl LatticeNode {
                                 witness_id: witness_peer_id,
                                 claim_hash: request.claim_hash,
                                 witnessed_at_epoch: self.economic_engine.epoch_count(),
-                                signature: Vec::new(), // empty = declined
+                                signature: Vec::new(),
                                 decline_reason: Some("Self-witness is not permitted".into()),
                             }
+                        } else if self.peer_table.get(&request.claimant_id)
+                                .map_or(true, |info| info.heartbeats_received == 0)
+                        {
+                            warn!(
+                                claimant = %request.claimant_id,
+                                "Witness request for unestablished peer — no heartbeats received"
+                            );
+                            WitnessResponse {
+                                claim_id: request.claim_id,
+                                witness_id: witness_peer_id,
+                                claim_hash: request.claim_hash,
+                                witnessed_at_epoch: self.economic_engine.epoch_count(),
+                                signature: Vec::new(),
+                                decline_reason: Some(
+                                    "Claimant is not established (no heartbeats observed)".into()
+                                ),
+                            }
                         } else {
-                            // Model A: sign the hash we received, not a claim we independently verified.
-                            let witness_id_bytes = witness_peer_id.to_bytes();
-                            let epoch_bytes = self.economic_engine.epoch_count().to_le_bytes();
-                            let mut payload = Vec::with_capacity(32 + witness_id_bytes.len() + 8);
-                            payload.extend_from_slice(&request.claim_hash);
-                            payload.extend_from_slice(&witness_id_bytes);
-                            payload.extend_from_slice(&epoch_bytes);
+                            // Domain-separated signing payload.
+                            // The prefix prevents the same key from signing
+                            // messages intended for other protocols.
+                            let payload = [
+                                b"lattice/witness/v1" as &[u8],
+                                &request.claim_hash[..],
+                                &witness_peer_id.to_bytes()[..],
+                                &self.economic_engine.epoch_count().to_le_bytes()[..],
+                            ].concat();
 
                             match self.local_key.sign(&payload) {
                                 Ok(sig) => {
@@ -2875,7 +2894,7 @@ impl LatticeNode {
                                         claim_id = %request.claim_id,
                                         witness = %witness_peer_id,
                                         sig_len = sig.len(),
-                                        "Witness signature issued (Model A)"
+                                        "Witness signature issued (domain-separated)"
                                     );
                                     WitnessResponse {
                                         claim_id: request.claim_id,

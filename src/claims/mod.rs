@@ -23,7 +23,7 @@
 //! If thickness ever gates a consensus-critical function (sortition
 //! selection, quorum weights), this assumption must be revisited.
 
-mod acceptance;
+pub(crate) mod acceptance;
 mod old;
 
 pub use acceptance::{accept_claim, ClaimRejection};

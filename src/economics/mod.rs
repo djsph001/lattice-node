@@ -23,6 +23,7 @@ use libp2p::PeerId;
 
 use crate::ledger::types::DigitalUtilityUnit;
 use crate::state::peers::PeerTable;
+use tracing::info;
 
 use self::metrics::NodeMetrics;
 use self::tax::{EpochTransactions, TaxEngine};
@@ -195,6 +196,11 @@ impl EconomicEngine {
     /// The claim is immediately stored in accepted_claims with
     /// applied_at_epoch: None, ensuring it survives crashes via snapshot.
     pub fn queue_claim(&mut self, claim: crate::claims::WitnessedClaim) {
+        info!(
+            claim_id = %format!("{:?}", &claim.start_epoch),
+            witnesses = claim.witnesses.len(),
+            "queue_claim: pushing to accepted_claims"
+        );
         self.accepted_claims.push(
             crate::ledger::persistence::StoredClaim {
                 claim,
@@ -221,14 +227,30 @@ impl EconomicEngine {
         }
     }
 
-    /// Take all accepted claims for snapshot persistence.
-    pub fn take_accepted_claims(&mut self) -> Vec<crate::ledger::persistence::StoredClaim> {
-        std::mem::take(&mut self.accepted_claims)
+    /// Return all accepted claims for snapshot persistence.
+    /// Does NOT drain the vec — claims remain in memory for witness-count
+    /// queries and survive across snapshot cycles. The `applied_at_epoch`
+    /// marker is the only state change; nothing needs consuming.
+    pub fn accepted_claims_snapshot(&self) -> &Vec<crate::ledger::persistence::StoredClaim> {
+        &self.accepted_claims
     }
 
     /// Import accepted claims on recovery (rebuild from snapshot).
     pub fn import_accepted_claims(&mut self, claims: Vec<crate::ledger::persistence::StoredClaim>) {
         self.accepted_claims = claims;
+    }
+
+    /// Count distinct witnesses across all accepted claims.
+    /// Returns None if no claims have been accepted yet.
+    pub fn count_distinct_witnesses(&self) -> Option<u64> {
+        if self.accepted_claims.is_empty() {
+            return None;
+        }
+        let count = self.accepted_claims.iter()
+            .flat_map(|sc| sc.claim.witnesses.iter().map(|w| w.witness))
+            .collect::<std::collections::HashSet<_>>()
+            .len() as u64;
+        if count > 0 { Some(count) } else { None }
     }
 }
 

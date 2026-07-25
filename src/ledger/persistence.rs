@@ -20,7 +20,7 @@ use super::types::{DigitalUtilityUnit, SignedTransaction};
 /// epoch boundary.  `Some(e)` means it was credited at epoch e.
 /// This is the one source of truth for both pending and applied claims;
 /// on recovery, `None` entries are re-queued for the next boundary.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct StoredClaim {
     pub claim: crate::claims::WitnessedClaim,
     pub applied_at_epoch: Option<u64>,
@@ -47,6 +47,7 @@ pub struct PersistentEconomicState {
     /// TODO(witnessed-claims): prune claim bodies older than the epoch
     /// high-water mark — only StoredClaim.applied_at_epoch is needed for
     /// overlap checks once a claim is superseded.
+    #[serde(default)]
     pub accepted_claims: Vec<StoredClaim>,
 }
 
@@ -67,7 +68,7 @@ impl PersistentEconomicState {
         balances: &HashMap<PeerId, DigitalUtilityUnit>,
         thickness: &ThicknessGraph,
         self_tx_nonce: u64,
-        accepted_claims: Vec<StoredClaim>,
+        accepted_claims: &[StoredClaim],
     ) -> Self {
         Self {
             seen_nonces: nonces.iter().map(|(k, v)| (k.to_base58(), *v)).collect(),
@@ -81,7 +82,7 @@ impl PersistentEconomicState {
                 })
                 .collect(),
             self_tx_nonce,
-            accepted_claims,
+            accepted_claims: accepted_claims.to_vec(),
         }
     }
 

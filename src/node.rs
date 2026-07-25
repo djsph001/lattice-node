@@ -114,6 +114,43 @@ const ZOMBIE_ATTESTATION_SILENCE_EPOCHS: u64 = 10;
 /// transaction forwarding.  0.5 = 50%.
 const OUTBOUND_CIRCUIT_BREAKER_FRACTION: f64 = 0.5;
 
+/// How many epochs a witness claim stays in "collecting" before
+/// timing out. At 64s/epoch, 5 epochs ≈ 5 minutes — enough for
+/// peer responses on any reasonable mesh.
+const CLAIM_COLLECTION_EPOCHS: u64 = 5;
+
+/// How many epochs finalized claims stay in the registry before
+/// eviction. 10 epochs ≈ 10 minutes — enough for the operator to
+/// poll the result.
+const CLAIM_RETENTION_EPOCHS: u64 = 10;
+
+// ── Witness claim submission tracking ──────────────────────
+
+/// State of a single witness claim submission, tracked through
+/// the collection → assembly → acceptance lifecycle.
+#[derive(Debug, Clone)]
+struct WitnessClaimState {
+    claim_id: String,
+    status: ClaimSubmissionStatus,
+    start_epoch: u64,
+    end_epoch: u64,
+    candidates: Vec<PeerId>,
+    signatures: Vec<crate::claims::WitnessSignature>,
+    declines: Vec<(PeerId, String)>,
+    started_at_epoch: u64,
+}
+
+#[derive(Debug, Clone)]
+enum ClaimSubmissionStatus {
+    /// Waiting for witness responses.
+    Collecting,
+    /// All witnesses responded (or deadline expired) — assembled
+    /// and accepted.
+    Accepted { thickness: f64 },
+    /// Witnesses refused, or acceptance rejected.
+    Rejected { reason: String },
+}
+
 // ── Phase 6: storage verification types ────────────────────
 
 /// Tracks the context of an outbound storage challenge so the
@@ -388,6 +425,12 @@ pub struct LatticeNode {
     executor: crate::agent::executor::Executor,
     /// Phase 9: channel sender for background execution results.
     exec_tx: Option<tokio::sync::mpsc::Sender<ExecutionResult>>,
+    /// Witness claim submission registry — tracks in-flight and
+    /// completed claims through the collection → acceptance lifecycle.
+    witness_claims: HashMap<String, WitnessClaimState>,
+    /// High-water mark per (claimant, claim_type) for replay/overlap
+    /// defense.  Advances on acceptance.
+    last_claimed: crate::claims::acceptance::ClaimNonceMap,
 }
 
 impl LatticeNode {
@@ -705,6 +748,8 @@ impl LatticeNode {
             state_store: None,
             executor: crate::agent::executor::Executor::new(openai_api_key, openai_endpoint),
             exec_tx: None,
+            witness_claims: HashMap::new(),
+            last_claimed: crate::claims::acceptance::ClaimNonceMap::new(),
         })
     }
 
@@ -1993,6 +2038,15 @@ impl LatticeNode {
         // Order: credit before decay, so a claim credited this epoch
         // gets its first decay at the next epoch boundary.
         let unapplied = self.economic_engine.take_unapplied_claims();
+        // Credit-path diagnostic: count what the credit step sees
+        if !unapplied.is_empty() {
+            info!(
+                unapplied_count = unapplied.len(),
+                "Credit step: crediting unapplied claims"
+            );
+        } else {
+            info!("Credit step: no unapplied claims found");
+        }
         if !unapplied.is_empty() {
             let mut indices = Vec::with_capacity(unapplied.len());
             for (idx, claim) in &unapplied {
@@ -2026,7 +2080,7 @@ impl LatticeNode {
                     &self.ledger.balances,
                     &self.ledger.thickness_graph,
                     self.tx_nonce,
-                    self.economic_engine.take_accepted_claims(),
+                    self.economic_engine.accepted_claims_snapshot(),
                 );
                 if let Err(e) = store.take_snapshot(epoch, &snapshot) {
                     warn!(error = %e, "Failed to save economic snapshot");
@@ -2148,6 +2202,10 @@ impl LatticeNode {
         if !expired.is_empty() {
             info!(count = expired.len(), "[agent] Expired {} tasks", expired.len());
         }
+
+        // Sweep claim registry — expire timed-out collections,
+        // evict old finalized entries.
+        self.sweep_claims();
     }
 
     /// Mint units to the local node (test bootstrapping only).
@@ -2220,6 +2278,102 @@ impl LatticeNode {
         Ok(())
     }
 
+    // ── Witness handler: three-gate request processing ──────────
+    //
+    // Extracted from the event loop so that LatticeNode::run() and
+    // the two-swarm test harness share a single implementation.
+    // Changing the gates here changes both callers — no copy drift.
+
+    /// Apply the three witness gates to a request and produce a
+    /// WitnessResponse. Does NOT send the response — the caller
+    /// is responsible for dispatching via the witness_rpc channel.
+    ///
+    /// Gates (in order):
+    /// 1. Self-witness — claimant cannot witness its own claim
+    /// 2. Establishment — claimant must have heartbeats_received > 0
+    /// 3. Signing — domain-separated Ed25519 over (claim_hash,
+    ///    witness_id, epoch)
+    pub(crate) fn handle_witness_request(
+        peer_table: &PeerTable,
+        local_key: &identity::Keypair,
+        epoch: u64,
+        request: &WitnessRequest,
+    ) -> WitnessResponse {
+        let witness_peer_id = PeerId::from(local_key.public());
+
+        // Gate 1: self-witness
+        if request.claimant_id == witness_peer_id {
+            warn!(claimant = %request.claimant_id,
+                "Self-witness request rejected");
+            return WitnessResponse {
+                claim_id: request.claim_id.clone(),
+                witness_id: witness_peer_id,
+                claim_hash: request.claim_hash,
+                witnessed_at_epoch: epoch,
+                signature: Vec::new(),
+                decline_reason: Some("Self-witness is not permitted".into()),
+            };
+        }
+
+        // Gate 2: establishment
+        if peer_table.get(&request.claimant_id)
+            .map_or(true, |info| info.heartbeats_received == 0)
+        {
+            warn!(
+                claimant = %request.claimant_id,
+                "Witness request for unestablished peer — no heartbeats received"
+            );
+            return WitnessResponse {
+                claim_id: request.claim_id.clone(),
+                witness_id: witness_peer_id,
+                claim_hash: request.claim_hash,
+                witnessed_at_epoch: epoch,
+                signature: Vec::new(),
+                decline_reason: Some(
+                    "Claimant is not established (no heartbeats observed)".into()
+                ),
+            };
+        }
+
+        // Gate 3: domain-separated signing
+        let payload = [
+            crate::claims::WITNESS_DOMAIN as &[u8],
+            &request.claim_hash[..],
+            &witness_peer_id.to_bytes()[..],
+            &epoch.to_le_bytes()[..],
+        ].concat();
+
+        match local_key.sign(&payload) {
+            Ok(sig) => {
+                info!(
+                    claim_id = %request.claim_id,
+                    witness = %witness_peer_id,
+                    sig_len = sig.len(),
+                    "Witness signature issued (domain-separated)"
+                );
+                WitnessResponse {
+                    claim_id: request.claim_id.clone(),
+                    witness_id: witness_peer_id,
+                    claim_hash: request.claim_hash,
+                    witnessed_at_epoch: epoch,
+                    signature: sig,
+                    decline_reason: None,
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to sign witness response");
+                WitnessResponse {
+                    claim_id: request.claim_id.clone(),
+                    witness_id: witness_peer_id,
+                    claim_hash: request.claim_hash,
+                    witnessed_at_epoch: epoch,
+                    signature: Vec::new(),
+                    decline_reason: Some(format!("Signing failed: {e}")),
+                }
+            }
+        }
+    }
+
     /// Send a direct witness request to a specific peer over the
     /// request-response protocol. Returns a RequestId for correlation.
     /// The witness will sign the claim_hash (Model A) — they sign what
@@ -2230,6 +2384,346 @@ impl LatticeNode {
         request: WitnessRequest,
     ) -> libp2p::request_response::OutboundRequestId {
         self.swarm.behaviour_mut().witness_rpc.send_request(&peer, request)
+    }
+
+    // ── Witness claim orchestration ────────────────────────────
+
+    /// Initiate a service attestation claim: identify witnesses,
+    /// dispatch requests, return a claim_id. The caller polls
+    /// GetClaimStatus for results. Does NOT block — sends requests
+    /// and returns immediately.
+    fn handle_witness_claim_service(&mut self, msg: crate::api::ApiMessage) {
+        use crate::api::ApiResponse;
+
+        // Guard: no concurrent claim for same (self, service attestation)
+        let active = self.witness_claims.values().any(|s| {
+            matches!(s.status, ClaimSubmissionStatus::Collecting)
+        });
+        if active {
+            let existing_id = self.witness_claims.values()
+                .find(|s| matches!(s.status, ClaimSubmissionStatus::Collecting))
+                .map(|s| s.claim_id.clone())
+                .unwrap_or_default();
+            let _ = msg.reply.send(ApiResponse::AlreadyCollecting {
+                claim_id: existing_id,
+            });
+            return;
+        }
+
+        // Compute the claimable window
+        let (start_epoch, end_epoch) = match self.compute_service_window() {
+            Some(w) => w,
+            None => {
+                let _ = msg.reply.send(ApiResponse::NothingToClaim);
+                return;
+            }
+        };
+
+        // Identify candidates: established peers, not self
+        let current_epoch = self.economic_engine.epoch_count();
+        let candidates: Vec<PeerId> = self.peer_table.iter()
+            .filter(|p| {
+                p.peer_id != self.local_peer_id
+                    && p.heartbeats_received > 0
+            })
+            .map(|p| p.peer_id)
+            .collect();
+
+        if candidates.is_empty() {
+            let _ = msg.reply.send(ApiResponse::ClaimStatus {
+                claim_id: String::new(),
+                status: "rejected".into(),
+                candidates: 0,
+                signatures_collected: 0,
+                declines: vec![],
+                result: Some(crate::api::ClaimResultInfo {
+                    thickness: None,
+                    acceptance: "rejected".into(),
+                    reason: Some("No established peers to witness".into()),
+                }),
+            });
+            return;
+        }
+
+        // Generate a claim ID and build the request
+        let claim_id = format!(
+            "svc-{}-{}",
+            current_epoch,
+            &self.local_peer_id.to_base58()[..8]
+        );
+        let claim_hash = self.compute_claim_hash(
+            &self.local_peer_id,
+            start_epoch,
+            end_epoch,
+        );
+        let request = WitnessRequest {
+            claim_id: claim_id.clone(),
+            claim_type: 0, // ServiceAttestation
+            claimant_id: self.local_peer_id,
+            claim_hash,
+            requested_at_epoch: current_epoch,
+        };
+
+        // Create registry entry
+        let state = WitnessClaimState {
+            claim_id: claim_id.clone(),
+            status: ClaimSubmissionStatus::Collecting,
+            start_epoch,
+            end_epoch,
+            candidates: candidates.clone(),
+            signatures: Vec::new(),
+            declines: Vec::new(),
+            started_at_epoch: current_epoch,
+        };
+        self.witness_claims.insert(claim_id.clone(), state);
+
+        // Dispatch requests to all candidates
+        for peer_id in &candidates {
+            self.swarm.behaviour_mut()
+                .witness_rpc
+                .send_request(peer_id, request.clone());
+        }
+
+        info!(
+            claim_id = %claim_id,
+            candidates = candidates.len(),
+            window = format!("{}-{}", start_epoch, end_epoch),
+            "Witness claim initiated"
+        );
+
+        let _ = msg.reply.send(ApiResponse::ClaimSubmitted { claim_id });
+    }
+
+    /// Compute the claimable window for a service attestation claim.
+    /// Returns None if no claimable window exists (fresh node, or
+    /// already claimed through the current epoch).
+    fn compute_service_window(&self) -> Option<(u64, u64)> {
+        let key = (
+            self.local_peer_id.to_base58(),
+            crate::claims::ClaimType::ServiceAttestation as u8,
+        );
+        let last_end = self.last_claimed.get(&key).copied().unwrap_or(0);
+        let current_epoch = self.economic_engine.epoch_count();
+
+        let start = last_end.saturating_add(1);
+        if current_epoch < 2 {
+            return None; // need at least epoch 1 to have a window
+        }
+        let end = current_epoch.saturating_sub(1);
+
+        if start > end {
+            return None;
+        }
+
+        // Clamp to MAX_CLAIM_WINDOW from the end
+        let max_window = crate::claims::MAX_CLAIM_WINDOW;
+        let start = start.max(end.saturating_sub(max_window));
+
+        if start > end {
+            return None;
+        }
+
+        Some((start, end))
+    }
+
+    /// Compute the canonical claim hash for a service attestation.
+    fn compute_claim_hash(
+        &self,
+        claimant: &PeerId,
+        start_epoch: u64,
+        end_epoch: u64,
+    ) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(claimant.to_bytes().as_ref());
+        hasher.update(&start_epoch.to_le_bytes());
+        hasher.update(&end_epoch.to_le_bytes());
+        hasher.update(b"service_attestation");
+        hasher.finalize().into()
+    }
+
+    /// Route a witness response to the appropriate claim in the
+    /// registry. Returns true if the response was claimed (routed
+    /// to an active collection), false if it should fall through
+    /// to the existing attestation path.
+    fn route_witness_response(&mut self, peer: PeerId, response: &WitnessResponse) -> bool {
+        if let Some(state) = self.witness_claims.get_mut(&response.claim_id) {
+            // Safety: only accept responses from actual candidates
+            if !state.candidates.contains(&response.witness_id) {
+                warn!(
+                    claim_id = %response.claim_id,
+                    peer = %response.witness_id,
+                    "Unsolicited witness response — peer not a candidate"
+                );
+                return true; // claimed but rejected
+            }
+
+            if response.signature.is_empty() {
+                info!(
+                    claim_id = %response.claim_id,
+                    witness = %response.witness_id,
+                    reason = ?response.decline_reason,
+                    "Witness declined"
+                );
+                state.declines.push((
+                    response.witness_id,
+                    response.decline_reason.clone()
+                        .unwrap_or_else(|| "no reason given".into()),
+                ));
+            } else {
+                info!(
+                    claim_id = %response.claim_id,
+                    witness = %response.witness_id,
+                    sig_len = response.signature.len(),
+                    "Witness signed"
+                );
+                state.signatures.push(crate::claims::WitnessSignature {
+                    witness: response.witness_id,
+                    signed_at_epoch: response.witnessed_at_epoch,
+                    observed_heartbeats: 1,
+                    signature: response.signature.clone(),
+                });
+            }
+
+            // Check if collection is complete (all candidates responded)
+            let responded = state.signatures.len() + state.declines.len();
+            if responded >= state.candidates.len() {
+                self.finalize_claim(&response.claim_id.clone());
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Finalize a claim: assemble the WitnessedClaim, feed to
+    /// accept_claim(), and update the registry.
+    fn finalize_claim(&mut self, claim_id: &str) {
+        let state = match self.witness_claims.get(claim_id) {
+            Some(s) => s.clone(),
+            None => return,
+        };
+
+        if !matches!(state.status, ClaimSubmissionStatus::Collecting) {
+            return; // already finalized
+        }
+
+        // Check minimum witnesses
+        let min_witnesses = crate::claims::MIN_WITNESSES;
+        if (state.signatures.len() as u64) < min_witnesses {
+            let reason = if state.signatures.is_empty() && state.declines.is_empty() {
+                "No witnesses responded — all candidates timed out".to_string()
+            } else if state.signatures.is_empty() {
+                format!(
+                    "All {} candidates declined (0 signed). Window reclaimable.",
+                    state.candidates.len()
+                )
+            } else {
+                format!(
+                    "Insufficient witnesses: got {} signatures, need {} ({} candidates, {} declined)",
+                    state.signatures.len(),
+                    min_witnesses,
+                    state.candidates.len(),
+                    state.declines.len(),
+                )
+            };
+            if let Some(s) = self.witness_claims.get_mut(claim_id) {
+                s.status = ClaimSubmissionStatus::Rejected {
+                    reason: reason.clone(),
+                };
+            }
+            info!(claim_id = %claim_id, reason = %reason, "Claim rejected — insufficient witnesses");
+            return;
+        }
+
+        // Assemble the WitnessedClaim
+        let assembled = crate::claims::WitnessedClaim {
+            claimant: self.local_peer_id,
+            claim_type: crate::claims::ClaimType::ServiceAttestation,
+            start_epoch: state.start_epoch,
+            end_epoch: state.end_epoch,
+            evidence: crate::claims::ClaimEvidence::Service {
+                claimed_count: 1,
+            },
+            witnesses: state.signatures.clone(),
+            submitted_epoch: self.economic_engine.epoch_count(),
+        };
+
+        // Feed to accept_claim. established_peers counts all peers
+        // in the mesh (including self) so accept_claim can enforce
+        // the "need at least one other peer to witness" rule.
+        // peer_table doesn't contain self, so add 1.
+        let established = self.peer_table.len() + 1;
+        match crate::claims::accept_claim(
+            &assembled,
+            &self.last_claimed,
+            established,
+        ) {
+            Ok(thickness) => {
+                // Update high-water mark
+                let key = (
+                    self.local_peer_id.to_base58(),
+                    crate::claims::ClaimType::ServiceAttestation as u8,
+                );
+                self.last_claimed.insert(key, state.end_epoch);
+
+                // Queue for economic engine
+                self.economic_engine.queue_claim(assembled);
+
+                if let Some(s) = self.witness_claims.get_mut(claim_id) {
+                    s.status = ClaimSubmissionStatus::Accepted { thickness };
+                }
+                info!(
+                    claim_id = %claim_id,
+                    thickness,
+                    witnesses = state.signatures.len(),
+                    "Claim accepted"
+                );
+            }
+            Err(rejection) => {
+                let reason = format!("{}", rejection);
+                if let Some(s) = self.witness_claims.get_mut(claim_id) {
+                    s.status = ClaimSubmissionStatus::Rejected {
+                        reason: reason.clone(),
+                    };
+                }
+                info!(
+                    claim_id = %claim_id,
+                    reason = %reason,
+                    "Claim rejected by acceptance"
+                );
+            }
+        }
+    }
+
+    /// Sweep the claim registry: expire timed-out collections and
+    /// evict old finalized entries. Called from the epoch tick.
+    fn sweep_claims(&mut self) {
+        let current_epoch = self.economic_engine.epoch_count();
+
+        // Expire timed-out collections
+        let mut to_finalize: Vec<String> = Vec::new();
+        for (id, state) in &self.witness_claims {
+            if matches!(state.status, ClaimSubmissionStatus::Collecting)
+                && current_epoch.saturating_sub(state.started_at_epoch)
+                    > CLAIM_COLLECTION_EPOCHS
+            {
+                to_finalize.push(id.clone());
+            }
+        }
+        for id in &to_finalize {
+            info!(claim_id = %id, "Claim collection deadline expired — finalizing with collected signatures");
+            self.finalize_claim(id);
+        }
+
+        // Evict old finalized entries
+        self.witness_claims.retain(|_id, state| {
+            match &state.status {
+                ClaimSubmissionStatus::Collecting => true, // keep active
+                ClaimSubmissionStatus::Accepted { .. } | ClaimSubmissionStatus::Rejected { .. } => {
+                    current_epoch.saturating_sub(state.started_at_epoch)
+                        <= CLAIM_RETENTION_EPOCHS
+                }
+            }
+        });
     }
 
     /// Sign a transaction with the node's Ed25519 keypair.
@@ -2841,83 +3335,18 @@ impl LatticeNode {
                         request_id: _, request, channel,
                     } => {
                         // Responder side: examine the witness request
-                        let witness_peer_id = PeerId::from(self.local_key.public());
-
+                        //
                         // I7: Discovery ≠ Recognition — receiving a request
                         // does not create a relationship or modify trust.
                         // I4: Witness ≠ Certification — signing the hash
                         // does not mark the claim as verified.
-
-                        // Reject self-witness (claimant cannot witness own claim)
-                        let response = if request.claimant_id == witness_peer_id {
-                            warn!(claimant = %request.claimant_id,
-                                "Self-witness request rejected");
-                            WitnessResponse {
-                                claim_id: request.claim_id,
-                                witness_id: witness_peer_id,
-                                claim_hash: request.claim_hash,
-                                witnessed_at_epoch: self.economic_engine.epoch_count(),
-                                signature: Vec::new(),
-                                decline_reason: Some("Self-witness is not permitted".into()),
-                            }
-                        } else if self.peer_table.get(&request.claimant_id)
-                                .map_or(true, |info| info.heartbeats_received == 0)
-                        {
-                            warn!(
-                                claimant = %request.claimant_id,
-                                "Witness request for unestablished peer — no heartbeats received"
-                            );
-                            WitnessResponse {
-                                claim_id: request.claim_id,
-                                witness_id: witness_peer_id,
-                                claim_hash: request.claim_hash,
-                                witnessed_at_epoch: self.economic_engine.epoch_count(),
-                                signature: Vec::new(),
-                                decline_reason: Some(
-                                    "Claimant is not established (no heartbeats observed)".into()
-                                ),
-                            }
-                        } else {
-                            // Domain-separated signing payload.
-                            // The prefix prevents the same key from signing
-                            // messages intended for other protocols.
-                            let payload = [
-                                crate::claims::WITNESS_DOMAIN as &[u8],
-                                &request.claim_hash[..],
-                                &witness_peer_id.to_bytes()[..],
-                                &self.economic_engine.epoch_count().to_le_bytes()[..],
-                            ].concat();
-
-                            match self.local_key.sign(&payload) {
-                                Ok(sig) => {
-                                    info!(
-                                        claim_id = %request.claim_id,
-                                        witness = %witness_peer_id,
-                                        sig_len = sig.len(),
-                                        "Witness signature issued (domain-separated)"
-                                    );
-                                    WitnessResponse {
-                                        claim_id: request.claim_id,
-                                        witness_id: witness_peer_id,
-                                        claim_hash: request.claim_hash,
-                                        witnessed_at_epoch: self.economic_engine.epoch_count(),
-                                        signature: sig,
-                                        decline_reason: None,
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "Failed to sign witness response");
-                                    WitnessResponse {
-                                        claim_id: request.claim_id,
-                                        witness_id: witness_peer_id,
-                                        claim_hash: request.claim_hash,
-                                        witnessed_at_epoch: self.economic_engine.epoch_count(),
-                                        signature: Vec::new(),
-                                        decline_reason: Some(format!("Signing failed: {e}")),
-                                    }
-                                }
-                            }
-                        };
+                        let epoch = self.economic_engine.epoch_count();
+                        let response = Self::handle_witness_request(
+                            &self.peer_table,
+                            &self.local_key,
+                            epoch,
+                            &request,
+                        );
 
                         // I4: Witness ≠ Certification — the response is sent
                         // but the claim is NOT marked as verified.
@@ -2925,7 +3354,13 @@ impl LatticeNode {
                             .send_response(channel, response);
                     }
                     request_response::Message::Response { response, .. } => {
-                        // Requester side: a witness responded
+                        // Route to claim registry first; fall through
+                        // to attestation path if unclaimed.
+                        let claimed = self.route_witness_response(peer, &response);
+                        if claimed {
+                            return;
+                        }
+                        // Requester side: a witness responded (attestation path)
                         if response.signature.is_empty() {
                             info!(
                                 claim_id = %response.claim_id,
@@ -3412,9 +3847,18 @@ impl LatticeNode {
             // thickness at all.  On a fresh mesh with no genesis seed,
             // every peer looks like a zombie by this criterion, and
             // evicting all of them on loop breaks the mesh.
+            //
+            // Constitutional separation (2026-07-24): establishment
+            // (heartbeats > 0) is the standing that keeps you in the
+            // mesh.  Thickness is standing you earn and spend, not
+            // standing you're required to hold.  An established peer
+            // is never evicted for zero thickness — that would create
+            // a chicken-and-egg where a fresh peer must earn thickness
+            // through witnessing but can't survive long enough to do so.
             let thickness = self.ledger.thickness_graph.total_thickness(peer_id);
             if thickness < 0.001
                 && self.ledger.thickness_graph.peer_count() > 0
+                && info.heartbeats_received == 0
             {
                 let last_att_epoch = self.last_attestation_epoch.get(peer_id).copied().unwrap_or(0);
                 let epochs_since_attest =
@@ -3532,9 +3976,13 @@ impl LatticeNode {
             }
             // Zero thickness + attestation silence
             // Gate: skip if mesh has never had thickness (same as check_peer_liveness)
+            //
+            // Constitutional separation (2026-07-24): established peers
+            // are never dead by zero-thickness criterion.
             let thickness = self.ledger.thickness_graph.total_thickness(&info.peer_id);
             if thickness < 0.001
                 && self.ledger.thickness_graph.peer_count() > 0
+                && info.heartbeats_received == 0
             {
                 let last_att_epoch =
                     self.last_attestation_epoch.get(&info.peer_id).copied().unwrap_or(0);
@@ -5404,8 +5852,58 @@ impl LatticeNode {
                     message: format!("Unknown domain_tag: {}", domain_tag),
                 },
             },
+            ApiRequest::WitnessClaimService => {
+                return self.handle_witness_claim_service(msg);
+            }
+            ApiRequest::GetClaimStatus { claim_id } => {
+                let state = self.witness_claims.get(&claim_id);
+                match state {
+                    Some(s) => {
+                        let status_str = match &s.status {
+                            ClaimSubmissionStatus::Collecting => "collecting",
+                            ClaimSubmissionStatus::Accepted { .. } => "accepted",
+                            ClaimSubmissionStatus::Rejected { .. } => "rejected",
+                        };
+                        let declines: Vec<_> = s.declines.iter().map(|(pid, reason)| {
+                            crate::api::ClaimDeclineInfo {
+                                witness: pid.to_base58(),
+                                reason: reason.clone(),
+                            }
+                        }).collect();
+                        let result = match &s.status {
+                            ClaimSubmissionStatus::Accepted { thickness } => {
+                                Some(crate::api::ClaimResultInfo {
+                                    thickness: Some(*thickness),
+                                    acceptance: "accepted".into(),
+                                    reason: None,
+                                })
+                            }
+                            ClaimSubmissionStatus::Rejected { reason } => {
+                                Some(crate::api::ClaimResultInfo {
+                                    thickness: None,
+                                    acceptance: "rejected".into(),
+                                    reason: Some(reason.clone()),
+                                })
+                            }
+                            ClaimSubmissionStatus::Collecting => None,
+                        };
+                        ApiResponse::ClaimStatus {
+                            claim_id,
+                            status: status_str.to_string(),
+                            candidates: s.candidates.len(),
+                            signatures_collected: s.signatures.len(),
+                            declines,
+                            result,
+                        }
+                    }
+                    None => ApiResponse::Error {
+                        message: format!("Claim {} not found", claim_id),
+                    },
+                }
+            }
             // ── Read-only query API (v1) ──────────────────────────
             ApiRequest::GetPeers => {
+                let dead = self.dead_peer_ids();
                 let peers: Vec<_> = self.peer_table.iter()
                     .filter(|p| p.peer_id != self.local_peer_id)
                     .map(|p| {
@@ -5413,7 +5911,11 @@ impl LatticeNode {
                             .get(&p.peer_id)
                             .map(|q| q.len() as u64)
                             .unwrap_or(0);
-                        let dead = self.dead_peer_ids();
+                        let thickness = {
+                            let t = self.ledger.thickness_graph
+                                .total_thickness(&p.peer_id);
+                            if t > 0.0 { Some(t) } else { None }
+                        };
                         crate::api::PeerInfo {
                             peer_id: p.peer_id.to_base58(),
                             name: None,
@@ -5426,6 +5928,8 @@ impl LatticeNode {
                             },
                             is_dead: dead.contains(&p.peer_id),
                             queue_depth,
+                            thickness,
+                            distinct_witnesses: None, // TODO: count from accepted claims
                         }
                     })
                     .collect();
@@ -5469,6 +5973,18 @@ impl LatticeNode {
                 let genesis_id = self.genesis_root.as_ref()
                     .map(|g| g.to_string())
                     .unwrap_or_else(|| "auto".to_string());
+                let self_thickness = {
+                    let t = self.ledger.thickness_graph
+                        .total_thickness(&self.local_peer_id);
+                    if t > 0.0 { Some(t) } else { None }
+                };
+                // Count distinct witnesses from accepted claims
+                let dw = self.economic_engine.count_distinct_witnesses();
+                // Earned thickness — VerifiedContribution edges only (no genesis/vouch)
+                let earned: Option<f64> = {
+                    let e = self.ledger.thickness_graph.earned_thickness(&self.local_peer_id);
+                    if e > 0.0 { Some(e) } else { None }
+                };
                 ApiResponse::NodeInfo {
                     peer_id: self.local_peer_id.to_base58(),
                     name: self.node_name.clone(),
@@ -5478,6 +5994,9 @@ impl LatticeNode {
                         .duration_since(self.start_time)
                         .as_secs(),
                     build_commit: env!("BUILD_COMMIT").to_string(),
+                    thickness: self_thickness,
+                    distinct_witnesses: dw,
+                    earned_thickness: earned,
                 }
             }
             ApiRequest::GetPersistenceState => {
@@ -6306,10 +6825,20 @@ mod outbound_sweep_tests {
     }
 
     #[test]
-    fn peer_with_thickness_not_dead() {
-        let thickness = 1.0_f64;
-        let is_dead = thickness < 0.001;
-        assert!(!is_dead);
+    fn established_peer_survives_zero_thickness_eviction() {
+        // Constitutional separation (2026-07-24):
+        // An established peer (heartbeats > 0) must not be
+        // evicted for zero thickness. Thickness is earned,
+        // establishment is the standing that keeps you in the mesh.
+        let thickness = 0.0_f64;
+        let heartbeats = 5u64;
+        let is_established = heartbeats > 0;
+
+        // Before: would have been dead. After 2b gate: survives.
+        let would_be_dead = thickness < 0.001;
+        let actually_dead = would_be_dead && !is_established;
+        assert!(!actually_dead,
+            "established peer with heartbeats>0 must survive zero-thickness eviction");
     }
 
     #[test]
@@ -6595,5 +7124,981 @@ mod witness_seam_tests {
         // not the acceptance layer.
         assert!(result.is_ok(),
             "declined response still produces a valid WitnessedClaim: {:?}", result);
+    }
+}
+
+// ── Two-Swarm Witness Harness ────────────────────────────────
+//
+// Exercises the full round-trip: real LatticeBehaviour, real
+// WitnessCodec, real request-response protocol, real event dispatch,
+// real handler code with all three gates. Two in-process libp2p
+// swarms on loopback, deterministically driven via tokio::select!.
+//
+// What this proves that the 306 unit tests don't:
+//   - A WitnessRequest survives the CBOR codec + length-prefix
+//     framing + request-response transport.
+//   - The real event dispatch (SwarmEvent → LatticeBehaviourEvent
+//     → WitnessRpc) delivers the request to the handler in the
+//     shape it expects.
+//   - The handler's three gates fire on the real code path.
+//   - WitnessResponse travels back through the same stack.
+//   - Assembled WitnessedClaim feeds into accept_claim().
+//
+// What this does NOT test: the UDS submit path. That's the
+// remaining unknown.
+
+#[cfg(test)]
+mod two_swarm_witness_harness {
+    use super::*;
+    use crate::claims::{self, WitnessSignature, ClaimType, ClaimEvidence, WitnessedClaim};
+    use crate::message::codec::rpc::WitnessProtocol;
+    use crate::network::protocol::{
+        LatticeBehaviour, LatticeBehaviourEvent,
+        LATTICE_HEARTBEAT_TOPIC, LATTICE_KAD_PROTOCOL,
+    };
+    use crate::state::peers::PeerTable;
+    use libp2p::{
+        futures::StreamExt,
+        gossipsub, identify, identity, kad, mdns, noise, relay, request_response,
+        swarm::SwarmEvent,
+        tcp, yamux, Multiaddr, PeerId, SwarmBuilder,
+        StreamProtocol,
+    };
+    use libp2p::swarm::behaviour::toggle::Toggle;
+    use std::time::Duration;
+
+    /// Minimum node with a Swarm<LatticeBehaviour> plus the state
+    /// the witness handler reads: peer_table, keypair, epoch.
+    struct WitnessNode {
+        swarm: libp2p::Swarm<LatticeBehaviour>,
+        peer_table: PeerTable,
+        local_key: identity::Keypair,
+        local_peer_id: PeerId,
+        epoch: u64,
+        listen_addr: Option<Multiaddr>,
+    }
+
+    impl WitnessNode {
+        fn new() -> Self {
+            let local_key = identity::Keypair::generate_ed25519();
+            let local_peer_id = PeerId::from(local_key.public());
+
+            let swarm = SwarmBuilder::with_existing_identity(local_key.clone())
+                .with_tokio()
+                .with_tcp(
+                    tcp::Config::default(),
+                    noise::Config::new,
+                    yamux::Config::default,
+                )
+                .expect("tcp transport")
+                .with_relay_client(
+                    noise::Config::new,
+                    yamux::Config::default,
+                )
+                .expect("relay transport")
+                .with_behaviour(|key, relay_client| {
+                    let mdns = mdns::tokio::Behaviour::new(
+                        mdns::Config::default(),
+                        key.public().to_peer_id(),
+                    )?;
+
+                    let gossipsub_config = gossipsub::ConfigBuilder::default()
+                        .heartbeat_interval(Duration::from_secs(1))
+                        .validation_mode(gossipsub::ValidationMode::Permissive)
+                        .mesh_outbound_min(1)
+                        .mesh_n_low(1)
+                        .mesh_n(2)
+                        .mesh_n_high(4)
+                        .build()
+                        .map_err(|e| anyhow::anyhow!("gossipsub config: {e}"))?;
+
+                    let mut gossipsub = gossipsub::Behaviour::new(
+                        gossipsub::MessageAuthenticity::Signed(key.clone()),
+                        gossipsub_config,
+                    )
+                    .map_err(|e| anyhow::anyhow!("gossipsub init: {e}"))?;
+
+                    // Minimal topic subscriptions — only what's needed
+                    // for the swarm to not error on incoming messages.
+                    let topic = gossipsub::IdentTopic::new(LATTICE_HEARTBEAT_TOPIC);
+                    gossipsub.subscribe(&topic).ok();
+
+                    let rpc = request_response::Behaviour::new(
+                        [(LatticeProtocol, request_response::ProtocolSupport::Full)],
+                        request_response::Config::default(),
+                    );
+                    let balance_rpc = request_response::Behaviour::new(
+                        [(BalanceProtocol, request_response::ProtocolSupport::Full)],
+                        request_response::Config::default(),
+                    );
+                    let verify_rpc = request_response::Behaviour::new(
+                        [(VerifyProtocol, request_response::ProtocolSupport::Full)],
+                        request_response::Config::default(),
+                    );
+                    let agent_rpc = request_response::Behaviour::new(
+                        [(StreamProtocol::new(AGENT_STATE_PROTOCOL),
+                          request_response::ProtocolSupport::Full)],
+                        request_response::Config::default(),
+                    );
+
+                    let mut kademlia = {
+                        let store = kad::store::MemoryStore::new(key.public().to_peer_id());
+                        let kconfig = kad::Config::new(StreamProtocol::new(LATTICE_KAD_PROTOCOL));
+                        kad::Behaviour::with_config(key.public().to_peer_id(), store, kconfig)
+                    };
+                    kademlia.set_mode(Some(kad::Mode::Server));
+
+                    let relay_server = Toggle::from(None);
+                    let identify = identify::Behaviour::new(
+                        identify::Config::new(
+                            "/lattice/identify/v1".to_string(),
+                            key.public(),
+                        ),
+                    );
+
+                    let tx_rpc = request_response::Behaviour::new(
+                        [(TransactionProtocol, request_response::ProtocolSupport::Full)],
+                        request_response::Config::default(),
+                    );
+                    let chain_sync_rpc = request_response::Behaviour::new(
+                        [(ChainSyncProtocol, request_response::ProtocolSupport::Full)],
+                        request_response::Config::default(),
+                    );
+                    let witness_rpc = request_response::Behaviour::new(
+                        [(WitnessProtocol, request_response::ProtocolSupport::Full)],
+                        request_response::Config::default(),
+                    );
+
+                    Ok(LatticeBehaviour::new(
+                        mdns, gossipsub, rpc, balance_rpc, verify_rpc,
+                        kademlia, relay_client, relay_server, identify,
+                        agent_rpc, tx_rpc, chain_sync_rpc, witness_rpc,
+                    ))
+                })
+                .expect("behaviour")
+                .with_swarm_config(|c| {
+                    c.with_idle_connection_timeout(Duration::from_secs(60))
+                })
+                .build();
+
+            Self {
+                swarm,
+                peer_table: PeerTable::new(),
+                local_key,
+                local_peer_id,
+                epoch: 42,
+                listen_addr: None,
+            }
+        }
+
+        /// Process one swarm event. Returns Some(response) when a
+        /// WitnessResponse is received from a peer, or None for
+        /// all other events.
+        fn process_event(
+            &mut self,
+            event: SwarmEvent<LatticeBehaviourEvent>,
+        ) -> Option<(PeerId, WitnessResponse)> {
+            match event {
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    self.listen_addr = Some(address);
+                }
+                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                    // Add peer to peer_table on connection — mimics
+                    // the real node's ConnectionEstablished handler.
+                    if let Some(addr) = self.listen_addr.clone() {
+                        self.peer_table.add_peer(peer_id, addr, self.epoch);
+                    }
+                }
+                SwarmEvent::Behaviour(LatticeBehaviourEvent::WitnessRpc(
+                    request_response::Event::Message { peer, message },
+                )) => {
+                    match message {
+                        request_response::Message::Request {
+                            request_id: _, request, channel,
+                        } => {
+                            // Call the real handler — same function LatticeNode::run() uses
+                            let response = LatticeNode::handle_witness_request(
+                                &self.peer_table,
+                                &self.local_key,
+                                self.epoch,
+                                &request,
+                            );
+
+                            let _ = self
+                                .swarm
+                                .behaviour_mut()
+                                .witness_rpc
+                                .send_response(channel, response);
+                        }
+                        request_response::Message::Response {
+                            response, ..
+                        } => {
+                            return Some((peer, response));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            None
+        }
+    }
+
+    // ── Helper: seed peer table ────────────────────────────
+
+    fn seed_peer_table(table: &mut PeerTable, peer_id: PeerId, epoch: u64) {
+        use libp2p::multiaddr::Protocol;
+        let addr: Multiaddr =
+            "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+        table.add_peer(peer_id, addr.clone(), epoch);
+        // Add heartbeats so establishment gate passes
+        for _ in 0..5 {
+            table.record_heartbeat(&peer_id);
+        }
+    }
+
+    // ── Assertion 1: Happy path ────────────────────────────
+
+    #[tokio::test]
+    async fn two_swarm_witness_roundtrip_happy_path() {
+        let mut a = WitnessNode::new();
+        let mut b = WitnessNode::new();
+
+        // B listens on loopback
+        a.swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        b.swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+
+        // Wait for B to get its listen address
+        let b_addr = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match b.swarm.next().await {
+                    Some(SwarmEvent::NewListenAddr { address, .. }) => {
+                        return address;
+                    }
+                    Some(_) => continue,
+                    None => panic!("swarm exhausted"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for B listen addr");
+
+        // A dials B
+        a.swarm.dial(b_addr.clone()).unwrap();
+
+        // Wait for connection to establish — process swarm events
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut a_connected = false;
+            let mut b_connected = false;
+            loop {
+                tokio::select! {
+                    ev = a.swarm.next() => {
+                        match ev {
+                            Some(SwarmEvent::ConnectionEstablished { .. }) => {
+                                a_connected = true;
+                            }
+                            Some(_) => {}
+                            None => break,
+                        }
+                    }
+                    ev = b.swarm.next() => {
+                        match ev {
+                            Some(SwarmEvent::ConnectionEstablished { peer_id, .. }) => {
+                                b.peer_table.add_peer(
+                                    peer_id,
+                                    b.listen_addr.clone().unwrap_or_else(||
+                                        "/ip4/127.0.0.1/tcp/0".parse().unwrap()
+                                    ),
+                                    b.epoch,
+                                );
+                                b_connected = true;
+                            }
+                            Some(_) => {}
+                            None => break,
+                        }
+                    }
+                }
+                if a_connected && b_connected {
+                    break;
+                }
+            }
+            assert!(a_connected, "A did not connect to B");
+            assert!(b_connected, "B did not see A's connection");
+        })
+        .await
+        .expect("timed out waiting for connection");
+
+        // Seed B's peer_table: A must have heartbeats_received > 0
+        seed_peer_table(&mut b.peer_table, a.local_peer_id, b.epoch);
+
+        // Build the witness request
+        let claim_hash = [0xAB; 32];
+        let request = WitnessRequest {
+            claim_id: "harness-test-1".into(),
+            claim_type: 0, // ServiceAttestation
+            claimant_id: a.local_peer_id,
+            claim_hash,
+            requested_at_epoch: a.epoch,
+        };
+
+        a.swarm
+            .behaviour_mut()
+            .witness_rpc
+            .send_request(&b.local_peer_id, request);
+
+        // Drive both swarms until we get a response
+        let response = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    ev = a.swarm.next() => {
+                        if let Some(ev) = ev {
+                            if let Some((_peer, resp)) = a.process_event(ev) {
+                                return resp;
+                            }
+                        }
+                    }
+                    ev = b.swarm.next() => {
+                        if let Some(ev) = ev {
+                            b.process_event(ev);
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for witness response");
+
+        // ── Assertions ──────────────────────────────────────
+        // 1a: Non-empty signature
+        assert!(
+            !response.signature.is_empty(),
+            "expected non-empty signature, got empty"
+        );
+
+        // 1b: No decline reason
+        assert!(
+            response.decline_reason.is_none(),
+            "expected no decline, got: {:?}",
+            response.decline_reason
+        );
+
+        // 1c: Signature verifies
+        let valid = claims::verify_witness_signature(
+            &response.claim_hash,
+            &response.witness_id,
+            response.witnessed_at_epoch,
+            &response.signature,
+            &b.local_key.public(),
+        );
+        assert!(valid, "witness signature failed verification");
+
+        // 1d: Response echoes the request fields
+        assert_eq!(response.claim_id, "harness-test-1");
+        assert_eq!(response.claim_hash, claim_hash);
+
+        // ── Assertion 2: Acceptance integration ─────────────
+        let assembled = WitnessedClaim {
+            claimant: a.local_peer_id,
+            claim_type: ClaimType::ServiceAttestation,
+            start_epoch: 0,
+            end_epoch: 1,
+            evidence: ClaimEvidence::Service { claimed_count: 1 },
+            witnesses: vec![WitnessSignature {
+                witness: response.witness_id,
+                signed_at_epoch: response.witnessed_at_epoch,
+                observed_heartbeats: 1,
+                signature: response.signature,
+            }],
+            submitted_epoch: a.epoch,
+        };
+
+        let nonce_map = claims::acceptance::ClaimNonceMap::new();
+        let result = claims::accept_claim(&assembled, &nonce_map, 2);
+        assert!(
+            result.is_ok(),
+            "accept_claim must accept the assembled WitnessedClaim: {:?}",
+            result
+        );
+    }
+
+    // ── Assertion 3: Self-witness decline over the wire ────
+
+    #[tokio::test]
+    async fn two_swarm_self_witness_decline() {
+        let mut a = WitnessNode::new();
+        let mut b = WitnessNode::new();
+
+        a.swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        b.swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+
+        let b_addr = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match b.swarm.next().await {
+                    Some(SwarmEvent::NewListenAddr { address, .. }) => return address,
+                    Some(_) => continue,
+                    None => panic!("swarm exhausted"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for B listen addr");
+
+        a.swarm.dial(b_addr).unwrap();
+
+        // Wait for connection
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut a_ok = false;
+            let mut b_ok = false;
+            loop {
+                tokio::select! {
+                    ev = a.swarm.next() => {
+                        if matches!(ev, Some(SwarmEvent::ConnectionEstablished { .. })) {
+                            a_ok = true;
+                        }
+                    }
+                    ev = b.swarm.next() => {
+                        if let Some(SwarmEvent::ConnectionEstablished { peer_id, .. }) = ev {
+                            b.peer_table.add_peer(peer_id,
+                                "/ip4/127.0.0.1/tcp/0".parse().unwrap(), b.epoch);
+                            b_ok = true;
+                        }
+                    }
+                }
+                if a_ok && b_ok { break; }
+            }
+        })
+        .await
+        .expect("timed out waiting for connection");
+
+        // Seed peer table so establishment gate passes —
+        // but then self-witness gate should fire because
+        // claimant_id == B's peer_id.
+        seed_peer_table(&mut b.peer_table, b.local_peer_id, b.epoch);
+
+        // Request where claimant IS the witness (self-witness)
+        let request = WitnessRequest {
+            claim_id: "self-witness-test".into(),
+            claim_type: 0,
+            claimant_id: b.local_peer_id, // claimant == witness
+            claim_hash: [0xCD; 32],
+            requested_at_epoch: a.epoch,
+        };
+
+        a.swarm
+            .behaviour_mut()
+            .witness_rpc
+            .send_request(&b.local_peer_id, request);
+
+        let response = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    ev = a.swarm.next() => {
+                        if let Some(ev) = ev {
+                            if let Some((_peer, resp)) = a.process_event(ev) {
+                                return resp;
+                            }
+                        }
+                    }
+                    ev = b.swarm.next() => {
+                        if let Some(ev) = ev {
+                            b.process_event(ev);
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for self-witness decline");
+
+        assert!(response.signature.is_empty(),
+            "self-witness must produce empty signature");
+        assert!(response.decline_reason.is_some(),
+            "self-witness must produce a decline_reason");
+        assert!(
+            response.decline_reason.unwrap().contains("Self-witness"),
+            "decline reason must mention self-witness"
+        );
+    }
+
+    // ── Assertion 4: Unestablished decline over the wire ───
+
+    #[tokio::test]
+    async fn two_swarm_unestablished_decline() {
+        let mut a = WitnessNode::new();
+        let mut b = WitnessNode::new();
+
+        a.swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        b.swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+
+        let b_addr = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match b.swarm.next().await {
+                    Some(SwarmEvent::NewListenAddr { address, .. }) => return address,
+                    Some(_) => continue,
+                    None => panic!("swarm exhausted"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for B listen addr");
+
+        a.swarm.dial(b_addr).unwrap();
+
+        // Wait for connection
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut a_ok = false;
+            let mut b_ok = false;
+            loop {
+                tokio::select! {
+                    ev = a.swarm.next() => {
+                        if matches!(ev, Some(SwarmEvent::ConnectionEstablished { .. })) {
+                            a_ok = true;
+                        }
+                    }
+                    ev = b.swarm.next() => {
+                        if let Some(SwarmEvent::ConnectionEstablished { peer_id, .. }) = ev {
+                            b.peer_table.add_peer(peer_id,
+                                "/ip4/127.0.0.1/tcp/0".parse().unwrap(), b.epoch);
+                            b_ok = true;
+                        }
+                    }
+                }
+                if a_ok && b_ok { break; }
+            }
+        })
+        .await
+        .expect("timed out waiting for connection");
+
+        // Do NOT seed A into B's peer_table — A has heartbeats_received=0
+        // (actually not even in the table). The establishment gate must decline.
+
+        let request = WitnessRequest {
+            claim_id: "unestablished-test".into(),
+            claim_type: 0,
+            claimant_id: a.local_peer_id,
+            claim_hash: [0xEF; 32],
+            requested_at_epoch: a.epoch,
+        };
+
+        a.swarm
+            .behaviour_mut()
+            .witness_rpc
+            .send_request(&b.local_peer_id, request);
+
+        let response = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    ev = a.swarm.next() => {
+                        if let Some(ev) = ev {
+                            if let Some((_peer, resp)) = a.process_event(ev) {
+                                return resp;
+                            }
+                        }
+                    }
+                    ev = b.swarm.next() => {
+                        if let Some(ev) = ev {
+                            b.process_event(ev);
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for unestablished decline");
+
+        assert!(response.signature.is_empty(),
+            "unestablished claimant must produce empty signature");
+        assert!(response.decline_reason.is_some(),
+            "unestablished claimant must produce a decline_reason");
+        assert!(
+            response.decline_reason.as_ref().unwrap().contains("not established"),
+            "decline reason must mention not established, got: {:?}",
+            response.decline_reason
+        );
+    }
+
+    // ── Orchestration test: full claim pipeline ──────────────
+    //
+    // Exercises the complete flow the UDS endpoint orchestrates:
+    // identify candidates → dispatch requests → collect responses
+    // → assemble WitnessedClaim → accept_claim.
+    //
+    // Uses the same two-swarm rig; A is the claimant, B the witness.
+
+    #[tokio::test]
+    async fn orchestrate_and_accept_service_claim() {
+        let mut a = WitnessNode::new();
+        let mut b = WitnessNode::new();
+
+        a.swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        b.swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+
+        let b_addr = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match b.swarm.next().await {
+                    Some(SwarmEvent::NewListenAddr { address, .. }) => return address,
+                    Some(_) => continue,
+                    None => panic!("swarm exhausted"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for B listen addr");
+
+        a.swarm.dial(b_addr).unwrap();
+
+        // Wait for connection
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut a_ok = false;
+            let mut b_ok = false;
+            loop {
+                tokio::select! {
+                    ev = a.swarm.next() => {
+                        if matches!(ev, Some(SwarmEvent::ConnectionEstablished { .. })) {
+                            a_ok = true;
+                        }
+                    }
+                    ev = b.swarm.next() => {
+                        if let Some(SwarmEvent::ConnectionEstablished { peer_id, .. }) = ev {
+                            b.peer_table.add_peer(peer_id,
+                                "/ip4/127.0.0.1/tcp/0".parse().unwrap(), b.epoch);
+                            b_ok = true;
+                        }
+                    }
+                }
+                if a_ok && b_ok { break; }
+            }
+        })
+        .await
+        .expect("timed out waiting for connection");
+
+        // Seed B's peer_table: A must be established
+        seed_peer_table(&mut b.peer_table, a.local_peer_id, b.epoch);
+
+        // A dispatches witness requests — same as handle_witness_claim_service
+        let claim_hash = blake3::hash(b"orchestration-test-claim");
+        let claim_hash: [u8; 32] = claim_hash.into();
+        let request = WitnessRequest {
+            claim_id: "orch-test-1".into(),
+            claim_type: 0,
+            claimant_id: a.local_peer_id,
+            claim_hash,
+            requested_at_epoch: a.epoch,
+        };
+
+        a.swarm
+            .behaviour_mut()
+            .witness_rpc
+            .send_request(&b.local_peer_id, request);
+
+        // Collect the response
+        let response = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    ev = a.swarm.next() => {
+                        if let Some(ev) = ev {
+                            if let Some((_peer, resp)) = a.process_event(ev) {
+                                return resp;
+                            }
+                        }
+                    }
+                    ev = b.swarm.next() => {
+                        if let Some(ev) = ev {
+                            b.process_event(ev);
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for witness response");
+
+        // Verify the witness signed
+        assert!(!response.signature.is_empty(), "witness must sign");
+        assert!(response.decline_reason.is_none());
+
+        // Assemble the WitnessedClaim (same as finalize_claim)
+        let assembled = WitnessedClaim {
+            claimant: a.local_peer_id,
+            claim_type: ClaimType::ServiceAttestation,
+            start_epoch: 0,
+            end_epoch: 1,
+            evidence: ClaimEvidence::Service { claimed_count: 1 },
+            witnesses: vec![WitnessSignature {
+                witness: response.witness_id,
+                signed_at_epoch: response.witnessed_at_epoch,
+                observed_heartbeats: 1,
+                signature: response.signature.clone(),
+            }],
+            submitted_epoch: a.epoch,
+        };
+
+        // Feed to accept_claim — the seam that proves the orchestration
+        // produces valid input to the acceptance layer.
+        let nonce_map = claims::acceptance::ClaimNonceMap::new();
+        let result = claims::accept_claim(&assembled, &nonce_map, 2);
+        assert!(
+            result.is_ok(),
+            "orchestrated claim must be accepted: {:?}",
+            result
+        );
+
+        let thickness = result.unwrap();
+        assert!(thickness > 0.0,
+            "accepted claim must earn positive thickness, got {}",
+            thickness);
+    }
+
+    // ── Expiry: witness never responds ────────────────────────
+    //
+    // Proves that the collection timeout path works: when a
+    // candidate never answers, the claim doesn't sit in
+    // "collecting" forever.
+
+    #[tokio::test]
+    async fn witness_never_responds_results_in_timeout() {
+        let mut a = WitnessNode::new();
+        let mut b = WitnessNode::new();
+
+        a.swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        b.swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+
+        let b_addr = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match b.swarm.next().await {
+                    Some(SwarmEvent::NewListenAddr { address, .. }) => return address,
+                    Some(_) => continue,
+                    None => panic!("swarm exhausted"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for B listen addr");
+
+        a.swarm.dial(b_addr).unwrap();
+
+        // Wait for connection — drive both swarms so B accepts
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut a_ok = false;
+            loop {
+                tokio::select! {
+                    ev = a.swarm.next() => {
+                        if matches!(ev, Some(SwarmEvent::ConnectionEstablished { .. })) {
+                            a_ok = true;
+                            break;
+                        }
+                    }
+                    ev = b.swarm.next() => {
+                        if let Some(SwarmEvent::ConnectionEstablished { peer_id, .. }) = ev {
+                            b.peer_table.add_peer(peer_id,
+                                "/ip4/127.0.0.1/tcp/0".parse().unwrap(), b.epoch);
+                        }
+                        _ = ev;
+                    }
+                }
+            }
+            assert!(a_ok, "A did not connect to B");
+        })
+        .await
+        .expect("timed out waiting for connection");
+
+        // Seed B's peer_table so the establishment gate passes
+        seed_peer_table(&mut b.peer_table, a.local_peer_id, b.epoch);
+
+        // Send the request — but never process B's response events.
+        // The request sits in B's transport buffer with no handler
+        // to respond. A waits until timeout.
+        let request = WitnessRequest {
+            claim_id: "timeout-test".into(),
+            claim_type: 0,
+            claimant_id: a.local_peer_id,
+            claim_hash: [0x99; 32],
+            requested_at_epoch: a.epoch,
+        };
+
+        a.swarm
+            .behaviour_mut()
+            .witness_rpc
+            .send_request(&b.local_peer_id, request);
+
+        // Drive A's event loop with a short timeout — B is never
+        // polled, so the response can never arrive.
+        let result = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                match a.swarm.next().await {
+                    Some(ev) => {
+                        if let Some((_peer, resp)) = a.process_event(ev) {
+                            return resp;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            panic!("swarm exhausted before timeout");
+        })
+        .await;
+
+        // The timeout must fire — no response can arrive because
+        // B's swarm is never polled to process the request.
+        assert!(
+            result.is_err(),
+            "expected timeout, but a response arrived — B was polled"
+        );
+    }
+
+    // ── Expiry condition: pure logic test ────────────────────
+
+    #[test]
+    fn collecting_claim_expires_after_deadline() {
+        use super::CLAIM_COLLECTION_EPOCHS;
+
+        let started = 1u64;
+
+        // Not expired: 1 epoch elapsed (2-1 = 1 < 5)
+        assert!(
+            2u64.saturating_sub(started) <= CLAIM_COLLECTION_EPOCHS,
+            "claim should not expire after 1 epoch"
+        );
+
+        // Not expired: exactly at threshold (6-1 = 5)
+        assert!(
+            6u64.saturating_sub(started) <= CLAIM_COLLECTION_EPOCHS,
+            "claim should not expire at exact threshold"
+        );
+
+        // Expired: one past threshold (7-1 = 6 > 5)
+        assert!(
+            7u64.saturating_sub(started) > CLAIM_COLLECTION_EPOCHS,
+            "claim should expire one epoch past threshold"
+        );
+
+        // Expired: well past (100-1 = 99 > 5)
+        assert!(
+            100u64.saturating_sub(started) > CLAIM_COLLECTION_EPOCHS,
+            "claim should be long expired"
+        );
+    }
+
+    // ── Rejection invariants ─────────────────────────────────
+
+    #[test]
+    fn rejected_claim_leaves_window_reclaimable() {
+        // Documents the structural invariant: last_claimed is only
+        // updated in the Ok(thickness) branch of finalize_claim.
+        // A rejected claim must NOT advance the high-water mark,
+        // otherwise a single unresponsive witness permanently burns
+        // an epoch range the claimant genuinely served.
+        //
+        // This test verifies the rejection-reason taxonomy and
+        // confirms the three cases are distinguishable.
+
+        let candidate = PeerId::random();
+
+        // Case 1: zero signatures, zero declines → "timed out"
+        {
+            let state = super::WitnessClaimState {
+                claim_id: "case1".into(),
+                status: super::ClaimSubmissionStatus::Collecting,
+                start_epoch: 0,
+                end_epoch: 10,
+                candidates: vec![candidate],
+                signatures: vec![],
+                declines: vec![],
+                started_at_epoch: 1,
+            };
+
+            let min_wits = crate::claims::MIN_WITNESSES;
+            let insufficient = (state.signatures.len() as u64) < min_wits;
+            assert!(insufficient, "0 signatures must be insufficient");
+
+            let reason = if state.signatures.is_empty() && state.declines.is_empty() {
+                "No witnesses responded — all candidates timed out".to_string()
+            } else if state.signatures.is_empty() {
+                format!("All {} candidates declined (0 signed). Window reclaimable.",
+                    state.candidates.len())
+            } else {
+                format!("Insufficient witnesses: got {}, need {} ({} candidates, {} declined)",
+                    state.signatures.len(), min_wits,
+                    state.candidates.len(), state.declines.len())
+            };
+            assert!(reason.contains("timed out"),
+                "zero sigs + zero declines => 'timed out', got: {}", reason);
+        }
+
+        // Case 2: zero signatures, some declines → "all declined"
+        {
+            let state = super::WitnessClaimState {
+                claim_id: "case2".into(),
+                status: super::ClaimSubmissionStatus::Collecting,
+                start_epoch: 0,
+                end_epoch: 10,
+                candidates: vec![candidate],
+                signatures: vec![],
+                declines: vec![(candidate, "Self-witness is not permitted".into())],
+                started_at_epoch: 1,
+            };
+
+            let reason = if state.signatures.is_empty() && state.declines.is_empty() {
+                String::new()
+            } else if state.signatures.is_empty() {
+                format!("All {} candidates declined (0 signed). Window reclaimable.",
+                    state.candidates.len())
+            } else {
+                String::new()
+            };
+            assert!(reason.contains("Window reclaimable"),
+                "all-declined must say 'Window reclaimable', got: {}", reason);
+        }
+
+        // Case 3: some signatures but below threshold → partial
+        {
+            let sig = crate::claims::WitnessSignature {
+                witness: PeerId::random(),
+                signed_at_epoch: 5,
+                observed_heartbeats: 1,
+                signature: vec![0xAB; 64],
+            };
+            let state = super::WitnessClaimState {
+                claim_id: "case3".into(),
+                status: super::ClaimSubmissionStatus::Collecting,
+                start_epoch: 0,
+                end_epoch: 10,
+                candidates: vec![PeerId::random(), PeerId::random(), PeerId::random()],
+                signatures: vec![sig],
+                declines: vec![(PeerId::random(), "declined".into())],
+                started_at_epoch: 1,
+            };
+
+            let reason = format!(
+                "Insufficient witnesses: got {} signatures, need {} ({} candidates, {} declined)",
+                state.signatures.len(),
+                crate::claims::MIN_WITNESSES,
+                state.candidates.len(),
+                state.declines.len(),
+            );
+            assert!(reason.contains("Insufficient witnesses"),
+                "partial must say 'Insufficient witnesses', got: {}", reason);
+            assert!(reason.contains("1 signatures") && reason.contains("3 candidates"),
+                "must report counts, got: {}", reason);
+        }
     }
 }

@@ -7,7 +7,7 @@ use libp2p::PeerId;
 use super::{
     ClaimEvidence, ClaimType, WitnessSignature, WitnessedClaim,
     ATTESTATION_SILENCE_EPOCHS, DECAY_PER_EPOCH, MAX_CLAIM_WINDOW,
-    MIN_THICKNESS, MIN_WITNESSES,
+    MIN_WITNESSES,
 };
 
 // ── Transient state: last claimed epoch per (claimant, type) ──

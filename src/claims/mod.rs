@@ -112,12 +112,17 @@ pub const MAX_CLAIM_WINDOW: u64 = 1000;
 /// governance act, not an auto-scaling parameter.
 pub const MIN_WITNESSES: u64 = 1;
 
-/// Per-epoch decay factor for a 30-day half-life at 64s/epoch.
-/// 30 days ≈ 40,500 epochs. Factor = 2^(-1/40,500) ≈ 0.999983.
-pub const DECAY_PER_EPOCH: f64 = 0.999_982_885_4;
+/// Per-epoch decay factor targeting a 30-day half-life at 30 s/epoch.
+/// Derived: factor = 0.5^(epoch_duration / half_life)
+///   = 0.5^(30 / 2,592,000) = 0.999_991_977_5
+///
+/// If the epoch duration changes, this factor must be recomputed:
+///   factor = 0.5^(new_epoch_s / 2_592_000)
+pub const DECAY_PER_EPOCH: f64 = 0.999_991_977_5;
 
-/// Edges below this thickness are pruned during decay.
-pub const MIN_THICKNESS: f64 = 0.001;
+/// Prune edge decay floor is defined in thickness.rs (1e-6).
+/// The value here was 0.001 — previously duplicated, now removed
+/// to prevent a silent regression if accidentally imported again.
 
 /// Domain separation prefix for witness signing.
 /// Both signer and verifier must use the same constant to reconstruct

@@ -2665,7 +2665,13 @@ impl LatticeNode {
                 );
                 self.last_claimed.insert(key, state.end_epoch);
 
-                // Queue for economic engine
+                // Queue for economic engine — persist to claims WAL first
+                // so the claim survives a crash before the next snapshot.
+                if let Some(ref mut store) = self.state_store {
+                    if let Err(e) = store.persist_claim(&assembled) {
+                        warn!(error = %e, "Failed to persist claim to WAL");
+                    }
+                }
                 self.economic_engine.queue_claim(assembled);
 
                 if let Some(s) = self.witness_claims.get_mut(claim_id) {

@@ -118,6 +118,9 @@ impl PersistentEconomicState {
 
 pub trait StateStore: Send {
     fn persist(&mut self, tx: &SignedTransaction) -> Result<()>;
+    fn persist_claim(&mut self, _claim: &crate::claims::WitnessedClaim) -> Result<()> {
+        Ok(()) // default: no-op for state stores that don't support claims
+    }
     fn recover(&mut self) -> Result<PersistentEconomicState>;
     fn take_snapshot(&mut self, epoch: u64, state: &PersistentEconomicState) -> Result<()>;
     /// Returns (last_snapshot_epoch, wal_bytes, wal_entry_count).
@@ -140,6 +143,7 @@ pub struct WalStateStoreConfig {
 pub struct WalStateStore {
     config: WalStateStoreConfig,
     wal_path: PathBuf,
+    claim_wal_path: PathBuf,
     snapshot_path: PathBuf,
     wal_buffer: Vec<u8>,
     wal_file: Option<std::fs::File>,
@@ -153,6 +157,7 @@ impl WalStateStore {
         fs::create_dir_all(&config.data_dir)
             .with_context(|| format!("creating data dir {:?}", config.data_dir))?;
         let wal_path = config.data_dir.join("transactions.wal");
+        let claim_wal_path = config.data_dir.join("claims.wal");
         let snapshot_path = config.data_dir.join("state.snapshot");
         // Open the WAL file once at startup and hold the handle open.
         // Reopening on every flush creates a window where the directory entry
@@ -179,6 +184,7 @@ impl WalStateStore {
         Ok(Self {
             config,
             wal_path,
+            claim_wal_path,
             snapshot_path,
             wal_buffer: Vec::new(),
             wal_file,
@@ -338,6 +344,21 @@ impl StateStore for WalStateStore {
         Ok(())
     }
 
+    fn persist_claim(&mut self, claim: &crate::claims::WitnessedClaim) -> Result<()> {
+        let claim_bytes = serde_cbor::to_vec(claim)?;
+        let len = claim_bytes.len() as u32;
+        // Simple append to claims.wal — same format as transactions.wal
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.claim_wal_path)
+            .with_context(|| format!("opening claims WAL at {:?}", self.claim_wal_path))?;
+        file.write_all(&len.to_be_bytes())?;
+        file.write_all(&claim_bytes)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
     fn recover(&mut self) -> Result<PersistentEconomicState> {
         // 1. Load snapshot (nonces only — thickness graph from WAL replay)
         let mut state = match fs::read(&self.snapshot_path) {
@@ -388,6 +409,76 @@ impl StateStore for WalStateStore {
             offset += len;
         }
         info!(replayed, "Replayed transactions from WAL");
+
+        // 3. Replay claims WAL — claims written at acceptance time,
+        //    before the snapshot captured them as credited. Build a
+        //    dedup set from the snapshot so we skip claims already there.
+        //    Keys are (claimant_base58, claim_type, end_epoch) — unique
+        //    given monotonic non-overlapping claim windows.
+        use std::collections::HashSet;
+        let snapshot_keys: HashSet<(String, u8, u64)> = state
+            .accepted_claims
+            .iter()
+            .map(|sc| {
+                (
+                    sc.claim.claimant.to_base58(),
+                    sc.claim.claim_type as u8,
+                    sc.claim.end_epoch,
+                )
+            })
+            .collect();
+
+        match std::fs::read(&self.claim_wal_path) {
+            Ok(claim_wal_data) => {
+                let mut claim_offset = 0;
+                let mut claims_replayed = 0u64;
+                let mut claims_skipped = 0u64;
+                while claim_offset + 4 <= claim_wal_data.len() {
+                    let clen = u32::from_be_bytes([
+                        claim_wal_data[claim_offset],
+                        claim_wal_data[claim_offset + 1],
+                        claim_wal_data[claim_offset + 2],
+                        claim_wal_data[claim_offset + 3],
+                    ]) as usize;
+                    claim_offset += 4;
+                    if claim_offset + clen > claim_wal_data.len() {
+                        warn!("Truncated claim WAL entry — stopping replay");
+                        break;
+                    }
+                    if let Ok(claim) = serde_cbor::from_slice::<crate::claims::WitnessedClaim>(
+                        &claim_wal_data[claim_offset..claim_offset + clen],
+                    ) {
+                        let key = (
+                            claim.claimant.to_base58(),
+                            claim.claim_type as u8,
+                            claim.end_epoch,
+                        );
+                        if snapshot_keys.contains(&key) {
+                            claims_skipped += 1;
+                        } else {
+                            state.accepted_claims.push(
+                                crate::ledger::persistence::StoredClaim {
+                                    claim,
+                                    applied_at_epoch: None,
+                                },
+                            );
+                            claims_replayed += 1;
+                        }
+                    }
+                    claim_offset += clen;
+                }
+                info!(
+                    claims_replayed,
+                    claims_skipped,
+                    "Replayed claims from claims WAL"
+                );
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                info!("No claims WAL found, starting from snapshot claims only");
+            }
+            Err(e) => return Err(e.into()),
+        }
+
         Ok(state)
     }
 

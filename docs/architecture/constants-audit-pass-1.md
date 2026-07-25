@@ -289,19 +289,20 @@ capability-negotiation gap (stabilization gate 4), not an arithmetic flaw.
 
 | Result | Count | Rows |
 |--------|-------|------|
-| PASS | 7 | decay factor (math), MIN_THICKNESS (prune), credit multiplier, tax rate, mint rate, wall-clock silence, cold-start grace, claim window, MIN_WITNESSES |
-| FAIL | 1 | CLAIM_RETENTION_EPOCHS vs edge lifetime |
-| NEEDS REVIEW | 3 | decay half-life vs stated 30-day (epoch interval mismatch), dead MIN_THICKNESS import (claims/mod.rs), eviction layer gap |
+| PASS | 9 | decay factor (post-fix), MIN_THICKNESS (post-fix, single definition), credit multiplier, tax rate, mint rate, wall-clock silence, cold-start grace, claim window, MIN_WITNESSES |
+| FAIL | 1 | CLAIM_RETENTION_EPOCHS vs edge lifetime (C1a confirmed) |
+| NEEDS REVIEW | 1 | eviction layer gap (epoch calibrated, but ratio unstated) |
 
 ---
 
 ## Open Arithmetic Questions
 
-1. **What epoch duration was the decay factor calibrated against?** 0.9999828854 produces half-life at 40,500 epochs. At current 30 s epochs that's ~14 days. At the older 64 s epochs that's ~30 days. Determine the design baseline and either adjust the constant or document the effective half-life.
-
-2. **Is the global `contribution_count()` for genesis amortization deliberate?** The counter is network-wide, not per-peer. Confirm against design intent.
-
-3. **Why two eviction layers 10× apart?** Layer 1 (90 s wall-clock) and Layer 2a (30 epochs = 900 s) differ by an order of magnitude. If the intent was "roughly comparable tolerance for two signal types," the constants disagree.
+1. ~~**What epoch duration was the decay factor calibrated against?**~~ **RESOLVED (f0dae2d).** Factor was calibrated for 64 s epoch; CLI default has always been 30 s. Corrected to 0.9999919775.
+2. ~~**Duplicate MIN_THICKNESS definitions**~~ **RESOLVED (f0dae2d).** Dead 0.001 import removed; single definition at thickness.rs (1e-6). No third definition found.
+3. **Is the global `contribution_count()` for genesis amortization deliberate?** Counter is network-wide, not per-peer. Confirm against design intent.
+4. **Why two eviction layers 10× apart?** Layer 1 (90 s) vs Layer 2a (900 s). Arithmetic is now epoch-calibrated; the ratio remains unstated intent.
+5. **Does `sweep_claims` destroy persisted evidence or an in-memory index?** Determines C1b severity.
+6. **Where did the 2-unit tax remainder go?** 209 owed, 207 collected — confirm remainder handling.
 
 ---
 

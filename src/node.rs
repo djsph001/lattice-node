@@ -2900,9 +2900,27 @@ impl LatticeNode {
         // Hydrate accepted claims from snapshot — evidence must survive restart
         if !state.accepted_claims.is_empty() {
             let count = state.accepted_claims.len();
+            // Rebuild the claim-window high-water mark from recovered claims
+            // so that post-restart windows do not overlap previously accepted history.
+            // last_claimed is in-memory only and would otherwise reset to empty,
+            // silently allowing overlapping claim windows after every restart.
+            for sc in &state.accepted_claims {
+                // ClaimNonceMap uses (String, u8) — base58 PeerId and type discriminant.
+                let key = (sc.claim.claimant.to_base58(), sc.claim.claim_type as u8);
+                let end = sc.claim.end_epoch;
+                self.last_claimed
+                    .entry(key)
+                    .and_modify(|prev| {
+                        if end > *prev {
+                            *prev = end;
+                        }
+                    })
+                    .or_insert(end);
+            }
             self.economic_engine.import_accepted_claims(state.accepted_claims);
             info!(
                 count,
+                last_claimed_restored = self.last_claimed.len(),
                 "Recovered accepted claims from economic snapshot"
             );
         }

@@ -2897,6 +2897,16 @@ impl LatticeNode {
             }
         }
 
+        // Hydrate accepted claims from snapshot — evidence must survive restart
+        if !state.accepted_claims.is_empty() {
+            let count = state.accepted_claims.len();
+            self.economic_engine.import_accepted_claims(state.accepted_claims);
+            info!(
+                count,
+                "Recovered accepted claims from economic snapshot"
+            );
+        }
+
         // Recover tx_nonce from self_tx_nonce field (persisted directly
         // in the snapshot, not derived from seen_nonces[self]).
         // Using seen_nonces[self] was fragile: the identity may have been

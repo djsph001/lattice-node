@@ -27,7 +27,9 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 /// Minimum thickness threshold — edges below this are pruned during decay.
-const MIN_THICKNESS: f64 = 0.001;
+/// Must be well below the smallest meaningful credit (0.001 per heartbeat)
+/// to avoid pruning real contributions as numerical dust.
+const MIN_THICKNESS: f64 = 1e-6;
 
 /// Identifies a specific verified receipt (the Blake3 message_hash).
 pub type ReceiptId = [u8; 32];
@@ -1447,5 +1449,38 @@ mod tests {
             "earned must be independent of genesis decay: expected 3.0, got {}", earned_after);
         assert!(total_after < total_before,
             "total must have decreased (genesis amortized from {} to {})", total_before, total_after);
+    }
+
+    #[test]
+    fn single_heartbeat_credit_survives_decay() {
+        use crate::claims::DECAY_PER_EPOCH;
+        let mut graph = ThicknessGraph::new();
+        let peer = PeerId::random();
+        graph.add_verified_contribution(&peer, [0x01; 32], 0.001);
+        assert!((graph.earned_thickness(&peer) - 0.001).abs() < 1e-9);
+        graph.apply_edge_decay(DECAY_PER_EPOCH);
+        let after = graph.earned_thickness(&peer);
+        assert!(after > 0.0,
+            "single-heartbeat credit must survive one decay pass, got {}", after);
+    }
+
+    #[test]
+    fn decay_factor_produces_stated_half_life() {
+        // Property test: applying the decay factor for HALF_LIFE_SECS
+        // worth of epochs should reduce thickness to ~50%.
+        // This is agnostic to the actual values of epoch duration and
+        // half-life — change either constant and the test stays valid.
+        use crate::claims::{DECAY_PER_EPOCH, DEFAULT_EPOCH_DURATION_SECS, HALF_LIFE_SECS};
+        let epochs_per_half_life = HALF_LIFE_SECS / DEFAULT_EPOCH_DURATION_SECS as u64;
+        let mut remaining = 1.0;
+        for _ in 0..epochs_per_half_life {
+            remaining *= DECAY_PER_EPOCH;
+        }
+        let epsilon = 1e-4; // tolerance for floating-point accumulation
+        assert!((remaining - 0.5).abs() < epsilon,
+            "after {} epochs (one half-life), remaining {} should be ≈0.5; \
+             check DECAY_PER_EPOCH derivation against HALF_LIFE_SECS and \
+             DEFAULT_EPOCH_DURATION_SECS",
+            epochs_per_half_life, remaining);
     }
 }

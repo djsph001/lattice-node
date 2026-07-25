@@ -112,12 +112,22 @@ pub const MAX_CLAIM_WINDOW: u64 = 1000;
 /// governance act, not an auto-scaling parameter.
 pub const MIN_WITNESSES: u64 = 1;
 
-/// Per-epoch decay factor targeting a 30-day half-life at 30 s/epoch.
-/// Derived: factor = 0.5^(epoch_duration / half_life)
-///   = 0.5^(30 / 2,592,000) = 0.999_991_977_5
+/// Default epoch duration in seconds. Must match the CLI default for
+/// `--epoch-interval` in src/main.rs. If that default changes, update
+/// this constant and re-derive DECAY_PER_EPOCH.
+pub const DEFAULT_EPOCH_DURATION_SECS: u64 = 30;
+
+/// Target half-life for thickness decay, in seconds.
+pub const HALF_LIFE_SECS: u64 = 30 * 24 * 60 * 60; // 30 days
+
+/// Per-epoch decay factor derived from HALF_LIFE_SECS and
+/// DEFAULT_EPOCH_DURATION_SECS:
+///   factor = 0.5^(epoch_duration / half_life)
+///         = 0.5^(30 / 2_592_000)
+///         = 0.999_991_977_5
 ///
-/// If the epoch duration changes, this factor must be recomputed:
-///   factor = 0.5^(new_epoch_s / 2_592_000)
+/// If either the epoch duration or target half-life changes,
+/// recompute with: 0.5^(new_epoch_s / new_half_life_s)
 pub const DECAY_PER_EPOCH: f64 = 0.999_991_977_5;
 
 /// Prune edge decay floor is defined in thickness.rs (1e-6).

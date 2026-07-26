@@ -207,3 +207,20 @@ Durable history + recoverable records + deterministic replay + idempotent applic
 
 **This design commit establishes the invariant before any code is written.**
 **The implementation will prove it.**
+
+---
+
+## Known Provisional: WAL Rotation Naming (2026-07-26)
+
+WAL rotation produces `wal.wal.old` instead of `wal.log.old` for the
+unified WAL fallback file.  This is caused by `with_extension("wal.old")`
+in the rotation/recovery code, which replaces the `.log` extension on
+`wal.log` with `.wal.old` rather than appending `.old`.
+
+Recovery reads the same incorrect name via the same `with_extension`
+call, so writer and reader agree — the mesh operates correctly.
+
+An aesthetic fix (appending `.old` rather than replacing the extension)
+is deferred until the unified WAL migration completes across all mesh
+nodes, at which point it becomes a separate protocol migration per
+principle 5 (historical state is part of the protocol).

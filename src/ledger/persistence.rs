@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{PathBuf};
@@ -330,6 +330,57 @@ impl WalStateStore {
     }
 }
 
+impl WalStateStore {
+    fn replay_claims_wal(
+        state: &mut PersistentEconomicState,
+        claim_wal_data: &[u8],
+        snapshot_keys: &HashSet<(String, u8, u64)>,
+    ) {
+        let mut claim_offset = 0;
+        let mut claims_replayed = 0u64;
+        let mut claims_skipped = 0u64;
+        while claim_offset + 4 <= claim_wal_data.len() {
+            let clen = u32::from_be_bytes([
+                claim_wal_data[claim_offset],
+                claim_wal_data[claim_offset + 1],
+                claim_wal_data[claim_offset + 2],
+                claim_wal_data[claim_offset + 3],
+            ]) as usize;
+            claim_offset += 4;
+            if claim_offset + clen > claim_wal_data.len() {
+                warn!("Truncated claim WAL entry — stopping replay");
+                break;
+            }
+            if let Ok(claim) = serde_cbor::from_slice::<crate::claims::WitnessedClaim>(
+                &claim_wal_data[claim_offset..claim_offset + clen],
+            ) {
+                let key = (
+                    claim.claimant.to_base58(),
+                    claim.claim_type as u8,
+                    claim.end_epoch,
+                );
+                if snapshot_keys.contains(&key) {
+                    claims_skipped += 1;
+                } else {
+                    state.accepted_claims.push(
+                        crate::ledger::persistence::StoredClaim {
+                            claim,
+                            applied_at_epoch: None,
+                        },
+                    );
+                    claims_replayed += 1;
+                }
+            }
+            claim_offset += clen;
+        }
+        info!(
+            claims_replayed,
+            claims_skipped,
+            "Replayed claims from claims WAL"
+        );
+    }
+}
+
 impl StateStore for WalStateStore {
     fn persist(&mut self, tx: &SignedTransaction) -> Result<()> {
         let tx_bytes = serde_cbor::to_vec(tx)?;
@@ -347,7 +398,6 @@ impl StateStore for WalStateStore {
     fn persist_claim(&mut self, claim: &crate::claims::WitnessedClaim) -> Result<()> {
         let claim_bytes = serde_cbor::to_vec(claim)?;
         let len = claim_bytes.len() as u32;
-        // Simple append to claims.wal — same format as transactions.wal
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -374,16 +424,29 @@ impl StateStore for WalStateStore {
             Err(e) => return Err(e.into()),
         };
 
-        // 2. Replay WAL — read directly from path, not from the open handle.
-        //    The handle is for append-mode writes; rewind() + read_to_end()
-        //    can produce "Bad file descriptor" on some kernels when the fd
-        //    is in append mode.
+        // 2. Replay WAL — read from current WAL, falling back to .old
+        //    (the previous snapshot rotated it).  The handle is for
+        //    append-mode writes; reading from the fd can produce bad
+        //    results on some kernels, so we read from the path directly.
         let mut wal_data = Vec::new();
         match std::fs::read(&self.wal_path) {
             Ok(bytes) => wal_data = bytes,
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
-                info!("No WAL found, starting from snapshot only");
-                return Ok(state);
+                // Try the rotated .old WAL — it was renamed at the last
+                // snapshot and contains the entries that were current
+                // when that snapshot was taken.
+                let old_path = self.wal_path.with_extension("wal.old");
+                match std::fs::read(&old_path) {
+                    Ok(bytes) => {
+                        info!("Replaying from rotated WAL: {:?}", old_path);
+                        wal_data = bytes;
+                    }
+                    Err(ref e2) if e2.kind() == std::io::ErrorKind::NotFound => {
+                        info!("No WAL found, starting from snapshot only");
+                        return Ok(state);
+                    }
+                    Err(e2) => return Err(e2.into()),
+                }
             }
             Err(e) => return Err(e.into()),
         }
@@ -430,51 +493,21 @@ impl StateStore for WalStateStore {
 
         match std::fs::read(&self.claim_wal_path) {
             Ok(claim_wal_data) => {
-                let mut claim_offset = 0;
-                let mut claims_replayed = 0u64;
-                let mut claims_skipped = 0u64;
-                while claim_offset + 4 <= claim_wal_data.len() {
-                    let clen = u32::from_be_bytes([
-                        claim_wal_data[claim_offset],
-                        claim_wal_data[claim_offset + 1],
-                        claim_wal_data[claim_offset + 2],
-                        claim_wal_data[claim_offset + 3],
-                    ]) as usize;
-                    claim_offset += 4;
-                    if claim_offset + clen > claim_wal_data.len() {
-                        warn!("Truncated claim WAL entry — stopping replay");
-                        break;
-                    }
-                    if let Ok(claim) = serde_cbor::from_slice::<crate::claims::WitnessedClaim>(
-                        &claim_wal_data[claim_offset..claim_offset + clen],
-                    ) {
-                        let key = (
-                            claim.claimant.to_base58(),
-                            claim.claim_type as u8,
-                            claim.end_epoch,
-                        );
-                        if snapshot_keys.contains(&key) {
-                            claims_skipped += 1;
-                        } else {
-                            state.accepted_claims.push(
-                                crate::ledger::persistence::StoredClaim {
-                                    claim,
-                                    applied_at_epoch: None,
-                                },
-                            );
-                            claims_replayed += 1;
-                        }
-                    }
-                    claim_offset += clen;
-                }
-                info!(
-                    claims_replayed,
-                    claims_skipped,
-                    "Replayed claims from claims WAL"
-                );
+                Self::replay_claims_wal(&mut state, &claim_wal_data, &snapshot_keys);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
-                info!("No claims WAL found, starting from snapshot claims only");
+                // Try the rotated .old claims WAL
+                let old_path = self.claim_wal_path.with_extension("wal.old");
+                match std::fs::read(&old_path) {
+                    Ok(claim_wal_data) => {
+                        info!("Replaying claims from rotated WAL: {:?}", old_path);
+                        Self::replay_claims_wal(&mut state, &claim_wal_data, &snapshot_keys);
+                    }
+                    Err(ref e2) if e2.kind() == std::io::ErrorKind::NotFound => {
+                        info!("No claims WAL found, starting from snapshot claims only");
+                    }
+                    Err(e2) => return Err(e2.into()),
+                }
             }
             Err(e) => return Err(e.into()),
         }
@@ -488,8 +521,37 @@ impl StateStore for WalStateStore {
         let tmp = self.snapshot_path.with_extension("tmp");
         fs::write(&tmp, &bytes)?;
         fs::rename(&tmp, &self.snapshot_path)?;
+        // fsync the parent directory so the rename is durable.
+        // Without this, a crash between rename and directory sync
+        // could lose the snapshot — and if we truncated the WAL
+        // against a snapshot that never reached disk, both copies
+        // of the data would be gone.
+        if let Some(parent) = self.snapshot_path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         self.last_snapshot_epoch = epoch;
         info!(epoch, "Snapshot saved");
+
+        // Rotate WALs — the snapshot is now the durable checkpoint,
+        // so all entries before this epoch are redundant.  Rename to
+        // .old as a one-cycle fallback, then remove the previous .old.
+        // If rotation crashes, the snapshot handles recovery;
+        // replaying extra WAL entries is harmless (dedup is idempotent).
+        for wal_path in [&self.wal_path, &self.claim_wal_path] {
+            let old_path = wal_path.with_extension("wal.old");
+            // Remove previous .old — the current snapshot supersedes it.
+            let _ = fs::remove_file(&old_path);
+            // Rotate: rename current WAL → .old, then a fresh WAL
+            // will be created on the next persist call.
+            let _ = fs::rename(wal_path, &old_path);
+        }
+        // Close the open WAL handle — it still points to the now-renamed
+        // .old file.  The next persist will create a fresh WAL at the
+        // original path.
+        self.wal_file = None;
+
         Ok(())
     }
 
@@ -906,6 +968,9 @@ mod tests {
         store.persist(&sign(mint2, &kp)).unwrap();
 
         // ── Phase 4: recover (simulate kill-9 restart) ─────
+        // Flush WAL buffer so post-snapshot entries are on disk
+        // before the next store opens the same path.
+        store.flush_wal().unwrap();
         let cfg2 = WalStateStoreConfig {
             data_dir: dir.path().to_path_buf(),
             fsync_batch_size: 100,

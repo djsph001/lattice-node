@@ -410,6 +410,10 @@ pub struct LatticeNode {
     /// Expected root PeerId for genesis validation (out-of-band trust anchor).
     /// If None, the node may self-author genesis using its own identity.
     genesis_root: Option<PeerId>,
+    /// The genesis this node has accepted (from gossip or self-authored).
+    /// None until the network origin is established.  Doubles as the
+    /// `genesis_established` flag for recovery ordering.
+    genesis: Option<crate::ledger::types::SignedGenesis>,
     /// Self-liquidation period for genesis thickness. None = permanent.
     genesis_amortize_over: Option<u64>,
     /// Automatically submit genesis on startup if the chain is empty.
@@ -742,6 +746,7 @@ impl LatticeNode {
                 }
                 parsed
             },
+            genesis: None,  // populated during recovery or on first genesis accept
             genesis_amortize_over,
             auto_genesis,
             genesis_thickness,
@@ -6164,6 +6169,23 @@ fn resolve_identity_path(identity_dir: Option<PathBuf>) -> Result<PathBuf> {
         }
     };
     Ok(dir.join("identity.key"))
+}
+
+/// Read a `genesis-root` config file from the identity directory if present.
+/// Returns the base58 PeerId string inside, or None if the file doesn't exist.
+fn read_genesis_root_from_config(identity_dir: Option<&PathBuf>) -> Option<String> {
+    let dir = identity_dir.cloned().or_else(|| {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        home.map(|h| h.join(".lattice"))
+    })?;
+    let path = dir.join("genesis-root");
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => {
+            let trimmed = contents.trim();
+            if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+        }
+        Err(_) => None,
+    }
 }
 
 fn load_or_generate_identity(path: &Path, fresh: bool) -> Result<identity::Keypair> {

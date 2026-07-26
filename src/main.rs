@@ -402,6 +402,8 @@ async fn main() -> Result<()> {
         cli.density_margin,
         cli.thickness_gauge,
         cli.genesis_root,
+        // Resolve genesis_root: CLI flag → config file → observer mode
+        // (config file is <identity-dir>/genesis-root, adjacent to identity.key)
         cli.genesis_amortize_over,
         cli.auto_genesis,
         cli.genesis_thickness,

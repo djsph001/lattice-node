@@ -141,6 +141,16 @@ genesis a node accepts is canonical. There is no replacement, no
 fork-choice rule, no "better genesis" concept. One genesis per network
 per node.
 
+Rejection distinguishes three cases in logging:
+- **Different signer** — benign (INFO). Another network's genesis arrived.
+  Normal under observer mode or multi-network meshes.
+- **Same signer, same content** — expected (TRACE). Duplicate delivery
+  via gossip. Silent drop, no action.
+- **Same signer, different content** — anomalous (WARN). Either the
+  signer's key was compromised or the signer created two different
+  genesis messages. Enforcement action is rejection in all three cases;
+  the log level distinguishes their diagnostic significance.
+
 ### Check 3: Structural validity
 
 ```
@@ -190,6 +200,14 @@ If recovery finds NO genesis in the WAL and no genesis in recovered
 state, the node starts in pre-genesis mode: it can gossip but cannot
 process transactions until a genesis is received or generated.
 
+**Recovery ordering invariant:** The replayer maintains a
+`genesis_established` flag, initialized false. On encountering a Genesis
+record, the flag is set. On encountering any Transaction or Claim record
+while the flag is false, recovery fails with an explicit
+`NoGenesisEstablished` error. This makes the "genesis before dependent
+state" invariant a checked property of recovery rather than an implicit
+consequence of append ordering.
+
 ---
 
 ## 7. Gossip Integration
@@ -223,6 +241,8 @@ transactions are meaningful.
 - Crash after genesis persist, before apply → replay recovers genesis
 - Crash after genesis apply → replay is idempotent
 - Restart without genesis in WAL → node enters pre-genesis mode
+- Transaction before Genesis in WAL (out of order) → recovery fails with
+  `NoGenesisEstablished` error
 
 ---
 

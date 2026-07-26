@@ -722,7 +722,9 @@ mod tests {
             timestamp: Utc::now(),
         };
         let signed_mint = sign(mint, &kp);
-        store.persist(&signed_mint).unwrap();
+        store.persist_record(
+            &crate::ledger::wal_record::WalRecord::Transaction(signed_mint),
+        ).unwrap();
 
         let transfer = Transaction::Transfer {
             from: peer.to_string(),
@@ -732,7 +734,9 @@ mod tests {
             timestamp: Utc::now(),
         };
         let signed_transfer = sign(transfer, &kp);
-        store.persist(&signed_transfer).unwrap();
+        store.persist_record(
+            &crate::ledger::wal_record::WalRecord::Transaction(signed_transfer),
+        ).unwrap();
 
         // ── Phase 2: take snapshot ─────────────────────────
         let mut snap = PersistentEconomicState::new();
@@ -800,7 +804,9 @@ mod tests {
             timestamp: Utc::now(),
         };
         let signed_genesis = sign(genesis, &kp);
-        store.persist(&signed_genesis).unwrap();
+        store.persist_record(
+            &crate::ledger::wal_record::WalRecord::Transaction(signed_genesis),
+        ).unwrap();
 
         // Vouch transaction
         let vouch = Transaction::Vouch {
@@ -812,7 +818,9 @@ mod tests {
             timestamp: Utc::now(),
         };
         let signed_vouch = sign(vouch, &kp);
-        store.persist(&signed_vouch).unwrap();
+        store.persist_record(
+            &crate::ledger::wal_record::WalRecord::Transaction(signed_vouch),
+        ).unwrap();
 
         // ── Take snapshot with thickness edges in state ────
         use crate::ledger::thickness::ThicknessEdge;
@@ -961,7 +969,9 @@ mod tests {
             to: alice.to_string(), amount: DigitalUtilityUnit(5000),
             authority: alice.to_string(), nonce: 1, timestamp: Utc::now(),
         };
-        store.persist(&sign(mint1, &kp)).unwrap();
+        store.persist_record(
+            &crate::ledger::wal_record::WalRecord::Transaction(sign(mint1, &kp)),
+        ).unwrap();
 
         // ── Phase 2: snapshot at nonce=1, balance=5000 ─────
         let mut snap = PersistentEconomicState::new();
@@ -974,13 +984,17 @@ mod tests {
             from: alice.to_string(), to: bob.to_string(),
             amount: DigitalUtilityUnit(300), nonce: 2, timestamp: Utc::now(),
         };
-        store.persist(&sign(transfer, &kp)).unwrap();
+        store.persist_record(
+            &crate::ledger::wal_record::WalRecord::Transaction(sign(transfer, &kp)),
+        ).unwrap();
 
         let mint2 = Transaction::Mint {
             to: alice.to_string(), amount: DigitalUtilityUnit(200),
             authority: alice.to_string(), nonce: 3, timestamp: Utc::now(),
         };
-        store.persist(&sign(mint2, &kp)).unwrap();
+        store.persist_record(
+            &crate::ledger::wal_record::WalRecord::Transaction(sign(mint2, &kp)),
+        ).unwrap();
 
         // ── Phase 4: recover (simulate kill-9 restart) ─────
         // Flush WAL buffer so post-snapshot entries are on disk

@@ -3859,16 +3859,23 @@ impl LatticeNode {
             }
 
             // ── Grace window: cold-start protection ──────────────────
-            // Defined once so both eviction layers (Layer 1 wall-clock,
-            // Layer 2a epoch heartbeat) read the same computation.
-            // Twin of the same guard in dead_peer_ids().
+            // Applies to ALL eviction paths, not just heartbeat silence.
+            // A peer that has not yet had a reasonable opportunity to
+            // establish itself should not be evicted for lacking evidence
+            // that can only be accumulated through continued participation.
+            // Grace exits on first heartbeat — the peer has demonstrated
+            // liveness and enters the standard eviction pool.
             let age = (Utc::now() - info.first_seen).num_seconds().max(0) as u64;
             let in_grace = info.heartbeats_received == 0 && age < COLD_START_GRACE_SECS;
+
+            if in_grace {
+                continue; // Skip all eviction checks for graced peers
+            }
 
             // ── Layer 2: epoch-based heartbeat silence ─────────
             let epochs_since_heartbeat =
                 current_epoch.saturating_sub(info.last_heartbeat_epoch);
-            if !in_grace && epochs_since_heartbeat > ZOMBIE_EPOCH_THRESHOLD {
+            if epochs_since_heartbeat > ZOMBIE_EPOCH_THRESHOLD {
                 to_evict.push((*peer_id, format!(
                     "heartbeat silence: {} epochs since last heartbeat (threshold {})",
                     epochs_since_heartbeat, ZOMBIE_EPOCH_THRESHOLD

@@ -2665,11 +2665,12 @@ impl LatticeNode {
                 );
                 self.last_claimed.insert(key, state.end_epoch);
 
-                // Queue for economic engine — persist to claims WAL first
+                // Queue for economic engine — persist to unified WAL first
                 // so the claim survives a crash before the next snapshot.
                 if let Some(ref mut store) = self.state_store {
-                    if let Err(e) = store.persist_claim(&assembled) {
-                        warn!(error = %e, "Failed to persist claim to WAL");
+                    let record = crate::ledger::wal_record::WalRecord::Claim(assembled.clone());
+                    if let Err(e) = store.persist_record(&record) {
+                        warn!(error = %e, "Failed to persist claim to unified WAL");
                     }
                 }
                 self.economic_engine.queue_claim(assembled);
@@ -3203,7 +3204,8 @@ impl LatticeNode {
 
                             // Persist to WAL BEFORE applying to ledger.
                             if let Some(ref mut store) = self.state_store {
-                                if let Err(e) = store.persist(tx) {
+                                let record = crate::ledger::wal_record::WalRecord::Transaction(tx.clone());
+                                if let Err(e) = store.persist_record(&record) {
                                     warn!(error = %e, nonce = applied_nonce,
                                         "Failed to persist transaction — skipping apply");
                                     continue;
@@ -4084,9 +4086,10 @@ impl LatticeNode {
     /// application to enforce the durability boundary.
     /// (See docs/architecture/persistence-design.md §2.)
     fn on_transaction_applied(&mut self, tx: &SignedTransaction) {
-        // Persist to WAL if persistence is enabled.
+        // Persist to unified WAL if persistence is enabled.
         if let Some(store) = self.state_store.as_mut() {
-            if let Err(e) = store.persist(tx) {
+            let record = crate::ledger::wal_record::WalRecord::Transaction(tx.clone());
+            if let Err(e) = store.persist_record(&record) {
                 warn!(error = %e, nonce = tx.transaction.nonce(), "Failed to persist transaction");
             }
         }

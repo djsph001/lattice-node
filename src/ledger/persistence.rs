@@ -447,60 +447,10 @@ impl StateStore for WalStateStore {
             Err(e) => return Err(e.into()),
         };
 
-        // 2. Replay WAL — read from current WAL, falling back to .old
-        //    (the previous snapshot rotated it).  The handle is for
-        //    append-mode writes; reading from the fd can produce bad
-        //    results on some kernels, so we read from the path directly.
-        let mut wal_data = Vec::new();
-        match std::fs::read(&self.wal_path) {
-            Ok(bytes) => wal_data = bytes,
-            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Try the rotated .old WAL — it was renamed at the last
-                // snapshot and contains the entries that were current
-                // when that snapshot was taken.
-                let old_path = self.wal_path.with_extension("wal.old");
-                match std::fs::read(&old_path) {
-                    Ok(bytes) => {
-                        info!("Replaying from rotated WAL: {:?}", old_path);
-                        wal_data = bytes;
-                    }
-                    Err(ref e2) if e2.kind() == std::io::ErrorKind::NotFound => {
-                        info!("No WAL found, starting from snapshot only");
-                        return Ok(state);
-                    }
-                    Err(e2) => return Err(e2.into()),
-                }
-            }
-            Err(e) => return Err(e.into()),
-        }
-
-        let mut offset = 0;
-        let mut replayed = 0u64;
-        while offset + 4 <= wal_data.len() {
-            let len = u32::from_be_bytes([
-                wal_data[offset],
-                wal_data[offset + 1],
-                wal_data[offset + 2],
-                wal_data[offset + 3],
-            ]) as usize;
-            offset += 4;
-            if offset + len > wal_data.len() {
-                warn!("Truncated WAL entry — stopping replay");
-                break;
-            }
-            if let Ok(tx) = serde_cbor::from_slice::<SignedTransaction>(&wal_data[offset..offset + len]) {
-                Self::apply_tx_to_state(&mut state, &tx);
-                replayed += 1;
-            }
-            offset += len;
-        }
-        info!(replayed, "Replayed transactions from WAL");
-
-        // 3. Replay claims WAL — claims written at acceptance time,
-        //    before the snapshot captured them as credited. Build a
-        //    dedup set from the snapshot so we skip claims already there.
-        //    Keys are (claimant_base58, claim_type, end_epoch) — unique
-        //    given monotonic non-overlapping claim windows.
+        // 2. Replay unified WAL (wal.log) — WalRecord entries with
+        //    numeric discriminant (Transaction=1, Claim=2).
+        //    Build a dedup set from snapshot claims so replay
+        //    skips already-credited claims.
         use std::collections::HashSet;
         let snapshot_keys: HashSet<(String, u8, u64)> = state
             .accepted_claims
@@ -514,28 +464,10 @@ impl StateStore for WalStateStore {
             })
             .collect();
 
-        match std::fs::read(&self.claim_wal_path) {
-            Ok(claim_wal_data) => {
-                Self::replay_claims_wal(&mut state, &claim_wal_data, &snapshot_keys);
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Try the rotated .old claims WAL
-                let old_path = self.claim_wal_path.with_extension("wal.old");
-                match std::fs::read(&old_path) {
-                    Ok(claim_wal_data) => {
-                        info!("Replaying claims from rotated WAL: {:?}", old_path);
-                        Self::replay_claims_wal(&mut state, &claim_wal_data, &snapshot_keys);
-                    }
-                    Err(ref e2) if e2.kind() == std::io::ErrorKind::NotFound => {
-                        info!("No claims WAL found, starting from snapshot claims only");
-                    }
-                    Err(e2) => return Err(e2.into()),
-                }
-            }
-            Err(e) => return Err(e.into()),
-        }
-
-        // 4. Replay unified WAL (wal.log) — new-format WalRecord entries.
+        // Snapshot was taken at some epoch before the node was shut
+        // down.  WAL entries from that point forward need to be
+        // replayed to reconstruct the post-snapshot state.
+        //
         //    Each entry is length-prefixed CBOR with a numeric discriminant
         //    (Transaction=1, Claim=2).  The unified file coexists with the
         //    legacy files during the migration window; truncation retires

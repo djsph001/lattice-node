@@ -15,7 +15,7 @@ use libp2p::swarm::behaviour::toggle::Toggle;
 use serde::{Deserialize, Serialize};
 use tokio::time;
 use chrono::Utc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::agent::ModelSize;
 use crate::ledger::state::LedgerState;
@@ -50,6 +50,10 @@ const PROTOCOL_VERSION: u32 = 1;
 
 /// Gossipsub topic for economic transaction propagation.
 pub const LATTICE_TX_TOPIC: &str = "lattice/tx/v1";
+
+/// Gossipsub topic for network genesis propagation.
+/// Genesis is a one-per-network record that establishes the trust anchor.
+pub const LATTICE_GENESIS_TOPIC: &str = "/lattice/genesis/v1";
 
 /// How long to wait for a fetch response before considering it failed.
 /// On a 3-node LAN mesh, round-trips are sub-second — 5s is generous.
@@ -414,6 +418,9 @@ pub struct LatticeNode {
     /// None until the network origin is established.  Doubles as the
     /// `genesis_established` flag for recovery ordering.
     genesis: Option<crate::ledger::types::SignedGenesis>,
+    /// PeerIds to which we have already sent genesis this session,
+    /// preventing re-gossip amplification on reconnect storms.
+    genesis_sent_to: HashSet<PeerId>,
     /// Self-liquidation period for genesis thickness. None = permanent.
     genesis_amortize_over: Option<u64>,
     /// Automatically submit genesis on startup if the chain is empty.
@@ -558,6 +565,12 @@ impl LatticeNode {
                 gossipsub
                     .subscribe(&block_topic)
                     .map_err(|e| anyhow::anyhow!("gossipsub block subscribe: {e}"))?;
+
+                // Subscribe to genesis topic for network origin propagation.
+                let genesis_topic = gossipsub::IdentTopic::new(LATTICE_GENESIS_TOPIC);
+                gossipsub
+                    .subscribe(&genesis_topic)
+                    .map_err(|e| anyhow::anyhow!("gossipsub genesis subscribe: {e}"))?;
 
                 let rpc = request_response::Behaviour::new(
                     [(LatticeProtocol, request_response::ProtocolSupport::Full)],
@@ -747,6 +760,7 @@ impl LatticeNode {
                 parsed
             },
             genesis: None,  // populated during recovery or on first genesis accept
+            genesis_sent_to: HashSet::new(),
             genesis_amortize_over,
             auto_genesis,
             genesis_thickness,
@@ -2888,6 +2902,16 @@ impl LatticeNode {
         for (peer, balance) in &balances {
             self.ledger.set_balance(peer, *balance);
         }
+
+        // Recover genesis, if one was persisted.
+        if let Some(g) = state.genesis {
+            info!(
+                network_name = %g.genesis.network_name,
+                root = %g.genesis.root,
+                "Genesis recovered from WAL"
+            );
+            self.genesis = Some(g);
+        }
         if !balances.is_empty() {
             info!(count = balances.len(), "Recovered balances from economic snapshot");
         }
@@ -2951,10 +2975,148 @@ impl LatticeNode {
             );
         }
 
+        // Author genesis if this node is the configured root and no genesis
+        // has been recovered. Authoring at startup, before the event loop,
+        // establishes genesis deterministically.
+        if self.genesis.is_none() {
+            if let Some(ref root) = self.genesis_root {
+                if *root == self.local_peer_id {
+                    self.author_and_gossip_genesis()?;
+                }
+            }
+        }
+
         Ok(())
     }
 
-    /// Send a balance query to a specific peer.
+    /// Author genesis (self-signed, persisted, gossiped) for the root node.
+    fn author_and_gossip_genesis(&mut self) -> Result<()> {
+        use crate::ledger::wal_record::WalRecord;
+        use crate::ledger::types::{Genesis, SignedGenesis};
+
+        let genesis = Genesis {
+            network_name: format!("lattice-{}", self.node_name),
+            root: self.local_peer_id.to_base58(),
+            timestamp: chrono::Utc::now(),
+        };
+        let genesis_bytes = serde_cbor::to_vec(&genesis)
+            .map_err(|e| anyhow::anyhow!("failed to encode genesis: {e}"))?;
+        let signature = self.local_key.sign(&genesis_bytes)
+            .map_err(|e| anyhow::anyhow!("failed to sign genesis: {e}"))?;
+        let signed = SignedGenesis {
+            genesis,
+            signer_public_key: self.local_key.public().encode_protobuf(),
+            signature,
+        };
+
+        // Persist before gossip — validate → persist → apply ordering.
+        if let Some(ref mut store) = self.state_store {
+            store.persist_record(&WalRecord::Genesis(signed.clone()))
+                .context("failed to persist genesis")?;
+        }
+
+        self.genesis = Some(signed.clone());
+        info!(
+            network_name = %signed.genesis.network_name,
+            root = %signed.genesis.root,
+            "Authored and persisted genesis"
+        );
+
+        // Gossip to the mesh.
+        let topic = gossipsub::IdentTopic::new(LATTICE_GENESIS_TOPIC);
+        let raw = serde_cbor::to_vec(&signed)
+            .map_err(|e| anyhow::anyhow!("failed to encode genesis for gossip: {e}"))?;
+        if let Err(e) = self
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(topic, raw)
+        {
+            warn!(error = %e, "Failed to gossip genesis (will retry on peer connect)");
+        }
+
+        Ok(())
+    }
+
+    /// Re-gossip genesis to a newly connected peer if we hold one.
+    fn re_gossip_genesis(&mut self, peer: &PeerId) {
+        if self.genesis.is_none() {
+            return;
+        }
+        if !self.genesis_sent_to.insert(*peer) {
+            return; // already sent to this peer this session
+        }
+        let topic = gossipsub::IdentTopic::new(LATTICE_GENESIS_TOPIC);
+        let raw = match self.genesis.as_ref().and_then(|g| serde_cbor::to_vec(g).ok()) {
+            Some(r) => r,
+            None => return,
+        };
+        if let Err(e) = self
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(topic, raw)
+        {
+            warn!(error = %e, peer = %peer, "Failed to re-gossip genesis to peer");
+        }
+    }
+
+    /// Handle an incoming genesis message from gossipsub.
+    fn handle_genesis_message(&mut self, raw: &[u8]) {
+        let signed: crate::ledger::types::SignedGenesis = match serde_cbor::from_slice(raw) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "Failed to deserialize genesis from gossip");
+                return;
+            }
+        };
+
+        use crate::ledger::validation::{validate_genesis, GenesisRejection};
+
+        let configured: Option<String> = self.genesis_root.as_ref()
+            .map(|r| r.to_base58());
+
+        match validate_genesis(
+            &signed,
+            configured.as_deref(),
+            self.genesis.as_ref(),
+        ) {
+            Ok(()) => {
+                // validate → persist → apply
+                if let Some(ref mut store) = self.state_store {
+                    if let Err(e) = store.persist_record(
+                        &crate::ledger::wal_record::WalRecord::Genesis(signed.clone()),
+                    ) {
+                        error!(error = %e, "Failed to persist incoming genesis");
+                        return;
+                    }
+                }
+                self.genesis = Some(signed.clone());
+                info!(
+                    network_name = %signed.genesis.network_name,
+                    root = %signed.genesis.root,
+                    "Genesis accepted and persisted"
+                );
+            }
+            Err(GenesisRejection::AlreadyEstablished { same_content: true, .. }) => {
+                trace!("Duplicate genesis from gossip — ignoring");
+            }
+            Err(GenesisRejection::AlreadyEstablished { same_content: false, existing_signer, incoming_signer, .. })
+                if existing_signer == incoming_signer =>
+            {
+                warn!(
+                    existing_signer,
+                    "Same signer produced conflicting genesis — possible key compromise"
+                );
+            }
+            Err(GenesisRejection::AlreadyEstablished { .. }) => {
+                info!("Genesis from different network — ignoring");
+            }
+            Err(e) => {
+                warn!(?e, "Genesis rejected");
+            }
+        }
+    }
     fn send_balance_query(&mut self, query_peer: PeerId, target: PeerId) {
         self.query_nonce += 1;
         self.economic_engine.metrics.record_query_issued();
@@ -3087,6 +3249,8 @@ impl LatticeNode {
                 );
                 if topic == LATTICE_BLOCK_TOPIC {
                     self.handle_block_message(&message.data, &propagation_source);
+                } else if topic == LATTICE_GENESIS_TOPIC {
+                    self.handle_genesis_message(&message.data);
                 } else {
                     self.handle_gossip_message(&message.data, propagation_source, message.source);
                 }
@@ -3660,6 +3824,8 @@ impl LatticeNode {
                 if self.queried_peers.insert(peer_id) {
                     self.send_status_request(peer_id);
                 }
+                // Re-gossip genesis to newly connected peer.
+                self.re_gossip_genesis(&peer_id);
             }
 
             SwarmEvent::ConnectionClosed { peer_id, .. } => {

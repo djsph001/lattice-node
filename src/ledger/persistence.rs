@@ -49,6 +49,10 @@ pub struct PersistentEconomicState {
     /// overlap checks once a claim is superseded.
     #[serde(default)]
     pub accepted_claims: Vec<StoredClaim>,
+    /// The network genesis record, if one has been persisted.  `None` means
+    /// pre-genesis state (node has not yet accepted a genesis).
+    #[serde(default)]
+    pub genesis: Option<crate::ledger::types::SignedGenesis>,
 }
 
 impl PersistentEconomicState {
@@ -59,6 +63,7 @@ impl PersistentEconomicState {
             thickness_edges: HashMap::new(),
             self_tx_nonce: 0,
             accepted_claims: Vec::new(),
+            genesis: None,
         }
     }
 
@@ -83,6 +88,7 @@ impl PersistentEconomicState {
                 .collect(),
             self_tx_nonce,
             accepted_claims: accepted_claims.to_vec(),
+            genesis: None,
         }
     }
 
@@ -476,6 +482,8 @@ impl StateStore for WalStateStore {
             Ok(data) => {
                 let mut offset = 0;
                 let mut unified_replayed = 0u64;
+                let mut genesis_established = false;
+                let mut recovered_genesis: Option<crate::ledger::types::SignedGenesis> = None;
                 while offset + 4 <= data.len() {
                     let len = u32::from_be_bytes([
                         data[offset], data[offset+1], data[offset+2], data[offset+3],
@@ -489,10 +497,29 @@ impl StateStore for WalStateStore {
                         &data[offset..offset + len],
                     ) {
                         match record {
+                            crate::ledger::wal_record::WalRecord::Genesis(g) => {
+                                if genesis_established {
+                                    return Err(anyhow::anyhow!(
+                                        "Recovery error: duplicate Genesis in unified WAL"
+                                    ));
+                                }
+                                genesis_established = true;
+                                recovered_genesis = Some(g);
+                            }
                             crate::ledger::wal_record::WalRecord::Transaction(tx) => {
+                                if !genesis_established {
+                                    return Err(anyhow::anyhow!(
+                                        "Recovery error: Transaction before Genesis in unified WAL"
+                                    ));
+                                }
                                 Self::apply_tx_to_state(&mut state, &tx);
                             }
                             crate::ledger::wal_record::WalRecord::Claim(claim) => {
+                                if !genesis_established {
+                                    return Err(anyhow::anyhow!(
+                                        "Recovery error: Claim before Genesis in unified WAL"
+                                    ));
+                                }
                                 let key = (
                                     claim.claimant.to_base58(),
                                     claim.claim_type as u8,
@@ -507,18 +534,13 @@ impl StateStore for WalStateStore {
                                     );
                                 }
                             }
-                            crate::ledger::wal_record::WalRecord::Genesis(_g) => {
-                                // Genesis is applied by node startup logic,
-                                // not by economic state replay. The WAL
-                                // preserves it; the node reads it separately.
-                                info!("Genesis record found in unified WAL");
-                            }
                         }
                         unified_replayed += 1;
                     }
                     offset += len;
                 }
                 info!(unified_replayed, "Replayed entries from unified WAL");
+                state.genesis = recovered_genesis;
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // No unified WAL yet — migration hasn't started or hasn't

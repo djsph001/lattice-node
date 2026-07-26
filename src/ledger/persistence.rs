@@ -507,6 +507,12 @@ impl StateStore for WalStateStore {
                                     );
                                 }
                             }
+                            crate::ledger::wal_record::WalRecord::Genesis(_g) => {
+                                // Genesis is applied by node startup logic,
+                                // not by economic state replay. The WAL
+                                // preserves it; the node reads it separately.
+                                info!("Genesis record found in unified WAL");
+                            }
                         }
                         unified_replayed += 1;
                     }

@@ -234,3 +234,34 @@ pub struct SignedTransaction {
     /// Ed25519 signature over the CBOR-encoded transaction bytes.
     pub signature: Vec<u8>,
 }
+
+/// Genesis payload — the network origin record.
+///
+/// WARNING: field additions, removals, renames, or reordering change the
+/// CBOR signing bytes and invalidate signatures on all previously written
+/// Genesis records. Genesis is exactly-once and permanent — treat any change
+/// to this struct as a protocol migration requiring coordinated mesh action.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Genesis {
+    /// Human-readable network identifier.
+    pub network_name: String,
+    /// Root PeerId as base58 string (matches the Transaction convention
+    /// where peer identity fields are Strings).
+    pub root: String,
+    /// Creation timestamp, included in signed payload to prevent stale replay.
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// A signed genesis record — structurally mirrors SignedTransaction.
+///
+/// The genesis signer is the trust anchor for the network.  The signature
+/// covers the CBOR encoding of `genesis` (same pattern as transaction
+/// signatures covering `Transaction` payloads).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SignedGenesis {
+    pub genesis: Genesis,
+    /// Protobuf-encoded Ed25519 public key bytes from the signer.
+    pub signer_public_key: Vec<u8>,
+    /// Ed25519 signature over `serde_cbor::to_vec(&genesis)`.
+    pub signature: Vec<u8>,
+}

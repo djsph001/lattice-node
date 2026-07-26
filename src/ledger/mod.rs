@@ -3,3 +3,4 @@ pub mod thickness;
 pub mod types;
 pub mod validation;
 pub mod persistence;
+pub mod wal_record;

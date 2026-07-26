@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use libp2p::PeerId;
+use tracing::warn;
 
 use crate::ledger::types::SignedTransaction;
 
@@ -157,10 +158,24 @@ impl Wal for FileWal {
 
             for nonce in files {
                 let path = peer_dir.join(format!("{:08}.cbor", nonce));
-                let data = fs::read(&path)
-                    .with_context(|| format!("reading WAL entry {:?}", path))?;
-                let tx: SignedTransaction = serde_cbor::from_slice(&data)
-                    .with_context(|| format!("deserializing WAL entry {:?}", path))?;
+                let data = match fs::read(&path) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("Skipping unreadable WAL entry {:?}: {}", path, e);
+                        continue;
+                    }
+                };
+                let tx: SignedTransaction = match serde_cbor::from_slice(&data) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        // Corrupt or partial entry — skip, don't fail the
+                        // entire replay.  This covers the "during WAL write"
+                        // crash row of the crash matrix.
+                        // See docs/architecture/persistence-design.md §4.
+                        warn!("Skipping corrupt WAL entry {:?}: {}", path, e);
+                        continue;
+                    }
+                };
                 all.push(tx);
             }
         }
@@ -292,7 +307,7 @@ mod tests {
 
     #[test]
     fn replay_sorts_by_nonce() {
-        let (mut wal, dir) = temp_wal();
+        let (mut wal, _dir) = temp_wal();
         let kp = make_kp();
         let peer = kp.public().to_peer_id();
 
@@ -314,5 +329,148 @@ mod tests {
             assert_eq!(tx.transaction.nonce(), (i as u64) + 1,
                 "replay must sort by nonce within each peer");
         }
+    }
+
+    // ── Crash recovery: tail integrity ────────────────────
+
+    /// A corrupt final WAL entry must be discarded without
+    /// damaging earlier durable transactions.
+    /// Covers the "during WAL write" crash row of the crash
+    /// matrix (docs/architecture/persistence-design.md §4).
+    #[test]
+    fn tail_integrity_corrupt_entry_discarded() {
+        let (mut wal, _dir) = temp_wal();
+        let kp = make_kp();
+        let peer = kp.public().to_peer_id();
+
+        // Append A, B, C
+        for nonce in 1..=3 {
+            let tx = Transaction::Mint {
+                to: peer.to_string(),
+                amount: DigitalUtilityUnit(10),
+                authority: peer.to_string(),
+                nonce,
+                timestamp: Utc::now(),
+            };
+            wal.append(&sign(tx, &kp)).unwrap();
+        }
+        assert_eq!(wal.replay().unwrap().len(), 3);
+
+        // Corrupt C: truncate to half its length
+        let c_path = wal.tx_path(&peer, 3);
+        let original = std::fs::read(&c_path).unwrap();
+        let partial = &original[..original.len() / 2];
+        std::fs::write(&c_path, partial).unwrap();
+
+        // Recovery must tolerate the corrupt entry — CBOR
+        // deserialization of a partial record fails, and
+        // the corrupt file must not prevent replay of A and B.
+        let recovered = wal.replay().unwrap();
+        assert_eq!(recovered.len(), 2,
+            "corrupt entry C discarded; A and B survive");
+        assert_eq!(recovered[0].transaction.nonce(), 1);
+        assert_eq!(recovered[1].transaction.nonce(), 2);
+    }
+
+    /// A completely invalid file (garbage, not partial CBOR)
+    /// is also discarded without harming valid entries.
+    #[test]
+    fn tail_integrity_garbage_entry_discarded() {
+        let (mut wal, _dir) = temp_wal();
+        let kp = make_kp();
+        let peer = kp.public().to_peer_id();
+
+        let tx = Transaction::Mint {
+            to: peer.to_string(),
+            amount: DigitalUtilityUnit(10),
+            authority: peer.to_string(),
+            nonce: 1,
+            timestamp: Utc::now(),
+        };
+        wal.append(&sign(tx, &kp)).unwrap();
+
+        // Simulate crash during write of nonce 2
+        std::fs::write(wal.tx_path(&peer, 2), b"not-cbor").unwrap();
+
+        let recovered = wal.replay().unwrap();
+        assert_eq!(recovered.len(), 1,
+            "garbage entry discarded; valid entry survives");
+    }
+
+    // ── Crash recovery: deterministic recovery ─────────────
+
+    /// Given the same valid WAL, recovery produces the same
+    /// transaction sequence every time.
+    #[test]
+    fn deterministic_recovery_same_wal_same_result() {
+        let (mut wal, _dir) = temp_wal();
+        let kp = make_kp();
+        let peer = kp.public().to_peer_id();
+
+        for nonce in 1..=3 {
+            let tx = Transaction::Mint {
+                to: peer.to_string(),
+                amount: DigitalUtilityUnit(10),
+                authority: peer.to_string(),
+                nonce,
+                timestamp: Utc::now(),
+            };
+            wal.append(&sign(tx, &kp)).unwrap();
+        }
+
+        let first = wal.replay().unwrap();
+        let second = wal.replay().unwrap();
+
+        assert_eq!(first.len(), second.len());
+        for (a, b) in first.iter().zip(second.iter()) {
+            assert_eq!(a.transaction.nonce(), b.transaction.nonce());
+        }
+    }
+
+    // ── Crash recovery: no duplicate application ────────────
+
+    /// Each durable transaction is applied exactly once during
+    /// a recovery run.  The recovery process starts from empty
+    /// state and walks the WAL in order.  Idempotence is a
+    /// property of the application layer (nonce tracking), not
+    /// of WAL replay itself.
+    #[test]
+    fn no_duplicate_application_during_recovery() {
+        use std::collections::HashSet;
+
+        let (mut wal, _dir) = temp_wal();
+        let kp = make_kp();
+        let peer = kp.public().to_peer_id();
+
+        for nonce in 1..=3 {
+            let tx = Transaction::Mint {
+                to: peer.to_string(),
+                amount: DigitalUtilityUnit(10),
+                authority: peer.to_string(),
+                nonce,
+                timestamp: Utc::now(),
+            };
+            wal.append(&sign(tx, &kp)).unwrap();
+        }
+
+        let txs = wal.replay().unwrap();
+        let mut seen: HashSet<(String, u64)> = HashSet::new();
+        for tx in &txs {
+            let key = (
+                libp2p::identity::PublicKey::try_decode_protobuf(
+                    &tx.signer_public_key,
+                )
+                .map(|pk| pk.to_peer_id().to_base58())
+                .unwrap(),
+                tx.transaction.nonce(),
+            );
+            let inserted = seen.insert(key.clone());
+            assert!(
+                inserted,
+                "duplicate application: signer={:?} nonce={}",
+                key.0, key.1
+            );
+        }
+        assert_eq!(txs.len(), 3);
     }
 }

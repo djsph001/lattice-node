@@ -211,6 +211,107 @@ fn verify_signature(tx: &SignedTransaction) -> Result<()> {
     Ok(())
 }
 
+// ── Genesis validation ──────────────────────────────────────
+
+/// Why a genesis was rejected.  Used by the caller to determine
+/// log level (INFO for different-network, TRACE for duplicate,
+/// WARN for same-signer-different-content).
+#[derive(Debug, Clone, PartialEq)]
+pub enum GenesisRejection {
+    BadSignature,
+    RootMismatch { payload_root: String, key_derived: String },
+    NotConfiguredRoot { signer: String, expected: String },
+    EmptyNetworkName,
+    TimestampOutOfRange,
+    AlreadyEstablished { existing_signer: String, incoming_signer: String, same_content: bool },
+}
+
+/// Validate a genesis against the configured root (if any) and
+/// any existing genesis this node has already accepted.  Pure
+/// function — no I/O, no state mutation.
+///
+/// `configured_root` comes from the `--genesis-root` CLI flag or
+/// config file.  `None` means observer mode: accept first valid
+/// genesis, skip root-authorization check.
+///
+/// `existing` is `None` if this node has not yet accepted a
+/// genesis.  `Some` if it has — required for the uniqueness and
+/// anomaly-classification checks.
+pub fn validate_genesis(
+    signed: &crate::ledger::types::SignedGenesis,
+    configured_root: Option<&str>,
+    existing: Option<&crate::ledger::types::SignedGenesis>,
+) -> Result<(), GenesisRejection> {
+    // 1. Reconstruct public key, verify signature over CBOR payload.
+    let public_key = libp2p::identity::PublicKey::try_decode_protobuf(
+        &signed.signer_public_key,
+    )
+    .map_err(|_| GenesisRejection::BadSignature)?;
+
+    let genesis_bytes = serde_cbor::to_vec(&signed.genesis)
+        .map_err(|_| GenesisRejection::BadSignature)?;
+
+    if !public_key.verify(&genesis_bytes, &signed.signature) {
+        return Err(GenesisRejection::BadSignature);
+    }
+
+    let key_peer_id = libp2p::PeerId::from(public_key);
+
+    // 2. Payload root must match the key that signed the envelope.
+    let payload_root = signed.genesis.root.clone();
+    let key_derived = key_peer_id.to_base58();
+    if payload_root != key_derived {
+        return Err(GenesisRejection::RootMismatch {
+            payload_root,
+            key_derived,
+        });
+    }
+
+    // 3. Network name must be non-empty and ≤ 128 bytes.
+    let nn = signed.genesis.network_name.as_str();
+    if nn.is_empty() || nn.len() > 128 {
+        return Err(GenesisRejection::EmptyNetworkName);
+    }
+
+    // 4. Timestamp must not be absurdly far in the future.
+    //    Past timestamps are legitimate (joining an old network).
+    let now = chrono::Utc::now();
+    let limit = now + chrono::Duration::seconds(300);
+    if signed.genesis.timestamp > limit {
+        return Err(GenesisRejection::TimestampOutOfRange);
+    }
+
+    // 5. If a root is configured, the signer must match it.
+    if let Some(expected) = configured_root {
+        if key_derived != expected {
+            return Err(GenesisRejection::NotConfiguredRoot {
+                signer: key_derived,
+                expected: expected.to_string(),
+            });
+        }
+    }
+
+    // 6. Uniqueness — if we already have a genesis, classify.
+    if let Some(prev) = existing {
+        let prev_signer = libp2p::identity::PublicKey::try_decode_protobuf(
+            &prev.signer_public_key,
+        )
+        .map(|pk| libp2p::PeerId::from(pk).to_base58())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+        let same_content = prev.genesis == signed.genesis
+            && prev.signature == signed.signature;
+
+        return Err(GenesisRejection::AlreadyEstablished {
+            existing_signer: prev_signer,
+            incoming_signer: key_derived,
+            same_content,
+        });
+    }
+
+    Ok(())
+}
+
 /// Reject transactions older than MAX_TX_AGE_SECS.
 fn check_timestamp(tx: &SignedTransaction) -> Result<()> {
     let tx_time = match &tx.transaction {
@@ -656,5 +757,156 @@ mod tests {
             &signed, &mut state, &mut nonces, None, false,
         );
         assert!(result.is_err(), "self-authored genesis must be rejected when not allowed");
+    }
+}
+
+// ── Genesis validation tests ─────────────────────────────────
+
+#[cfg(test)]
+mod genesis_tests {
+    use super::*;
+    use crate::ledger::types::{Genesis, SignedGenesis};
+    use chrono::Utc;
+    use libp2p::identity::Keypair;
+
+    fn make_signed_genesis(kp: &Keypair, root: &str, network: &str) -> SignedGenesis {
+        let payload = Genesis {
+            network_name: network.to_string(),
+            root: root.to_string(),
+            timestamp: Utc::now(),
+        };
+        let bytes = serde_cbor::to_vec(&payload).unwrap();
+        let signature = kp.sign(&bytes).unwrap();
+        SignedGenesis {
+            genesis: payload,
+            signer_public_key: kp.public().encode_protobuf(),
+            signature,
+        }
+    }
+
+    #[test]
+    fn valid_genesis_with_matching_root() {
+        let kp = Keypair::generate_ed25519();
+        let root = PeerId::from(kp.public()).to_base58();
+        let sg = make_signed_genesis(&kp, &root, "test");
+        assert!(validate_genesis(&sg, Some(&root), None).is_ok());
+    }
+
+    #[test]
+    fn valid_genesis_observer_mode() {
+        let kp = Keypair::generate_ed25519();
+        let root = PeerId::from(kp.public()).to_base58();
+        let sg = make_signed_genesis(&kp, &root, "test");
+        assert!(validate_genesis(&sg, None, None).is_ok());
+    }
+
+    #[test]
+    fn bad_signature_rejected() {
+        let kp = Keypair::generate_ed25519();
+        let root = PeerId::from(kp.public()).to_base58();
+        let mut sg = make_signed_genesis(&kp, &root, "test");
+        sg.signature = vec![0xAA; 64]; // corrupt signature
+        let result = validate_genesis(&sg, None, None);
+        assert_eq!(result, Err(GenesisRejection::BadSignature));
+    }
+
+    #[test]
+    fn root_mismatch_rejected() {
+        let kp = Keypair::generate_ed25519();
+        let sg = make_signed_genesis(&kp, "12D3KooWBogusClaim", "test");
+        let result = validate_genesis(&sg, None, None);
+        assert!(matches!(result, Err(GenesisRejection::RootMismatch { .. })));
+    }
+
+    #[test]
+    fn wrong_configured_root_rejected() {
+        let kp = Keypair::generate_ed25519();
+        let root = PeerId::from(kp.public()).to_base58();
+        let sg = make_signed_genesis(&kp, &root, "test");
+        let expected = "12D3KooWExpectedRoot";
+        assert_eq!(
+            validate_genesis(&sg, Some(expected), None),
+            Err(GenesisRejection::NotConfiguredRoot {
+                signer: root,
+                expected: expected.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn empty_network_name_rejected() {
+        let kp = Keypair::generate_ed25519();
+        let root = PeerId::from(kp.public()).to_base58();
+        let mut sg = make_signed_genesis(&kp, &root, "");
+        // re-sign with empty name
+        let bytes = serde_cbor::to_vec(&sg.genesis).unwrap();
+        sg.signature = kp.sign(&bytes).unwrap();
+        assert_eq!(
+            validate_genesis(&sg, None, None),
+            Err(GenesisRejection::EmptyNetworkName)
+        );
+    }
+
+    #[test]
+    fn future_timestamp_rejected() {
+        let kp = Keypair::generate_ed25519();
+        let root = PeerId::from(kp.public()).to_base58();
+        let mut sg = make_signed_genesis(&kp, &root, "test");
+        sg.genesis.timestamp = Utc::now() + chrono::Duration::seconds(600);
+        let bytes = serde_cbor::to_vec(&sg.genesis).unwrap();
+        sg.signature = kp.sign(&bytes).unwrap();
+        assert_eq!(
+            validate_genesis(&sg, None, None),
+            Err(GenesisRejection::TimestampOutOfRange)
+        );
+    }
+
+    #[test]
+    fn duplicate_identical_rejected() {
+        let kp = Keypair::generate_ed25519();
+        let root = PeerId::from(kp.public()).to_base58();
+        let sg = make_signed_genesis(&kp, &root, "test");
+        assert_eq!(
+            validate_genesis(&sg, None, Some(&sg)),
+            Err(GenesisRejection::AlreadyEstablished {
+                existing_signer: root.clone(),
+                incoming_signer: root.clone(),
+                same_content: true,
+            })
+        );
+    }
+
+    #[test]
+    fn duplicate_different_signer_rejected() {
+        let kp1 = Keypair::generate_ed25519();
+        let kp2 = Keypair::generate_ed25519();
+        let root1 = PeerId::from(kp1.public()).to_base58();
+        let root2 = PeerId::from(kp2.public()).to_base58();
+        let sg1 = make_signed_genesis(&kp1, &root1, "net-a");
+        let sg2 = make_signed_genesis(&kp2, &root2, "net-b");
+        assert_eq!(
+            validate_genesis(&sg2, None, Some(&sg1)),
+            Err(GenesisRejection::AlreadyEstablished {
+                existing_signer: root1,
+                incoming_signer: root2,
+                same_content: false,
+            })
+        );
+    }
+
+    #[test]
+    fn same_signer_different_content_rejected() {
+        let kp = Keypair::generate_ed25519();
+        let root = PeerId::from(kp.public()).to_base58();
+        let s1 = make_signed_genesis(&kp, &root, "net-a");
+        let s2 = make_signed_genesis(&kp, &root, "net-b");
+        assert_eq!(
+            validate_genesis(&s2, None, Some(&s1)),
+            Err(GenesisRejection::AlreadyEstablished {
+                existing_signer: root.clone(),
+                incoming_signer: root,
+                same_content: false,
+            })
+        );
     }
 }

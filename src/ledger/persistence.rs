@@ -121,6 +121,11 @@ pub trait StateStore: Send {
     fn persist_claim(&mut self, _claim: &crate::claims::WitnessedClaim) -> Result<()> {
         Ok(()) // default: no-op for state stores that don't support claims
     }
+    /// Persist a unified WalRecord to the new-format WAL (`wal.log`).
+    /// Default: no-op for state stores that haven't adopted the unified format.
+    fn persist_record(&mut self, _record: &crate::ledger::wal_record::WalRecord) -> Result<()> {
+        Ok(())
+    }
     fn recover(&mut self) -> Result<PersistentEconomicState>;
     fn take_snapshot(&mut self, epoch: u64, state: &PersistentEconomicState) -> Result<()>;
     /// Returns (last_snapshot_epoch, wal_bytes, wal_entry_count).
@@ -144,6 +149,8 @@ pub struct WalStateStore {
     config: WalStateStoreConfig,
     wal_path: PathBuf,
     claim_wal_path: PathBuf,
+    /// New-format unified WAL: wal.log, containing WalRecord entries.
+    unified_wal_path: PathBuf,
     snapshot_path: PathBuf,
     wal_buffer: Vec<u8>,
     wal_file: Option<std::fs::File>,
@@ -158,6 +165,7 @@ impl WalStateStore {
             .with_context(|| format!("creating data dir {:?}", config.data_dir))?;
         let wal_path = config.data_dir.join("transactions.wal");
         let claim_wal_path = config.data_dir.join("claims.wal");
+        let unified_wal_path = config.data_dir.join("wal.log");
         let snapshot_path = config.data_dir.join("state.snapshot");
         // Open the WAL file once at startup and hold the handle open.
         // Reopening on every flush creates a window where the directory entry
@@ -185,6 +193,7 @@ impl WalStateStore {
             config,
             wal_path,
             claim_wal_path,
+            unified_wal_path,
             snapshot_path,
             wal_buffer: Vec::new(),
             wal_file,
@@ -406,6 +415,20 @@ impl StateStore for WalStateStore {
         file.write_all(&len.to_be_bytes())?;
         file.write_all(&claim_bytes)?;
         file.sync_all()?;
+        Ok(())
+    }
+
+    fn persist_record(&mut self, record: &crate::ledger::wal_record::WalRecord) -> Result<()> {
+        let bytes = serde_cbor::to_vec(record)?;
+        let len = bytes.len() as u32;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.unified_wal_path)
+            .with_context(|| format!("opening unified WAL at {:?}", self.unified_wal_path))?;
+        file.write_all(&len.to_be_bytes())?;
+        file.write_all(&bytes)?;
+        file.sync_all()?; // independent fsync per write
         Ok(())
     }
 

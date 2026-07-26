@@ -55,16 +55,19 @@ pub fn validate_and_apply(
     validate_and_apply_with_genesis_root(tx, state, seen_nonces, None, false)
 }
 
-/// Full validation with genesis-root gate.
+/// Pure validation only — checks signature, genesis gate, timestamp,
+/// nonce, balance, and stake.  No state mutation.  The caller is
+/// responsible for persisting the transaction to durable storage
+/// BEFORE calling commit_validated_transaction to apply it.
 ///
-/// `allow_self_authored_genesis` relaxes the gate when `genesis_root` is
-/// `None`, allowing a node to accept a genesis transaction signed by the
-/// embedded root. The caller must ensure this is only used at chain height 0
-/// before BootstrapEnded.
-pub fn validate_and_apply_with_genesis_root(
+/// This split enables the correct durability ordering:
+///   validate → wal.append(fsync) → commit_validated_transaction
+///
+/// See docs/architecture/persistence-design.md §2.
+pub fn validate_transaction(
     tx: &SignedTransaction,
-    state: &mut LedgerState,
-    seen_nonces: &mut HashMap<PeerId, u64>,
+    state: &LedgerState,
+    seen_nonces: &HashMap<PeerId, u64>,
     genesis_root: Option<&PeerId>,
     allow_self_authored_genesis: bool,
 ) -> Result<(), ValidationError> {
@@ -72,7 +75,6 @@ pub fn validate_and_apply_with_genesis_root(
     verify_signature(tx)?;
 
     // 2. Genesis gate: only the configured root may submit Genesis.
-    // Genesis mints thickness from nothing — the strictest gate.
     if matches!(tx.transaction, Transaction::Genesis { .. }) {
         let signer: PeerId = tx.transaction.signer().parse()
             .map_err(|e| anyhow::anyhow!("invalid genesis signer PeerId: {e}"))?;
@@ -90,7 +92,7 @@ pub fn validate_and_apply_with_genesis_root(
         }
     }
 
-    // 3. Extract signer and nonce
+    // 3. Timestamp
     check_timestamp(tx)?;
 
     let signer: PeerId = tx
@@ -99,10 +101,10 @@ pub fn validate_and_apply_with_genesis_root(
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid signer PeerId: {e}"))?;
 
-    // 3. Replay protection: nonce must be strictly greater than last seen
+    // 4. Replay protection: nonce must be strictly greater than last seen
     check_nonce(&signer, tx.transaction.nonce(), seen_nonces)?;
 
-    // 4. For transfers, check sufficient balance
+    // 5. For transfers, check sufficient balance
     if let Transaction::Transfer { from, amount, .. } = &tx.transaction {
         let from_peer: PeerId = from
             .parse()
@@ -111,20 +113,13 @@ pub fn validate_and_apply_with_genesis_root(
         if balance < *amount {
             return Err(ValidationError::Other(anyhow::anyhow!(
                 "insufficient balance: {} has {}, needs {}",
-                from,
-                balance,
-                amount
+                from, balance, amount
             )));
         }
     }
 
-    // 4b. For vouches, check sufficient unencumbered thickness (exact integer bps)
-    if let Transaction::Vouch {
-        voucher,
-        stake_bps,
-        ..
-    } = &tx.transaction
-    {
+    // 6. For vouches, check sufficient unencumbered thickness
+    if let Transaction::Vouch { voucher, stake_bps, .. } = &tx.transaction {
         let voucher_peer: PeerId = voucher
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid voucher PeerId: {e}"))?;
@@ -138,19 +133,50 @@ pub fn validate_and_apply_with_genesis_root(
         let current_bps = state.thickness_graph.active_stake_bps(&voucher_peer);
         if current_bps + stake_bps > 10_000 {
             return Err(ValidationError::Other(anyhow::anyhow!(
-                "insufficient unencumbered thickness: {} has {current_bps}bps staked, cannot add {stake_bps}bps (max 10_000)",
+                "insufficient unencumbered thickness: {} has {current_bps}bps staked, \
+                 cannot add {stake_bps}bps (max 10_000)",
                 voucher,
             )));
         }
     }
 
-    // 5. Apply to local state
-    state.apply_transaction(&tx.transaction)?;
-
-    // 6. Record the nonce so we reject replays
-    seen_nonces.insert(signer, tx.transaction.nonce());
-
     Ok(())
+}
+
+/// Apply a transaction that has already passed validation.
+/// The caller MUST have called validate_transaction() first.
+/// This function mutates state and records the nonce.
+pub fn commit_validated_transaction(
+    tx: &SignedTransaction,
+    state: &mut LedgerState,
+    seen_nonces: &mut HashMap<PeerId, u64>,
+) -> Result<(), ValidationError> {
+    let signer: PeerId = tx
+        .transaction
+        .signer()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid signer PeerId in commit: {e}"))?;
+
+    state.apply_transaction(&tx.transaction)?;
+    seen_nonces.insert(signer, tx.transaction.nonce());
+    Ok(())
+}
+
+/// Full validation with genesis-root gate.
+///
+/// `allow_self_authored_genesis` relaxes the gate when `genesis_root` is
+/// `None`, allowing a node to accept a genesis transaction signed by the
+/// embedded root. The caller must ensure this is only used at chain height 0
+/// before BootstrapEnded.
+pub fn validate_and_apply_with_genesis_root(
+    tx: &SignedTransaction,
+    state: &mut LedgerState,
+    seen_nonces: &mut HashMap<PeerId, u64>,
+    genesis_root: Option<&PeerId>,
+    allow_self_authored_genesis: bool,
+) -> Result<(), ValidationError> {
+    validate_transaction(tx, state, seen_nonces, genesis_root, allow_self_authored_genesis)?;
+    commit_validated_transaction(tx, state, seen_nonces)
 }
 
 /// Verify the Ed25519 signature on a signed transaction.

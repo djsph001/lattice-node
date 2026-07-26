@@ -791,15 +791,15 @@ impl LatticeNode {
 
         self.commit_manager.commit_root_block(&data, "genesis", &signature, &self.local_peer_id)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        self.ledger.apply_transaction(&tx)?;
 
-        // Persist to WAL for crash recovery
+        // ── Durability boundary: persist before apply ──
         let stx = crate::ledger::types::SignedTransaction {
             transaction: tx,
             signer_public_key: self.local_key.public().encode_protobuf(),
             signature,
         };
         self.on_transaction_applied(&stx);
+        self.ledger.apply_transaction(&stx.transaction)?;
 
         // Broadcast the genesis block to peers.
         self.publish_committed_block("genesis");
@@ -842,15 +842,15 @@ impl LatticeNode {
 
         self.commit_manager.commit_root_block(&data, "bootstrap-ended", &signature, &self.local_peer_id)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        self.ledger.apply_transaction(&tx)?;
 
-        // Persist to WAL for crash recovery
+        // ── Durability boundary: persist before apply ──
         let stx = crate::ledger::types::SignedTransaction {
             transaction: tx,
             signer_public_key: self.local_key.public().encode_protobuf(),
             signature,
         };
         self.on_transaction_applied(&stx);
+        self.ledger.apply_transaction(&stx.transaction)?;
 
         // Broadcast the BootstrapEnded declaration to peers.
         self.publish_committed_block("bootstrap-ended");
@@ -3178,15 +3178,47 @@ impl LatticeNode {
                                 continue;
                             }
 
-                            match validation::validate_and_apply(
+                            // ── Durability boundary: validate → persist → apply ─
+                            // The WAL must fsync before state mutation so
+                            // a crash between apply and persist doesn't
+                            // leave the transaction in graph state but
+                            // absent from the WAL (b99cd2c).
+                            //
+                            // Recovery replays pre-validated WAL entries;
+                            // do NOT re-run validation during recovery
+                            // (see docs/architecture/persistence-design.md).
+                            match validation::validate_transaction(
+                                tx,
+                                &self.ledger,
+                                &self.seen_nonces,
+                                Some(&self.local_peer_id),
+                                false,
+                            ) {
+                                Err(e) => {
+                                    warn!(error = %e, "[tx-fetch] Transaction validation failed");
+                                    continue;
+                                }
+                                Ok(()) => {}
+                            }
+
+                            // Persist to WAL BEFORE applying to ledger.
+                            if let Some(ref mut store) = self.state_store {
+                                if let Err(e) = store.persist(tx) {
+                                    warn!(error = %e, nonce = applied_nonce,
+                                        "Failed to persist transaction — skipping apply");
+                                    continue;
+                                }
+                            }
+
+                            // Now commit the validated, persisted transaction.
+                            match validation::commit_validated_transaction(
                                 tx,
                                 &mut self.ledger,
                                 &mut self.seen_nonces,
                             ) {
                                 Ok(()) => {
-                                    // Remove the outstanding fetch mark for this gap.
-                                    self.outstanding_fetches.remove(&(applied_signer, applied_nonce));
-                                    self.on_transaction_applied(tx);
+                                    self.outstanding_fetches.remove(
+                                        &(applied_signer, applied_nonce));
                                     applied_count += 1;
                                 }
                                 Err(e) => {
@@ -4046,8 +4078,11 @@ impl LatticeNode {
             .count()
     }
 
-    /// Record a successfully-applied transaction: insert into tx_store,
-    /// prune old entries, drain pending, and persist to WAL.
+    /// Persist a validated transaction to the WAL and update tx_store
+    /// bookkeeping.  The caller is responsible for ordering: this
+    /// function must be called AFTER validation and BEFORE ledger
+    /// application to enforce the durability boundary.
+    /// (See docs/architecture/persistence-design.md §2.)
     fn on_transaction_applied(&mut self, tx: &SignedTransaction) {
         // Persist to WAL if persistence is enabled.
         if let Some(store) = self.state_store.as_mut() {

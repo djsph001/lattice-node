@@ -1,4 +1,19 @@
+mod agent;
+mod api;
 mod claims;
+mod commit;
+mod economics;
+mod ingest;
+mod ledger;
+mod message;
+mod network;
+mod node;
+mod persistence;
+mod sortition;
+mod state;
+mod startup;
+mod storage;
+
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -6,20 +21,6 @@ use clap::Parser;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use crate::agent::ModelSize;
-
-mod agent;
-mod api;
-mod commit;
-mod economics;
-mod ingest;
-mod ledger;
-mod startup;
-mod message;
-mod network;
-mod node;
-mod sortition;
-mod state;
-mod storage;
 
 use node::LatticeNode;
 
@@ -261,6 +262,22 @@ struct Cli {
     openai_endpoint: Option<String>,
 }
 
+// ── Storage directory lockfile guard ──────────────────────
+/// Holds an exclusive lockfile in the storage directory.
+/// On Drop, the lockfile is removed (graceful exit).
+/// After a crash, the file persists — the operator removes it
+/// manually before restarting.
+struct StorageLock {
+    path: PathBuf,
+}
+
+impl Drop for StorageLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+// ── End lockfile guard ─────────────────────────────────────
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize structured logging
@@ -317,6 +334,47 @@ async fn main() -> Result<()> {
     // Phase 10b: public relays are pure infrastructure — no economic participation.
     let no_economics = cli.no_economics || cli.relay_server;
     let storage_dir = cli.storage_dir.clone();
+
+    // ── Storage directory lockfile guard ────────────────────
+    // Prevents duplicate processes from sharing a storage dir.
+    // If the lockfile exists, refuse to start with a clear
+    // error message. The lockfile is auto-cleaned on graceful
+    // exit by Drop; after a crash, the operator removes it
+    // before restarting (the message tells them how).
+    let _storage_guard: Option<StorageLock> = if let Some(ref dir) = cli.storage_dir {
+        let lock_path = dir.join("lattice.lock");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                let _ = writeln!(f, "{}", std::process::id());
+                let _ = f.sync_all();
+                Some(StorageLock { path: lock_path })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                anyhow::bail!(
+                    "Storage directory '{}' appears to be in use by another process.\n\
+                     If no other lattice-node is running, remove the lockfile:\n  rm {}\n\
+                     Then try again.",
+                    dir.display(),
+                    lock_path.display()
+                );
+            }
+            Err(e) => {
+                anyhow::bail!(
+                    "Cannot create lockfile in storage directory '{}': {}",
+                    dir.display(),
+                    e
+                );
+            }
+        }
+    } else {
+        None
+    };
+    // ── End lockfile guard ──────────────────────────────────
 
     let mut node = LatticeNode::new(
         cli.port,

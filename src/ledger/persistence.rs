@@ -535,6 +535,60 @@ impl StateStore for WalStateStore {
             Err(e) => return Err(e.into()),
         }
 
+        // 4. Replay unified WAL (wal.log) — new-format WalRecord entries.
+        //    Each entry is length-prefixed CBOR with a numeric discriminant
+        //    (Transaction=1, Claim=2).  The unified file coexists with the
+        //    legacy files during the migration window; truncation retires
+        //    the legacy files over time.
+        match std::fs::read(&self.unified_wal_path) {
+            Ok(data) => {
+                let mut offset = 0;
+                let mut unified_replayed = 0u64;
+                while offset + 4 <= data.len() {
+                    let len = u32::from_be_bytes([
+                        data[offset], data[offset+1], data[offset+2], data[offset+3],
+                    ]) as usize;
+                    offset += 4;
+                    if offset + len > data.len() {
+                        warn!("Truncated unified WAL entry — stopping replay");
+                        break;
+                    }
+                    if let Ok(record) = serde_cbor::from_slice::<crate::ledger::wal_record::WalRecord>(
+                        &data[offset..offset + len],
+                    ) {
+                        match record {
+                            crate::ledger::wal_record::WalRecord::Transaction(tx) => {
+                                Self::apply_tx_to_state(&mut state, &tx);
+                            }
+                            crate::ledger::wal_record::WalRecord::Claim(claim) => {
+                                let key = (
+                                    claim.claimant.to_base58(),
+                                    claim.claim_type as u8,
+                                    claim.end_epoch,
+                                );
+                                if !snapshot_keys.contains(&key) {
+                                    state.accepted_claims.push(
+                                        crate::ledger::persistence::StoredClaim {
+                                            claim,
+                                            applied_at_epoch: None,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        unified_replayed += 1;
+                    }
+                    offset += len;
+                }
+                info!(unified_replayed, "Replayed entries from unified WAL");
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // No unified WAL yet — migration hasn't started or hasn't
+                // produced any entries yet.
+            }
+            Err(e) => return Err(e.into()),
+        }
+
         Ok(state)
     }
 
@@ -562,7 +616,7 @@ impl StateStore for WalStateStore {
         // .old as a one-cycle fallback, then remove the previous .old.
         // If rotation crashes, the snapshot handles recovery;
         // replaying extra WAL entries is harmless (dedup is idempotent).
-        for wal_path in [&self.wal_path, &self.claim_wal_path] {
+        for wal_path in [&self.wal_path, &self.claim_wal_path, &self.unified_wal_path] {
             let old_path = wal_path.with_extension("wal.old");
             // Remove previous .old — the current snapshot supersedes it.
             let _ = fs::remove_file(&old_path);

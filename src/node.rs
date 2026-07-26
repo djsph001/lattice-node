@@ -2979,10 +2979,9 @@ impl LatticeNode {
         // has been recovered. Authoring at startup, before the event loop,
         // establishes genesis deterministically.
         if self.genesis.is_none() {
-            if let Some(ref root) = self.genesis_root {
-                if *root == self.local_peer_id {
-                    self.author_and_gossip_genesis()?;
-                }
+            let root = self.genesis_root.unwrap_or(self.local_peer_id);
+            if root == self.local_peer_id {
+                self.author_and_gossip_genesis()?;
             }
         }
 
@@ -3041,23 +3040,41 @@ impl LatticeNode {
     /// Re-gossip genesis to a newly connected peer if we hold one.
     fn re_gossip_genesis(&mut self, peer: &PeerId) {
         if self.genesis.is_none() {
+            debug!("re_gossip_genesis: no genesis to send");
             return;
         }
         if !self.genesis_sent_to.insert(*peer) {
+            debug!(peer = %peer, "re_gossip_genesis: already sent this session");
             return; // already sent to this peer this session
         }
+        debug!(peer = %peer, "re_gossip_genesis: publishing genesis to peer");
         let topic = gossipsub::IdentTopic::new(LATTICE_GENESIS_TOPIC);
+        let mesh_count = self
+            .swarm
+            .behaviour()
+            .gossipsub
+            .mesh_peers(&topic.hash())
+            .count();
+        debug!(
+            peer = %peer,
+            mesh_count,
+            "re_gossip_genesis: mesh peers in genesis topic"
+        );
         let raw = match self.genesis.as_ref().and_then(|g| serde_cbor::to_vec(g).ok()) {
             Some(r) => r,
-            None => return,
+            None => {
+                warn!("re_gossip_genesis: failed to serialize genesis");
+                return;
+            }
         };
-        if let Err(e) = self
+        match self
             .swarm
             .behaviour_mut()
             .gossipsub
             .publish(topic, raw)
         {
-            warn!(error = %e, peer = %peer, "Failed to re-gossip genesis to peer");
+            Ok(id) => debug!(message_id = %id, peer = %peer, "re_gossip_genesis: published successfully"),
+            Err(e) => warn!(error = %e, peer = %peer, mesh_count, "Failed to re-gossip genesis to peer"),
         }
     }
 

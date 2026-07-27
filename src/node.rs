@@ -7700,7 +7700,7 @@ mod witness_seam_tests {
                 observed_heartbeats: 1,
                 signature: response.signature,
             }],
-            submitted_epoch: 0,
+            submitted_epoch: 2,  // must be > end_epoch (cannot claim the future)
             claim_id: [0u8; 32],
         };
         assembled.claim_id = assembled.compute_claim_id();
@@ -7742,7 +7742,7 @@ mod witness_seam_tests {
                 observed_heartbeats: 1,
                 signature: response.signature,
             }],
-            submitted_epoch: 0,
+            submitted_epoch: 2,  // must be > end_epoch (cannot claim the future)
             claim_id: [0u8; 32],
         };
         assembled.claim_id = assembled.compute_claim_id();
@@ -8144,7 +8144,7 @@ mod two_swarm_witness_harness {
                 observed_heartbeats: 1,
                 signature: response.signature,
             }],
-            submitted_epoch: 0,
+            submitted_epoch: 2,  // must be > end_epoch (cannot claim the future)
             claim_id: [0u8; 32],
         };
         assembled.claim_id = assembled.compute_claim_id();
@@ -8467,7 +8467,7 @@ mod two_swarm_witness_harness {
         assert!(response.decline_reason.is_none());
 
         // Assemble the WitnessedClaim (same as finalize_claim)
-        let claimant = PeerId::from(b.local_key.public());
+        let claimant = PeerId::from(a.local_key.public());
         let mut assembled = WitnessedClaim {
             claimant,
             claim_type: ClaimType::ServiceAttestation,
@@ -8480,7 +8480,7 @@ mod two_swarm_witness_harness {
                 observed_heartbeats: 1,
                 signature: response.signature,
             }],
-            submitted_epoch: 0,
+            submitted_epoch: 2,  // must be > end_epoch (cannot claim the future)
             claim_id: [0u8; 32],
         };
         assembled.claim_id = assembled.compute_claim_id();

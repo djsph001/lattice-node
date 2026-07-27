@@ -3303,19 +3303,6 @@ impl LatticeNode {
                 }
             }
 
-            SwarmEvent::Behaviour(LatticeBehaviourEvent::Gossipsub(
-                gossipsub::Event::Subscribed { peer_id, topic },
-            )) => {
-                if topic.as_str() == LATTICE_GENESIS_TOPIC {
-                    debug!(peer = %peer_id, "peer subscribed to genesis topic — attempting re-gossip");
-                    self.re_gossip_genesis(&peer_id);
-                }
-            }
-
-            SwarmEvent::Behaviour(LatticeBehaviourEvent::Gossipsub(other)) => {
-                debug!(event = ?other, "unhandled gossipsub event");
-            }
-
             SwarmEvent::Behaviour(LatticeBehaviourEvent::Rpc(
                 request_response::Event::Message { peer, message },
             )) => {

@@ -538,6 +538,11 @@ impl StateStore for WalStateStore {
                                     );
                                 }
                             }
+                            crate::ledger::wal_record::WalRecord::Objection(_obj) => {
+                                // Pass 1: objections have no ordering constraint and
+                                // no side-effects during recovery.  They will be
+                                // stored and retrievable in later commits.
+                            }
                         }
                         unified_replayed += 1;
                     }

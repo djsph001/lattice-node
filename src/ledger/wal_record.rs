@@ -19,7 +19,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::claims::WitnessedClaim;
-use crate::ledger::types::{Genesis, SignedGenesis, SignedTransaction};
+use crate::ledger::types::{Genesis, Objection, SignedGenesis, SignedObjection, SignedTransaction};
 
 /// A durable protocol record — either a transaction or a claim.
 ///
@@ -42,6 +42,10 @@ pub enum WalRecord {
     /// network identity. Exactly one per network per node. Validation
     /// rules differ from transactions (root signer, uniqueness).
     Genesis(SignedGenesis) = 3,
+
+    /// A dispute against a WitnessedClaim.  Pass 1 records and gossips
+    /// without affecting the targeted claim — observation before action.
+    Objection(SignedObjection) = 4,
 }
 
 impl WalRecord {
@@ -51,6 +55,7 @@ impl WalRecord {
             WalRecord::Transaction(_) => "transaction",
             WalRecord::Claim(_) => "claim",
             WalRecord::Genesis(_) => "genesis",
+            WalRecord::Objection(_) => "objection",
         }
     }
 }
@@ -115,5 +120,82 @@ mod tests {
         let bytes = serde_cbor::to_vec(&WalRecord::Transaction(tx)).unwrap();
         // Verify the tag byte didn't shift when Genesis was added
         assert!(bytes.len() > 2, "serialized bytes too short");
+    }
+
+    #[test]
+    fn objection_round_trips_through_walrecord() {
+        let obj = SignedObjection {
+            objection: Objection {
+                target_claim_id: [0xAB; 32],
+                objector: "12D3KooWTest".to_string(),
+                reason: "no".to_string(),
+                timestamp: Utc::now(),
+            },
+            signer_public_key: vec![1, 2, 3],
+            signature: vec![4, 5, 6],
+        };
+        let rec = WalRecord::Objection(obj.clone());
+        let bytes = serde_cbor::to_vec(&rec).unwrap();
+        let back: WalRecord = serde_cbor::from_slice(&bytes).unwrap();
+        match back {
+            WalRecord::Objection(o) => assert_eq!(o.objection.reason, "no"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn objection_round_trips_with_tag_4() {
+        let obj = SignedObjection {
+            objection: Objection {
+                target_claim_id: [0xAB; 32],
+                objector: "12D3KooWTest".to_string(),
+                reason: "test".to_string(),
+                timestamp: Utc::now(),
+            },
+            signer_public_key: vec![1],
+            signature: vec![2],
+        };
+        let rec = WalRecord::Objection(obj);
+        let bytes = serde_cbor::to_vec(&rec).unwrap();
+        let back: WalRecord = serde_cbor::from_slice(&bytes).unwrap();
+        assert!(matches!(back, WalRecord::Objection(_)), "Objection round-trip failed");
+    }
+
+    #[test]
+    fn existing_variant_tags_still_unchanged_after_objection() {
+        use crate::ledger::types::Transaction;
+        // Verify Transaction round-trips correctly (content, not byte position)
+        let tx = SignedTransaction {
+            transaction: Transaction::Mint {
+                to: "12D3KooWTest".to_string(),
+                amount: crate::ledger::types::DigitalUtilityUnit(1000),
+                authority: "12D3KooWTest".to_string(),
+                nonce: 1,
+                timestamp: Utc::now(),
+            },
+            signer_public_key: vec![1],
+            signature: vec![2],
+        };
+        let rec = WalRecord::Transaction(tx.clone());
+        let bytes = serde_cbor::to_vec(&rec).unwrap();
+        let back: WalRecord = serde_cbor::from_slice(&bytes).unwrap();
+        assert!(matches!(back, WalRecord::Transaction(_)), "Transaction round-trip broken");
+
+        // Verify Claim round-trips correctly
+        use crate::claims::{ClaimEvidence, ClaimType, WitnessedClaim};
+        let claim = WitnessedClaim {
+            claim_id: [0xCD; 32],
+            claimant: libp2p::PeerId::random(),
+            claim_type: ClaimType::ServiceAttestation,
+            start_epoch: 1,
+            end_epoch: 10,
+            evidence: ClaimEvidence::Service { claimed_count: 0 },
+            witnesses: vec![],
+            submitted_epoch: 11,
+        };
+        let rec = WalRecord::Claim(claim);
+        let bytes = serde_cbor::to_vec(&rec).unwrap();
+        let back: WalRecord = serde_cbor::from_slice(&bytes).unwrap();
+        assert!(matches!(back, WalRecord::Claim(_)), "Claim round-trip broken");
     }
 }

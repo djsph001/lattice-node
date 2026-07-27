@@ -265,3 +265,35 @@ pub struct SignedGenesis {
     /// Ed25519 signature over `serde_cbor::to_vec(&genesis)`.
     pub signature: Vec<u8>,
 }
+
+// ── Objection types ────────────────────────────────────────
+
+/// An objection to a witnessed claim — "I dispute this claim of work
+/// performed." Pass 1 records and gossips without affecting the targeted
+/// claim. Signer eligibility is checked in validation (Commit 2), not
+/// enforced at the type level.
+///
+/// WARNING: field additions, removals, renames, or reordering change
+/// the CBOR signing bytes and invalidate signatures on all previously
+/// written Objection records. Treat any change as a protocol migration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Objection {
+    /// Content-derived claim ID of the WitnessedClaim being disputed.
+    pub target_claim_id: [u8; 32],
+    /// PeerId of the objecting peer (base58 string, matches Transaction
+    /// convention).
+    pub objector: String,
+    /// Human-readable reason.  Capped at 1024 bytes in validation.
+    pub reason: String,
+    /// Wall-clock timestamp, stamped by the objector.
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SignedObjection {
+    pub objection: Objection,
+    /// Protobuf-encoded Ed25519 public key bytes from the signer.
+    pub signer_public_key: Vec<u8>,
+    /// Ed25519 signature over `serde_cbor::to_vec(&objection)`.
+    pub signature: Vec<u8>,
+}

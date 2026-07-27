@@ -34,7 +34,12 @@ cargo build --release --bin lattice-node
 ```
 
 **Identity:** Both nodes use stable keys in `/tmp/m-ap-id/` and `/tmp/lw-id/`.
-Peer IDs persist across restarts.
+Peer IDs persist across restarts *but not across reboots* — `/tmp/` is tmpfs.
+If the identity dirs are lost, both nodes regenerate keys and the witness's
+`--genesis-root` must be updated to the root's new PeerId.
+
+For a longer-running mesh, move identity dirs to `~/.lattice/m-ap-id/` and
+`~/.lattice/lw-id/`.
 
 | Node | PeerId |
 |---|---|

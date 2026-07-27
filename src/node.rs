@@ -421,6 +421,9 @@ pub struct LatticeNode {
     /// PeerIds to which we have already sent genesis this session,
     /// preventing re-gossip amplification on reconnect storms.
     genesis_sent_to: HashSet<PeerId>,
+    /// PeerIds awaiting retry — re-gossip failed with InsufficientPeers
+    /// and will be retried on each metrics tick until the mesh forms.
+    pending_genesis_gossip: HashSet<PeerId>,
     /// Self-liquidation period for genesis thickness. None = permanent.
     genesis_amortize_over: Option<u64>,
     /// Automatically submit genesis on startup if the chain is empty.
@@ -761,6 +764,7 @@ impl LatticeNode {
             },
             genesis: None,  // populated during recovery or on first genesis accept
             genesis_sent_to: HashSet::new(),
+            pending_genesis_gossip: HashSet::new(),
             genesis_amortize_over,
             auto_genesis,
             genesis_thickness,
@@ -1841,6 +1845,7 @@ impl LatticeNode {
                             format!("{}={}", short, q.len())
                         })
                         .collect();
+                    self.drain_pending_genesis();
                     info!(
                         "metrics: outstanding_fetches={} aged={} outbound_queues=[{}] max_peer_silence={}s",
                         fetch_total,
@@ -3073,8 +3078,33 @@ impl LatticeNode {
             .gossipsub
             .publish(topic, raw)
         {
-            Ok(id) => debug!(message_id = %id, peer = %peer, "re_gossip_genesis: published successfully"),
+            Ok(id) => {
+                debug!(message_id = %id, peer = %peer, "re_gossip_genesis: published successfully");
+                // also remove from pending set if present
+                self.pending_genesis_gossip.remove(peer);
+            }
+            Err(ref e) if e.to_string().contains("InsufficientPeers") => {
+                debug!(peer = %peer, mesh_count, "re_gossip_genesis: InsufficientPeers — queueing retry");
+                self.pending_genesis_gossip.insert(*peer);
+            }
             Err(e) => warn!(error = %e, peer = %peer, mesh_count, "Failed to re-gossip genesis to peer"),
+        }
+    }
+
+    /// Drain the pending genesis gossip set — retry peers where
+    /// re-gossip failed with InsufficientPeers.  Called from the
+    /// metrics tick (~10s) so the mesh has time to form.
+    fn drain_pending_genesis(&mut self) {
+        if self.pending_genesis_gossip.is_empty() || self.genesis.is_none() {
+            return;
+        }
+        let peers: Vec<PeerId> = self.pending_genesis_gossip.drain().collect();
+        debug!(count = peers.len(), "drain_pending_genesis: retrying");
+        for peer in &peers {
+            // Re-insert into genesis_sent_to to avoid double-counting
+            // if re_gossip also adds to pending again
+            self.genesis_sent_to.remove(peer);
+            self.re_gossip_genesis(peer);
         }
     }
 
@@ -3271,6 +3301,19 @@ impl LatticeNode {
                 } else {
                     self.handle_gossip_message(&message.data, propagation_source, message.source);
                 }
+            }
+
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::Gossipsub(
+                gossipsub::Event::Subscribed { peer_id, topic },
+            )) => {
+                if topic.as_str() == LATTICE_GENESIS_TOPIC {
+                    debug!(peer = %peer_id, "peer subscribed to genesis topic — attempting re-gossip");
+                    self.re_gossip_genesis(&peer_id);
+                }
+            }
+
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::Gossipsub(other)) => {
+                debug!(event = ?other, "unhandled gossipsub event");
             }
 
             SwarmEvent::Behaviour(LatticeBehaviourEvent::Rpc(

@@ -21,6 +21,7 @@ use crate::agent::ModelSize;
 use crate::ledger::state::LedgerState;
 use crate::ledger::types::{DigitalUtilityUnit, SignedTransaction, Transaction};
 use crate::ledger::validation;
+use crate::ledger::validation::validate_objection;
 use crate::message::codec::rpc::{BalanceCodec, BalanceProtocol, LatticeCodec, LatticeProtocol};
 use crate::message::codec::rpc::{TransactionCodec, TransactionProtocol, VerifyProtocol};
 use crate::message::codec::rpc::{ChainSyncCodec, ChainSyncProtocol};
@@ -54,6 +55,11 @@ pub const LATTICE_TX_TOPIC: &str = "lattice/tx/v1";
 /// Gossipsub topic for network genesis propagation.
 /// Genesis is a one-per-network record that establishes the trust anchor.
 pub const LATTICE_GENESIS_TOPIC: &str = "/lattice/genesis/v1";
+
+/// Gossipsub topic for objection propagation.
+/// Objections are disputes against witnessed claims — any peer may
+/// submit, validate, and relay them.
+pub const LATTICE_OBJECTION_TOPIC: &str = "lattice/objection/v1";
 
 /// How long to wait for a fetch response before considering it failed.
 /// On a 3-node LAN mesh, round-trips are sub-second — 5s is generous.
@@ -424,6 +430,11 @@ pub struct LatticeNode {
     /// PeerIds awaiting retry — re-gossip failed with InsufficientPeers
     /// and will be retried on each metrics tick until the mesh forms.
     pending_genesis_gossip: HashSet<PeerId>,
+    /// Pending objections to re-gossip.  When publishing an objection
+    /// fails with InsufficientPeers, it's queued here and retried on
+    /// each metrics tick.  Capped at 256 entries; oldest evicted on
+    /// overflow.
+    pending_objection_gossip: Vec<crate::ledger::types::SignedObjection>,
     /// Self-liquidation period for genesis thickness. None = permanent.
     genesis_amortize_over: Option<u64>,
     /// Automatically submit genesis on startup if the chain is empty.
@@ -574,6 +585,12 @@ impl LatticeNode {
                 gossipsub
                     .subscribe(&genesis_topic)
                     .map_err(|e| anyhow::anyhow!("gossipsub genesis subscribe: {e}"))?;
+
+                // Subscribe to objection topic for claim dispute propagation.
+                let objection_topic = gossipsub::IdentTopic::new(LATTICE_OBJECTION_TOPIC);
+                gossipsub
+                    .subscribe(&objection_topic)
+                    .map_err(|e| anyhow::anyhow!("gossipsub objection subscribe: {e}"))?;
 
                 let rpc = request_response::Behaviour::new(
                     [(LatticeProtocol, request_response::ProtocolSupport::Full)],
@@ -765,6 +782,7 @@ impl LatticeNode {
             genesis: None,  // populated during recovery or on first genesis accept
             genesis_sent_to: HashSet::new(),
             pending_genesis_gossip: HashSet::new(),
+            pending_objection_gossip: Vec::new(),
             genesis_amortize_over,
             auto_genesis,
             genesis_thickness,
@@ -1846,6 +1864,7 @@ impl LatticeNode {
                         })
                         .collect();
                     self.drain_pending_genesis();
+                    self.drain_pending_objections();
                     info!(
                         "metrics: outstanding_fetches={} aged={} outbound_queues=[{}] max_peer_silence={}s",
                         fetch_total,
@@ -3172,6 +3191,110 @@ impl LatticeNode {
             }
         }
     }
+
+    /// Handle an incoming objection message from gossipsub.
+    ///
+    /// Ordering: deserialize → validate → duplicate check → cap check
+    /// → persist → insert into in-memory map.  Persist-before-insert
+    /// so memory never advances past what's durable (3b0ef18).
+    fn handle_objection_message(&mut self, raw: &[u8]) {
+        const OBJECTION_CAP: usize = 64;
+
+        let signed: crate::ledger::types::SignedObjection =
+            match serde_cbor::from_slice(raw) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "Failed to decode objection from gossipsub");
+                    return;
+                }
+            };
+
+        let claim_id = signed.objection.target_claim_id;
+        let objector = &signed.objection.objector;
+
+        // Validate the objection (Commit 2).
+        if let Err(e) = validate_objection(
+            &signed,
+            |_cid| true,  // FIXME(commit-5): claim-existence deferred
+            |_cid, _obj| false,  // FIXME(commit-5): duplicate check deferred
+        ) {
+            warn!(
+                claim_id = ?claim_id,
+                objector = %objector,
+                error = %e,
+                "Objection validation failed — rejected"
+            );
+            return;
+        }
+
+        // validate → persist → insert
+        if let Some(ref mut store) = self.state_store {
+            if let Err(e) = store.persist_record(
+                &crate::ledger::wal_record::WalRecord::Objection(signed.clone()),
+            ) {
+                error!(error = %e, "Failed to persist objection");
+                return;
+            }
+        }
+
+        // FIXME(commit-5): insert_objection into in-memory map.
+        // FIXME(commit-5): cap check (64 distinct objectors per claim).
+        // FIXME(commit-5): duplicate check (same objector = no-op).
+
+        info!(
+            claim_id = ?claim_id,
+            objector = %objector,
+            reason = %signed.objection.reason,
+            "Objection accepted and persisted"
+        );
+
+        // Re-publish to the mesh for propagation.
+        self.publish_objection(&signed);
+    }
+
+    /// Publish an objection to all gossipsub peers.  On InsufficientPeers,
+    /// queue for retry on the next metrics tick.
+    fn publish_objection(&mut self, signed: &crate::ledger::types::SignedObjection) {
+        let topic = gossipsub::IdentTopic::new(LATTICE_OBJECTION_TOPIC);
+        let payload = match serde_cbor::to_vec(signed) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "Failed to serialize objection for gossip");
+                return;
+            }
+        };
+
+        match self.swarm.behaviour_mut().gossipsub.publish(topic, payload) {
+            Ok(id) => {
+                debug!(message_id = %id, "Objection published to mesh");
+            }
+            Err(gossipsub::PublishError::InsufficientPeers) => {
+                if self.pending_objection_gossip.len() >= 256 {
+                    self.pending_objection_gossip.remove(0);
+                }
+                self.pending_objection_gossip.push(signed.clone());
+                debug!("Objection queued for retry — InsufficientPeers");
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to publish objection");
+            }
+        }
+    }
+
+    /// Drain the pending objection gossip queue — retry publishing
+    /// objections that failed with InsufficientPeers.  Called on
+    /// each metrics tick.
+    fn drain_pending_objections(&mut self) {
+        if self.pending_objection_gossip.is_empty() {
+            return;
+        }
+        let pending: Vec<_> = self.pending_objection_gossip.drain(..).collect();
+        debug!(count = pending.len(), "Retrying pending objection gossip");
+        for obj in &pending {
+            self.publish_objection(obj);
+        }
+    }
+
     fn send_balance_query(&mut self, query_peer: PeerId, target: PeerId) {
         self.query_nonce += 1;
         self.economic_engine.metrics.record_query_issued();
@@ -3306,6 +3429,8 @@ impl LatticeNode {
                     self.handle_block_message(&message.data, &propagation_source);
                 } else if topic == LATTICE_GENESIS_TOPIC {
                     self.handle_genesis_message(&message.data);
+                } else if topic == LATTICE_OBJECTION_TOPIC {
+                    self.handle_objection_message(&message.data);
                 } else {
                     self.handle_gossip_message(&message.data, propagation_source, message.source);
                 }

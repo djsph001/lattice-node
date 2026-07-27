@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
 use super::thickness::ThicknessGraph;
-use super::types::{DigitalUtilityUnit, SignedTransaction};
+use super::types::{DigitalUtilityUnit, SignedObjection, SignedTransaction};
 
 // ── Persistent state (serializable) ──────────────────────────────
 
@@ -49,6 +49,13 @@ pub struct PersistentEconomicState {
     /// overlap checks once a claim is superseded.
     #[serde(default)]
     pub accepted_claims: Vec<StoredClaim>,
+    /// Objections to witnessed claims, keyed by target claim ID.
+    /// Each entry holds the objections from distinct peers — duplicate
+    /// submissions from the same objector are collapsed on insert.
+    /// The per-claim Vec is bounded by a cap enforced at the receive
+    /// boundary (not here); recovery replay is uncapped (trust-and-apply).
+    #[serde(default)]
+    pub objections: HashMap<[u8; 32], Vec<SignedObjection>>,
     /// The network genesis record, if one has been persisted.  `None` means
     /// pre-genesis state (node has not yet accepted a genesis).
     #[serde(default)]
@@ -63,6 +70,7 @@ impl PersistentEconomicState {
             thickness_edges: HashMap::new(),
             self_tx_nonce: 0,
             accepted_claims: Vec::new(),
+            objections: HashMap::new(),
             genesis: None,
         }
     }
@@ -88,6 +96,7 @@ impl PersistentEconomicState {
                 .collect(),
             self_tx_nonce,
             accepted_claims: accepted_claims.to_vec(),
+            objections: HashMap::new(),
             genesis: None,
         }
     }
@@ -117,6 +126,26 @@ impl PersistentEconomicState {
                 k.parse::<PeerId>().ok().map(|pid| (pid, *v))
             })
             .collect()
+    }
+
+    /// Insert an objection into the in-memory store, deduplicating by
+    /// objector within the target claim's entry.  Returns true if the
+    /// objection was new (added), false if it was a duplicate (no-op).
+    ///
+    /// This is pure structure manipulation — no cap enforcement, no
+    /// validation.  The cap is enforced at the receive boundary
+    /// (Commit 4's gossip handler).  Recovery replay calls this
+    /// uncapped (trust-and-apply), so it must never fail.
+    pub fn insert_objection(&mut self, signed: SignedObjection) -> bool {
+        let claim_id = signed.objection.target_claim_id;
+        let objector = &signed.objection.objector;
+        let entry = self.objections.entry(claim_id).or_default();
+        // Dedup: one objection per peer per claim
+        if entry.iter().any(|o| &o.objection.objector == objector) {
+            return false;
+        }
+        entry.push(signed);
+        true
     }
 }
 
@@ -538,10 +567,18 @@ impl StateStore for WalStateStore {
                                     );
                                 }
                             }
-                            crate::ledger::wal_record::WalRecord::Objection(_obj) => {
-                                // Pass 1: objections have no ordering constraint and
-                                // no side-effects during recovery.  They will be
-                                // stored and retrievable in later commits.
+                            crate::ledger::wal_record::WalRecord::Objection(o) => {
+                                // Trust-and-apply: objections are replayed
+                                // without re-validation, same discipline as
+                                // transactions.  No ordering constraint — an
+                                // objection can precede its target claim in
+                                // the WAL and replay will still accept it
+                                // because the insert is pure structure
+                                // manipulation with no existence check.
+                                // Replay is uncapped; the per-claim cap is
+                                // enforced at the receive boundary
+                                // (Commit 4's gossip handler).
+                                state.insert_objection(o);
                             }
                         }
                         unified_replayed += 1;
@@ -1051,5 +1088,379 @@ mod tests {
             "verify_consistency() failed on valid snapshot+WAL — \
              Fix 5 asserts healthy state as well as detecting corruption."
         );
+    }
+
+    // ── Objection recovery tests ───────────────────────────
+
+    fn make_objection_signed(
+        kp: &identity::Keypair,
+        claim_id: [u8; 32],
+        reason: &str,
+    ) -> SignedObjection {
+        use crate::ledger::types::Objection;
+        let peer = libp2p::PeerId::from(kp.public()).to_base58();
+        let obj = Objection {
+            target_claim_id: claim_id,
+            objector: peer,
+            reason: reason.into(),
+            timestamp: Utc::now(),
+        };
+        let bytes = serde_cbor::to_vec(&obj).unwrap();
+        let sig = kp.sign(&bytes).unwrap();
+        SignedObjection {
+            objection: obj,
+            signer_public_key: kp.public().encode_protobuf(),
+            signature: sig,
+        }
+    }
+
+    /// Test 1: Claim then objection — both recovered, objection retrievable
+    /// by claim ID.
+    #[test]
+    fn objection_recovery_claim_then_objection() {
+        let dir = tempdir().unwrap();
+        let cfg = WalStateStoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync_batch_size: 100,
+            fsync_interval: Duration::from_secs(60),
+        };
+        let mut store = WalStateStore::new(cfg).unwrap();
+
+        let kp = make_keypair();
+        let claim_id = [0xAB; 32];
+        let obj_kp = identity::Keypair::generate_ed25519();
+
+        // Persist a claim, then an objection against it — both via
+        // unified WAL (needs genesis to pass ordering gate).
+        let genesis = crate::ledger::types::Genesis {
+            network_name: "test-net".into(),
+            root: kp.public().to_peer_id().to_string(),
+            timestamp: Utc::now(),
+        };
+        let genesis_bytes = serde_cbor::to_vec(&genesis).unwrap();
+        let genesis_sig = kp.sign(&genesis_bytes).unwrap();
+        let sg = crate::ledger::types::SignedGenesis {
+            genesis: genesis.clone(),
+            signer_public_key: kp.public().encode_protobuf(),
+            signature: genesis_sig,
+        };
+        store
+            .persist_record(&crate::ledger::wal_record::WalRecord::Genesis(sg))
+            .unwrap();
+
+        let claim = crate::claims::WitnessedClaim {
+            claim_id,
+            claimant: libp2p::PeerId::random(),
+            claim_type: crate::claims::ClaimType::ServiceAttestation,
+            start_epoch: 0,
+            end_epoch: 100,
+            evidence: crate::claims::ClaimEvidence::Service { claimed_count: 1 },
+            witnesses: vec![],
+            submitted_epoch: 50,
+        };
+        store
+            .persist_record(&crate::ledger::wal_record::WalRecord::Claim(
+                claim.clone(),
+            ))
+            .unwrap();
+
+        let signed_obj = make_objection_signed(&obj_kp, claim_id, "disagree");
+        store
+            .persist_record(&crate::ledger::wal_record::WalRecord::Objection(
+                signed_obj.clone(),
+            ))
+            .unwrap();
+
+        store.flush_wal().unwrap();
+        let cfg2 = WalStateStoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync_batch_size: 100,
+            fsync_interval: Duration::from_secs(60),
+        };
+        let mut store2 = WalStateStore::new(cfg2).unwrap();
+        let recovered = store2.recover().unwrap();
+
+        // Objection retrievable by claim ID
+        let objections = recovered.objections.get(&claim_id);
+        assert!(
+            objections.is_some(),
+            "objection must be recoverable by target claim ID"
+        );
+        let objs = objections.unwrap();
+        assert_eq!(objs.len(), 1);
+        assert_eq!(
+            objs[0].objection.objector,
+            signed_obj.objection.objector
+        );
+        assert_eq!(objs[0].objection.reason, "disagree");
+    }
+
+    /// Test 2: Objection whose target claim isn't in the WAL — recovered
+    /// anyway (trust-and-apply, no target-existence check on replay).
+    #[test]
+    fn objection_recovery_target_not_in_wal() {
+        let dir = tempdir().unwrap();
+        let cfg = WalStateStoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync_batch_size: 100,
+            fsync_interval: Duration::from_secs(60),
+        };
+        let mut store = WalStateStore::new(cfg).unwrap();
+
+        let kp = make_keypair();
+        let claim_id = [0xCD; 32];
+        let obj_kp = identity::Keypair::generate_ed25519();
+
+        // Genesis needed to pass the ordering gate
+        let genesis = crate::ledger::types::Genesis {
+            network_name: "test-net".into(),
+            root: kp.public().to_peer_id().to_string(),
+            timestamp: Utc::now(),
+        };
+        let genesis_bytes = serde_cbor::to_vec(&genesis).unwrap();
+        let genesis_sig = kp.sign(&genesis_bytes).unwrap();
+        store
+            .persist_record(&crate::ledger::wal_record::WalRecord::Genesis(
+                crate::ledger::types::SignedGenesis {
+                    genesis,
+                    signer_public_key: kp.public().encode_protobuf(),
+                    signature: genesis_sig,
+                },
+            ))
+            .unwrap();
+
+        // Objection with no matching claim in the WAL
+        let signed_obj = make_objection_signed(&obj_kp, claim_id, "no target here");
+        store
+            .persist_record(&crate::ledger::wal_record::WalRecord::Objection(
+                signed_obj.clone(),
+            ))
+            .unwrap();
+
+        store.flush_wal().unwrap();
+        let cfg2 = WalStateStoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync_batch_size: 100,
+            fsync_interval: Duration::from_secs(60),
+        };
+        let mut store2 = WalStateStore::new(cfg2).unwrap();
+        let recovered = store2.recover().unwrap();
+
+        // Trust-and-apply: objection recovered even though target
+        // claim isn't in the WAL
+        let objs = recovered.objections.get(&claim_id);
+        assert!(
+            objs.is_some(),
+            "trust-and-apply: objection must be recovered even when \
+             target claim is absent from WAL"
+        );
+        assert_eq!(objs.unwrap().len(), 1);
+    }
+
+    /// Test 3: Multiple objections against the same claim from different
+    /// objectors — all stored under one key.
+    #[test]
+    fn objection_recovery_multiple_objectors_same_claim() {
+        let dir = tempdir().unwrap();
+        let cfg = WalStateStoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync_batch_size: 100,
+            fsync_interval: Duration::from_secs(60),
+        };
+        let mut store = WalStateStore::new(cfg).unwrap();
+
+        let kp = make_keypair();
+        let claim_id = [0xEF; 32];
+        let obj_kp1 = identity::Keypair::generate_ed25519();
+        let obj_kp2 = identity::Keypair::generate_ed25519();
+        let obj_kp3 = identity::Keypair::generate_ed25519();
+
+        // Genesis
+        let genesis = crate::ledger::types::Genesis {
+            network_name: "test-net".into(),
+            root: kp.public().to_peer_id().to_string(),
+            timestamp: Utc::now(),
+        };
+        let genesis_bytes = serde_cbor::to_vec(&genesis).unwrap();
+        let genesis_sig = kp.sign(&genesis_bytes).unwrap();
+        store
+            .persist_record(&crate::ledger::wal_record::WalRecord::Genesis(
+                crate::ledger::types::SignedGenesis {
+                    genesis,
+                    signer_public_key: kp.public().encode_protobuf(),
+                    signature: genesis_sig,
+                },
+            ))
+            .unwrap();
+
+        // Three different objectors against the same claim
+        let obj1 = make_objection_signed(&obj_kp1, claim_id, "reason a");
+        let obj2 = make_objection_signed(&obj_kp2, claim_id, "reason b");
+        let obj3 = make_objection_signed(&obj_kp3, claim_id, "reason c");
+
+        store
+            .persist_record(&crate::ledger::wal_record::WalRecord::Objection(obj1.clone()))
+            .unwrap();
+        store
+            .persist_record(&crate::ledger::wal_record::WalRecord::Objection(obj2.clone()))
+            .unwrap();
+        store
+            .persist_record(&crate::ledger::wal_record::WalRecord::Objection(obj3.clone()))
+            .unwrap();
+
+        store.flush_wal().unwrap();
+        let cfg2 = WalStateStoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync_batch_size: 100,
+            fsync_interval: Duration::from_secs(60),
+        };
+        let mut store2 = WalStateStore::new(cfg2).unwrap();
+        let recovered = store2.recover().unwrap();
+
+        let objs = recovered.objections.get(&claim_id).unwrap();
+        assert_eq!(objs.len(), 3, "all three objectors stored under one key");
+        let objectors: Vec<&str> = objs.iter().map(|o| o.objection.objector.as_str()).collect();
+        assert!(objectors.contains(&obj1.objection.objector.as_str()));
+        assert!(objectors.contains(&obj2.objection.objector.as_str()));
+        assert!(objectors.contains(&obj3.objection.objector.as_str()));
+    }
+
+    /// Test 4: Same objector submits twice against the same claim —
+    /// second is a no-op (dedup by objector, not reason).
+    #[test]
+    fn objection_recovery_duplicate_same_objector() {
+        let dir = tempdir().unwrap();
+        let cfg = WalStateStoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync_batch_size: 100,
+            fsync_interval: Duration::from_secs(60),
+        };
+        let mut store = WalStateStore::new(cfg).unwrap();
+
+        let kp = make_keypair();
+        let claim_id = [0x11; 32];
+        let obj_kp = identity::Keypair::generate_ed25519();
+
+        // Genesis
+        let genesis = crate::ledger::types::Genesis {
+            network_name: "test-net".into(),
+            root: kp.public().to_peer_id().to_string(),
+            timestamp: Utc::now(),
+        };
+        let genesis_bytes = serde_cbor::to_vec(&genesis).unwrap();
+        let genesis_sig = kp.sign(&genesis_bytes).unwrap();
+        store
+            .persist_record(&crate::ledger::wal_record::WalRecord::Genesis(
+                crate::ledger::types::SignedGenesis {
+                    genesis,
+                    signer_public_key: kp.public().encode_protobuf(),
+                    signature: genesis_sig,
+                },
+            ))
+            .unwrap();
+
+        // Same objector, two different reasons — dedup by objector
+        // means only one is stored
+        let obj1 = make_objection_signed(&obj_kp, claim_id, "first reason");
+        let obj2 = make_objection_signed(&obj_kp, claim_id, "second reason");
+
+        store
+            .persist_record(&crate::ledger::wal_record::WalRecord::Objection(obj1))
+            .unwrap();
+        store
+            .persist_record(&crate::ledger::wal_record::WalRecord::Objection(obj2))
+            .unwrap();
+
+        store.flush_wal().unwrap();
+        let cfg2 = WalStateStoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync_batch_size: 100,
+            fsync_interval: Duration::from_secs(60),
+        };
+        let mut store2 = WalStateStore::new(cfg2).unwrap();
+        let recovered = store2.recover().unwrap();
+
+        let objs = recovered.objections.get(&claim_id).unwrap();
+        assert_eq!(
+            objs.len(),
+            1,
+            "dedup by objector: both entries have same objector, only one stored"
+        );
+    }
+
+    /// Test 5: Objection before its target claim in the WAL —
+    /// both recovered (trust-and-apply, no ordering constraint).
+    #[test]
+    fn objection_recovery_objection_before_claim() {
+        let dir = tempdir().unwrap();
+        let cfg = WalStateStoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync_batch_size: 100,
+            fsync_interval: Duration::from_secs(60),
+        };
+        let mut store = WalStateStore::new(cfg).unwrap();
+
+        let kp = make_keypair();
+        let claim_id = [0x22; 32];
+        let obj_kp = identity::Keypair::generate_ed25519();
+
+        // Genesis
+        let genesis = crate::ledger::types::Genesis {
+            network_name: "test-net".into(),
+            root: kp.public().to_peer_id().to_string(),
+            timestamp: Utc::now(),
+        };
+        let genesis_bytes = serde_cbor::to_vec(&genesis).unwrap();
+        let genesis_sig = kp.sign(&genesis_bytes).unwrap();
+        store
+            .persist_record(&crate::ledger::wal_record::WalRecord::Genesis(
+                crate::ledger::types::SignedGenesis {
+                    genesis,
+                    signer_public_key: kp.public().encode_protobuf(),
+                    signature: genesis_sig,
+                },
+            ))
+            .unwrap();
+
+        // Objection FIRST, then claim (reverse of Test 1)
+        let signed_obj = make_objection_signed(&obj_kp, claim_id, "early objection");
+        store
+            .persist_record(&crate::ledger::wal_record::WalRecord::Objection(
+                signed_obj.clone(),
+            ))
+            .unwrap();
+
+        let claim = crate::claims::WitnessedClaim {
+            claim_id,
+            claimant: libp2p::PeerId::random(),
+            claim_type: crate::claims::ClaimType::ServiceAttestation,
+            start_epoch: 0,
+            end_epoch: 100,
+            evidence: crate::claims::ClaimEvidence::Service { claimed_count: 1 },
+            witnesses: vec![],
+            submitted_epoch: 50,
+        };
+        store
+            .persist_record(&crate::ledger::wal_record::WalRecord::Claim(claim))
+            .unwrap();
+
+        store.flush_wal().unwrap();
+        let cfg2 = WalStateStoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync_batch_size: 100,
+            fsync_interval: Duration::from_secs(60),
+        };
+        let mut store2 = WalStateStore::new(cfg2).unwrap();
+        let recovered = store2.recover().unwrap();
+
+        // Both recovered: objection (before claim in WAL) + claim
+        let objs = recovered.objections.get(&claim_id);
+        assert!(
+            objs.is_some(),
+            "trust-and-apply: objection recovered even when it precedes \
+             its target claim in WAL order"
+        );
+        assert_eq!(objs.unwrap().len(), 1);
+        assert!(recovered.accepted_claims.len() >= 1, "claim also recovered");
     }
 }

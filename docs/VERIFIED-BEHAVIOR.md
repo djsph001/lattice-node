@@ -1,115 +1,142 @@
 # Verified Protocol Behavior
 
 **Updated:** 2026-07-27
-**Authority:** Every entry sourced to a test run, harness execution, or live
-node observation. No claims without evidence.
+**Authority:** Every entry sourced to an observation on real nodes or a
+specific test run. No claims without evidence.
 
-This document records what's been demonstrated to work end-to-end. It is not
-a design doc, not a roadmap, and not aspirational. If it's here, it was
-executed on real nodes and produced the expected result.
-
----
-
-## Genesis Lifecycle (Closed)
-
-Full sequence verified on a two-node local mesh with snapshot rotation.
-
-| Step | Produces |
-|---|---|
-| `--auto-genesis` | `SignedGenesis` persisted to WAL |
-| `submit_genesis` | Published to `/lattice/genesis/v1` |
-| Receive + validate | Root signer check, duplicate rejection |
-| `handle_genesis_message` | Accept + persist on witness node |
-| Recovery on restart | Genesis recovered from snapshot or WAL re-seed |
-| Snapshot at epoch 10 | WAL rotated, fresh WAL seeded with Genesis |
-| Restart after rotation | Genesis survives, `verify_consistency` passes |
-
-**Known issues resolved:**
-- `from_state()` dropped genesis on snapshot (ae89fbd)
-- Same defect latent in objections field — would have activated at Commit 4
-- Post-rotation WAL couldn't identify its network — no Genesis record
-- `verify_consistency` would have failed the moment genesis survived anywhere
-
-**Propagation:**
-- `InsufficientPeers` timing: `re_gossip_genesis` fired on
-  `ConnectionEstablished` before gossipsub mesh had peers. Fixed at 0fbba1e
-  with `pending_genesis_gossip` set drained on each metrics tick.
+Tiers distinguish between "seen working on a live mesh," "proven by unit
+test only," and "shipped, never exercised." Conflating them is how
+"verified" degrades into "we wrote a test."
 
 ---
 
-## Objection Pipeline Pass 1 (Closed)
+## Verified End-to-End on Running Nodes
 
-Five commits (6ec9470 through e7d9e1e), verified on real nodes.
+### Genesis Lifecycle
 
-| Operation | Result |
-|---|---|
-| WAL + recovery round-trip | 5 tests, all green |
-| Validation (bad signature, empty reason, duplicate) | 10 tests |
-| Submit via UDS (`SubmitObjection`) | `ObjectionSubmitted` |
-| Query (`GetObjections`, `GetAllObjections`) | Returns correct payload |
-| Duplicate submit | `Error: Duplicate` — dedup works |
-| Restart recovery | Objection survives |
-| Cap at 64 distinct objectors | 64th accepted, 65th rejected |
-| Duplicate after cap reached | No-op, not cap rejection (dedup before cap) |
+Full sequence: author → persist → gossip → receive → validate → persist
+on peer → snapshot at epoch 10 → WAL rotation → Genesis re-seed → restart
+→ recovered.
 
-**Architecture:**
-- Gossip topic: `lattice/objection/v1`
-- Storage: `HashMap<[u8; 32], Vec<SignedObjection>>` keyed by claim ID
-- Cap: 64 distinct objectors per claim, enforced at receive boundary
-- Dedup: one objection per objector per claim
-- Recovery: trust-and-apply, no re-validation on replay
-- Submit + receive share `process_objection` — one code path
+**What was observed (Jul 27, ae89fbd):**
+- `morning-api` with `--auto-genesis` writes `SignedGenesis` to unified WAL
+- `Genesis committed — era one begins` in startup log
+- `local-witness` receives genesis via gossip, validates, persists
+- At epoch 10: `Snapshot saved epoch=10`, fresh `wal.log` is 806 bytes
+  (Genesis re-seed before any transactions)
+- After kill-9: `Genesis recovered from WAL`, `verify_consistency passed`
+- Build: `ae89fbd`, verified via `GetNodeInfo.build_commit`
 
-**Known-provisional:**
-- `GetAllObjections` unbounded — needs pagination before real deployment
-- No per-claim cap on total objections across all claims (only per-claim
-  distinct-objector cap)
+**Propagation (0fbba1e):** Initial `re_gossip_genesis` fired on
+`ConnectionEstablished` before gossipsub mesh had peers on
+`/lattice/genesis/v1`. Fixed by retrying on `InsufficientPeers` via
+`pending_genesis_gossip` set drained on each metrics tick (~10s).
+Harness at `~/genesis-propagation-test.sh` exercises this on isolated
+ports 4105/4110.
 
----
+### Objection Pipeline Pass 1
 
-## Persistence
+Full sequence: submit via UDS → sign locally → validate → dedup → cap →
+persist → gossip → recover on restart.
 
-| Item | Status |
-|---|---|
-| Unified WAL (`wal.log`, `WalRecord` enum) | Live on both nodes |
-| Snapshot rotation + WAL self-sufficiency | Verified (ae89fbd) |
-| Genesis survives snapshot rotation | Verified |
-| Objections survive snapshot + restart | Verified |
-| `verify_consistency` passes after rotation | Verified |
-| `build_commit` tracks HEAD, reports `-dirty` | Fixed (6c29f97) |
-
-**Known-provisional:**
-- `wal.wal.old` naming quirk — cosmetic, not functional
+**What was observed (Jul 27, e7d9e1e):**
+- `SubmitObjection { target_claim_id, reason }` → `ObjectionSubmitted`
+- `GetAllObjections` → returns correct objector/reason/timestamp
+- Same submission repeated → `Error: Duplicate { claim_id, objector }`
+- Kill-9 + restart → objection recovered and queryable
+- Build: `ae89fbd` (hash lag, no code changes between ae89fbd and e7d9e1e
+  in the persistence path)
 
 ---
 
-## Test Suite
+## Verified by Test Only (Never Exercised on a Live Mesh)
 
-| Target | Status |
-|---|---|
-| `cargo test --lib` | All pass |
-| `cargo test --bin lattice-node` | 255/255 pass (fixed Jul 27) |
+### Objection Cap Enforcement
 
-**Binary target was dark:** Two compilation errors in `two_swarm_witness_harness`
-(`claimant` variable undefined after `fe33971` added `claim_id` to
-`WitnessedClaim`) prevented the entire binary target from compiling. Four tests
-had fixtures written against already-existing validation rules and never passed
-since their commit. Fixed Jul 27. First time the witness protocol and two-swarm
-path have working test coverage.
+Three unit tests in `persistence.rs` (b4aa212):
+
+- `cap_accepts_64th_distinct_objector` — 64 distinct objectors, 64th accepted
+- `cap_rejects_65th_distinct_objector` — 65 distinct objectors, 65th rejected
+- `cap_duplicate_after_full_is_noop_not_rejection` — duplicate from existing
+  objector after cap reached is a no-op, not a cap rejection
+
+The cap logic (inside `process_objection`) operates on the in-memory
+`HashMap` the same way regardless of source — receive via gossip or submit
+via UDS. The map operations are identical. But the receive boundary was never
+exercised with 64 distinct objectors on a running mesh.
+
+### Objection Validation
+
+10 tests in `validation.rs` (6ec9470): bad signature, duplicate
+same-claim-same-objector, different-objector-same-claim OK, empty reason,
+future timestamp, reason over 1024 bytes, missing public key, missing
+signature.
+
+### Witness Protocol + Two-Swarm Harness
+
+4 tests in `two_swarm_witness_harness` and `witness_seam_tests` (fixed Jul 27,
+32efcf1): two-swarm witness round-trip, orchestrate and accept service claim,
+witness response to acceptance, witness response with decline rejected.
+
+These tests had never passed since their commit — fixtures were written with
+`submitted_epoch=0` against a validation rule (`submitted_epoch > end_epoch`)
+that predated the tests. Found and fixed when the binary test target was
+restored (214eb73).
 
 ---
 
-## Widget
+## Implemented, Unverified
 
-- **Status:** Down. Netlify Blobs read failing with `BlobsInternalError: Failed
-  to decode token: Token expired`.
-- **Pusher:** Multiple stale processes (Jul 27). Auth via `x-mesh-secret` header
-  (Authorization is stripped by Netlify on function paths).
-- No production impact — the widget is a monitoring convenience.
+This is the bucket that matters when someone asks "what's safe to rely on."
+
+- **Objection cap at 64 on a live receive boundary.** Unit tests cover the
+  map operations; no test exercises the gossip handler receiving objection
+  #65 from a real peer.
+- **Objection propagation.** The `publish_objection` call executes after
+  `process_objection`, but no test verified that a second node receives
+  an objection submitted via UDS on the first.
+- **GetAllObjections at scale.** Unbounded; returns everything. Not tested
+  with >64 entries or across claims.
+- **Observer-mode genesis Sybil surface.** An observer node can publish
+  a different genesis with the same root signer (acceptance was
+  unimplemented as of Commit 5). Not a current threat on a two-node
+  trusted mesh; would matter on an open mesh.
 
 ---
 
-## Harness
+## Known-Provisional
 
-`~/genesis-propagation-test.sh` — isolated two-node mesh, ports 4105/4110,
-separate from production. Run: `bash ~/genesis-propagation-test.sh` (~65s).
+Items known to be incomplete or suboptimal, documented so future work
+doesn't rediscover them.
+
+| Item | Category | When |
+|---|---|---|
+| `wal.wal.old` naming (should be `wal.log.old`) | Cosmetic | ae89fbd |
+| `GetAllObjections` unbounded — needs pagination | Scale | e7d9e1e |
+| No per-claim cap on total objections archive | Scale | 6ec9470 |
+| Widget down — Netlify blobs read failing | Infra | Jul 27 |
+| `build_commit` lags if no proto changes | Fixed | 6c29f97 |
+
+---
+
+## The Pattern That Found the Bugs
+
+Jul 27 started as "verify the objection cap" and uncovered four production
+defects, a broken diagnostic, and a dark test target. None were on any board
+at the start. Every one surfaced by refusing a plausible explanation.
+
+| What was said | What it was | How it was found |
+|---|---|---|
+| "Pre-existing test failure, unrelated" | `populated_wal_recovery_with_snapshot` was a real bug — genesis lost at every snapshot rotation | ae89fbd |
+| "Production is fine, enable_persistence carries genesis" | `from_state()` hardcoded `genesis: None` | ae89fbd |
+| "Silently dead code, pre-existing" | `two_swarm_witness_harness` wasn't gated — compilation errors killed the entire binary test target since fe33971 | 214eb73 |
+| "Build hash lags, known issue" | `build_commit` hadn't updated since 294da2c — the running binary was genuinely stale, and the fix caught it | 6c29f97 |
+
+The reflex that kept finding them: checking whether the verification
+mechanism itself ran. A harness script that executes on a pre-fix binary
+proves nothing. A test count reported against a target that doesn't compile
+proves nothing. A diagnostic that hasn't fired since the last proto change
+proves nothing.
+
+A future contributor reading this before their own first "pre-existing
+failure, unrelated" is the useful artifact.

@@ -8131,6 +8131,7 @@ mod two_swarm_witness_harness {
         assert_eq!(response.claim_hash, claim_hash);
 
         // ── Assertion 2: Acceptance integration ─────────────
+        let claimant = PeerId::from(a.local_key.public());
         let mut assembled = WitnessedClaim {
             claimant,
             claim_type: ClaimType::ServiceAttestation,
@@ -8466,6 +8467,7 @@ mod two_swarm_witness_harness {
         assert!(response.decline_reason.is_none());
 
         // Assemble the WitnessedClaim (same as finalize_claim)
+        let claimant = PeerId::from(b.local_key.public());
         let mut assembled = WitnessedClaim {
             claimant,
             claim_type: ClaimType::ServiceAttestation,

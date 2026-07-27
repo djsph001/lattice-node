@@ -1,6 +1,6 @@
 # Lattice Mesh — Topology Registry
 
-**Updated:** 2026-07-26
+**Updated:** 2026-07-27
 **Authority:** Every entry sourced to a log line, socket query, config file, or
 ongoing process. Unknown fields are explicit.
 **Discipline:** Update this file every time a process launches, dies, moves, or
@@ -88,6 +88,19 @@ this discipline prevents.
   (`transactions.wal`, `claims.wal`) collapsed into one unified `wal.log` with
   `WalRecord` enum (Transaction=1, Claim=2). Migration completed via two-cycle
   rotation across both nodes. See `docs/architecture/persistence-design.md`.
+- **2026-07-27: Genesis lifecycle.** `WalRecord::Genesis` (tag 0x03) added as
+  a distinct variant with its own validation rules (root signer, exactly-once,
+  network_name). Five commits: type definitions → validation logic → CLI/config
+  plumbing → recovery integration → gossip handler. Propagation failed initially
+  because `re_gossip_genesis` fired on `ConnectionEstablished` before gossipsub
+  mesh had peers on `/lattice/genesis/v1`. Fixed by retrying on
+  `InsufficientPeers` via a `pending_genesis_gossip` set drained on each
+  metrics tick (~10s). Full lifecycle confirmed: author → persist → gossip →
+  receive → validate → persist on witness → recovery on restart.
+  See `docs/architecture/genesis-gossip-design.md`.
+  **Propagation test harness:** `~/genesis-propagation-test.sh` — isolated
+  two-node mesh on ports 4105/4110, separate from production, reproducible.
+  Run: `bash ~/genesis-propagation-test.sh` (~65s).
 - **2026-07-22: mDNS policy.** Dev nodes run with mDNS disabled and explicit
   bootstrap lists. A node that appears without configuration should be shown as
   intruder, not neighbor.

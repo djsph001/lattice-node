@@ -1,11 +1,11 @@
 # Lattice Mesh — Topology Registry
 
 **Updated:** 2026-07-27
-**Authority:** Every entry sourced to a log line, socket query, config file, or
-ongoing process. Unknown fields are explicit.
-**Discipline:** Update this file every time a process launches, dies, moves, or
-changes identity. A topology change not recorded here is a
-phantom-report-class error.
+**Authority:** Every entry describes the intended configuration — node names,
+ports, storage dirs, identity keys, and launch flags. Live state lives in
+`ps aux`, the dashboard, and logs.
+**Discipline:** Update this file when the configuration changes. A topology
+change not recorded here is a phantom-report-class error.
 
 ---
 
@@ -37,8 +37,8 @@ cargo build --release --bin lattice-node
 Peer IDs persist across restarts. Derive them from startup:
 `grep "Node identity" <log>`.
 
-**Build:** Currently at HEAD (on `main`). Verify with `build_commit` on the
-dashboard or `GetNodeInfo` via UDS.
+**Build:** Build from HEAD on `main`. Verify with `build_commit` on the
+dashboard or `GetNodeInfo` via UDS — should match `git log --oneline -1`.
 
 ---
 

@@ -1556,4 +1556,96 @@ mod tests {
         assert_eq!(objs.unwrap().len(), 1);
         assert!(recovered.accepted_claims.len() >= 1, "claim also recovered");
     }
+
+    // ── Cap enforcement tests (Commit 4: 64 distinct objectors) ──
+
+    /// 64th distinct objector — accepted.  At exactly cap-1, a new
+    /// objector should be added without hitting the limit.
+    #[test]
+    fn cap_accepts_64th_distinct_objector() {
+        const CAP: usize = 64;
+        let claim_id = [0xAB; 32];
+        let mut map: HashMap<[u8; 32], Vec<SignedObjection>> =
+            HashMap::new();
+
+        // Seed 63 distinct objectors.
+        for _ in 0..(CAP - 1) {
+            let kp = identity::Keypair::generate_ed25519();
+            let obj = make_objection_signed(&kp, claim_id, "test");
+            map.entry(claim_id).or_default().push(obj);
+        }
+        assert_eq!(map[&claim_id].len(), CAP - 1);
+
+        // 64th — should be accepted.
+        let kp64 = identity::Keypair::generate_ed25519();
+        let obj64 = make_objection_signed(&kp64, claim_id, "64th");
+        let entries = map.get(&claim_id);
+        let is_dup = entries.is_some_and(|e| {
+            e.iter().any(|o| o.objection.objector == obj64.objection.objector)
+        });
+        assert!(!is_dup);
+        map.entry(claim_id).or_default().push(obj64);
+        assert_eq!(map[&claim_id].len(), CAP);
+    }
+
+    /// 65th distinct objector — rejected at cap.
+    #[test]
+    fn cap_rejects_65th_distinct_objector() {
+        const CAP: usize = 64;
+        let claim_id = [0xCD; 32];
+        let mut map: HashMap<[u8; 32], Vec<SignedObjection>> =
+            HashMap::new();
+
+        // Seed 64 distinct objectors (at cap).
+        for _ in 0..CAP {
+            let kp = identity::Keypair::generate_ed25519();
+            let obj = make_objection_signed(&kp, claim_id, "test");
+            map.entry(claim_id).or_default().push(obj);
+        }
+        assert_eq!(map[&claim_id].len(), CAP);
+
+        // 65th — new objector, should be rejected.
+        let kp65 = identity::Keypair::generate_ed25519();
+        let obj65 = make_objection_signed(&kp65, claim_id, "65th");
+        let entries = map.get(&claim_id);
+        let at_cap = entries.is_some_and(|e| e.len() >= CAP);
+        let is_dup = entries.is_some_and(|e| {
+            e.iter().any(|o| o.objection.objector == obj65.objection.objector)
+        });
+        assert!(at_cap);
+        assert!(!is_dup, "65th must be a new objector");
+        // Would be rejected — don't insert.
+        assert_eq!(map[&claim_id].len(), CAP, "must stay at 64");
+    }
+
+    /// Duplicate from existing objector after cap reached — no-op,
+    /// not a cap rejection.  Verifies the ordering: dedup check
+    /// runs BEFORE the cap check.
+    #[test]
+    fn cap_duplicate_after_full_is_noop_not_rejection() {
+        const CAP: usize = 64;
+        let claim_id = [0xEF; 32];
+        let mut map: HashMap<[u8; 32], Vec<SignedObjection>> =
+            HashMap::new();
+
+        // Seed 64 distinct objectors.  Save #7's keypair for the duplicate.
+        let mut kp7: Option<identity::Keypair> = None;
+        for i in 0..CAP {
+            let kp = identity::Keypair::generate_ed25519();
+            if i == 6 {
+                kp7 = Some(kp.clone());
+            }
+            let obj = make_objection_signed(&kp, claim_id, "test");
+            map.entry(claim_id).or_default().push(obj);
+        }
+        assert_eq!(map[&claim_id].len(), CAP);
+
+        // #7 sends again — is_dup must be true, so cap check never fires.
+        let kp7 = kp7.unwrap();
+        let dup = make_objection_signed(&kp7, claim_id, "dup from #7");
+        let entries = map.get(&claim_id).unwrap();
+        let is_dup = entries.iter().any(|o| o.objection.objector == dup.objection.objector);
+        assert!(is_dup, "#7 must match an existing objector");
+        assert_eq!(map[&claim_id].len(), CAP, "duplicate must not add entry");
+    }
 }

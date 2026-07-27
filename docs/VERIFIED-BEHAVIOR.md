@@ -119,6 +119,74 @@ doesn't rediscover them.
 
 ---
 
+## Not Verified — Confirmed Protocol-Level Findings
+
+### Transfer Path Integrity
+
+**Status:** CONFIRMED — wire path works correctly  
+**Verified by:** Verifier Mission 1 (Jul 27, snapshot 23:23:12Z)
+
+118/118 redistribution transactions transmitted, received, parsed, and
+validated with exact amount preservation (500, 277, 236, …, 1). Gossip,
+serialization, receipt, and parse all functioned correctly. Zero transaction
+loss or wire-level corruption across 549 epochs.
+
+### Supply Conservation
+
+**Status:** CONTRADICTED — mesh-wide accounting divergence  
+**Verified by:** Verifier Mission 1 (Jul 27), Observers passes 1-24
+
+In the tested redistribution sequence, morning-api's ledger decreased by
+4,980 DUU while local-witness credited 0 DUU. All 118 transfers were
+received (transfer path confirmed) and all 118 were correctly rejected
+by the witness's validation. The sender debited before recipient
+confirmation. Total supply by morning-api's accounting: 5,000. By
+witness's accounting: 0.
+
+The relevant conservation invariant was not previously specified and is
+now recorded as violated under the tested conditions.
+
+**Candidate invariant (proposed, pending governance):**
+
+> Supply Conservation Invariant: For every valid ledger state, the sum of
+> all spendable balances across the mesh must equal the network's recognized
+> total supply, subject only to explicitly defined issuance, destruction, or
+> escrow states.
+
+### Redistribution Supply Divergence — Original
+
+**Status:** SUPERSEDED by the decomposition above  
+**Observer pass:** #3 (Jul 27, 18:48 EDT)
+
+Originally classified as "not a bug — predictable consequence of minimal
+genesis." Both halves of that were wrong. Not predictable (no design
+document predicted it), and the transfer-path integrity was never
+separately tested. The divergences have now been decomposed into:
+
+- CONFIRMED: transfer path works (positive finding)
+- CONTRADICTED: supply conservation (negative finding)
+
+---
+
+## Causes / Contributing Conditions (separate from findings)
+
+These explain observed failures but are not themselves verified findings.
+They prevent the codebase from conflating explanation with evidence.
+
+1. **Initial mint is local and not propagated.** `Minting starting balance
+   to local node amount=5000` — applied locally, never enters the wire on
+   a 2-node mesh with no third-party relay.
+
+2. **Sender debits before recipient confirmation.** `src/node.rs:2032-2057`
+   — `validate_and_apply` runs before `flush_outbound`. The debit is
+   unconditional.
+
+3. **No reconciliation mechanism.** The state_root and thickness_root work
+   from Era Two exists but nothing currently uses it to detect or correct
+   cross-node divergence.
+
+---
+
 ## The Pattern That Found the Bugs
 
 Jul 27 started as "verify the objection cap" and uncovered four production

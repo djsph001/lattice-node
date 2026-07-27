@@ -30,6 +30,15 @@ pub struct PeerInfo {
     pub silence_secs: u64,
     pub is_dead: bool,
     pub queue_depth: u64,
+    /// Thickness earned by this peer — derived from the
+    /// ThicknessGraph at read time. None if thickness has
+    /// never been computed for this peer (fresh node).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thickness: Option<f64>,
+    /// Number of distinct peers that have witnessed claims
+    /// for this peer. None if no claims have been accepted yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distinct_witnesses: Option<u64>,
 }
 
 /// A peer balance entry in the GetEconomicState response.
@@ -74,6 +83,26 @@ pub enum ApiRequest {
         evidence: Vec<String>,
         thickness: f64,
     },
+    /// Initiate a service attestation claim — the node identifies
+    /// witnesses, collects signatures, assembles and accepts the
+    /// claim. Returns immediately with a claim_id; poll ClaimStatus
+    /// to see results.
+    WitnessClaimService,
+    /// Query the status of a previously submitted witness claim.
+    GetClaimStatus { claim_id: String },
+    /// Submit an objection against a witnessed claim.
+    /// The node signs with its own identity key — the caller
+    /// only provides the target and reason.  Submitted objections
+    /// go through the same validate → dedup → cap → persist
+    /// → gossip pipeline as received ones.
+    SubmitObjection {
+        target_claim_id: String,
+        reason: String,
+    },
+    /// Retrieve objections against a specific claim.
+    GetObjections { claim_id: String },
+    /// Retrieve all objections known to this node.
+    GetAllObjections,
 }
 
 #[derive(Debug, Serialize)]
@@ -128,6 +157,22 @@ pub enum ApiResponse {
         chain_tip: u64,
         uptime_secs: u64,
         build_commit: String,
+        /// This node's own earned thickness. None if no claims
+        /// have been credited yet.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thickness: Option<f64>,
+        /// Number of distinct peers that have witnessed claims
+        /// accepted by this node. None if no claims accepted yet.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        distinct_witnesses: Option<u64>,
+        /// This node's earned (non-genesis) thickness — sum of
+        /// VerifiedContribution edges. None when zero earned.
+        /// Distinct from total thickness (which includes genesis
+        /// and vouches), this is what was actually credited
+        /// through work — witness claims, relay receipts,
+        /// service attestations.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        earned_thickness: Option<f64>,
     },
     /// Persistence state — WAL and snapshot status.
     PersistenceState {
@@ -155,6 +200,43 @@ pub enum ApiResponse {
         reason: String,
         refused_because: String,
     },
+    /// Witness claim successfully initiated — poll ClaimStatus for results.
+    ClaimSubmitted { claim_id: String },
+    /// A claim is already collecting for this (self, claim_type).
+    AlreadyCollecting { claim_id: String },
+    /// No claimable window exists — either the node is fresh or a
+    /// claim was already submitted in the current epoch.
+    NothingToClaim,
+    /// Status of a previously submitted witness claim.
+    ClaimStatus {
+        claim_id: String,
+        status: String,              // "collecting" | "accepted" | "rejected"
+        candidates: usize,
+        signatures_collected: usize,
+        declines: Vec<ClaimDeclineInfo>,
+        result: Option<ClaimResultInfo>,
+    },
+    /// Objection successfully submitted and gossiped.
+    ObjectionSubmitted { claim_id: String },
+    /// Objections for a specific claim.
+    Objections {
+        claim_id: String,
+        objections: Vec<ObjectionInfo>,
+    },
+    /// All objections known to this node, keyed by claim ID.
+    AllObjections {
+        objections: std::collections::HashMap<String, Vec<ObjectionInfo>>,
+    },
+}
+
+/// Public-facing objection info — excludes cryptographic payload
+/// so the API response is readable and compact.
+#[derive(Debug, Serialize)]
+pub struct ObjectionInfo {
+    pub target_claim_id: String,
+    pub objector: String,
+    pub reason: String,
+    pub timestamp: String,
 }
 
 /// A request sent from the API server task to the main event loop,
@@ -162,6 +244,21 @@ pub enum ApiResponse {
 pub struct ApiMessage {
     pub request: ApiRequest,
     pub reply: oneshot::Sender<ApiResponse>,
+}
+
+/// Information about a witness that declined to sign.
+#[derive(Debug, Serialize)]
+pub struct ClaimDeclineInfo {
+    pub witness: String,
+    pub reason: String,
+}
+
+/// Result of a completed witness claim.
+#[derive(Debug, Serialize)]
+pub struct ClaimResultInfo {
+    pub thickness: Option<f64>,
+    pub acceptance: String,  // "accepted" | "rejected"
+    pub reason: Option<String>,
 }
 
 // ── Server ─────────────────────────────────────────────────────

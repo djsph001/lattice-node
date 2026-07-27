@@ -3211,8 +3211,6 @@ impl LatticeNode {
     /// → persist → insert into in-memory map.  Persist-before-insert
     /// so memory never advances past what's durable (3b0ef18).
     fn handle_objection_message(&mut self, raw: &[u8]) {
-        const OBJECTION_CAP: usize = 64;
-
         let signed: crate::ledger::types::SignedObjection =
             match serde_cbor::from_slice(raw) {
                 Ok(s) => s,
@@ -3223,14 +3221,13 @@ impl LatticeNode {
             };
 
         let claim_id = signed.objection.target_claim_id;
-        let objector = &signed.objection.objector;
+        let objector = signed.objection.objector;
 
         // Validate the objection (Commit 2).
         if let Err(e) = validate_objection(
             &signed,
-            |_cid| true,  // claim-existence deferred to retrieval
+            |_cid| true,
             |cid, obj| {
-                // Duplicate check: already have this objector for this claim?
                 self.objections.get(cid)
                     .is_some_and(|entries|
                         entries.iter().any(|o| o.objection.objector == *obj))
@@ -3245,12 +3242,24 @@ impl LatticeNode {
             return;
         }
 
+        self.process_objection(signed);
+    }
+
+    /// Core processing shared by receive and submit paths.
+    /// Runs cap → persist → insert → gossip.
+    /// Validation already completed by caller.
+    fn process_objection(&mut self, signed: crate::ledger::types::SignedObjection) {
+        const OBJECTION_CAP: usize = 64;
+
+        let claim_id = signed.objection.target_claim_id;
+        let objector = signed.objection.objector;
+
         // Cap check: at 64 distinct objectors for this claim?
         // Runs AFTER duplicate check so a duplicate from an existing
         // objector doesn't count as a cap rejection.
         if let Some(entries) = self.objections.get(&claim_id) {
             if entries.len() >= OBJECTION_CAP
-                && !entries.iter().any(|o| o.objection.objector == *objector)
+                && !entries.iter().any(|o| o.objection.objector == objector)
             {
                 warn!(
                     claim_id = ?claim_id,
@@ -3277,7 +3286,7 @@ impl LatticeNode {
         self.objections
             .entry(claim_id)
             .or_default()
-            .retain(|o| o.objection.objector != *objector);
+            .retain(|o| o.objection.objector != objector);
         self.objections
             .entry(claim_id)
             .or_default()
@@ -6482,6 +6491,131 @@ impl LatticeNode {
                     wal_bytes,
                     wal_entries,
                 }
+            }
+            ApiRequest::SubmitObjection {
+                target_claim_id,
+                reason,
+            } => {
+                // Parse claim ID from hex string.
+                let claim_id_bytes = match hex::decode(&target_claim_id) {
+                    Ok(b) if b.len() == 32 => {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&b);
+                        arr
+                    }
+                    _ => {
+                        let _ = msg.reply.send(ApiResponse::Error {
+                            message: format!(
+                                "Invalid claim_id: expected 32-byte hex string"
+                            ),
+                        });
+                        return;
+                    }
+                };
+
+                // Build the objection payload.
+                let objection = crate::ledger::types::Objection {
+                    objector: PeerId::from(self.local_key.public()),
+                    target_claim_id: claim_id_bytes,
+                    reason,
+                    timestamp: chrono::Utc::now(),
+                    witness_count: None,
+                    witness_ids: vec![],
+                };
+
+                // Sign with local identity key.
+                let signature = match self.local_key.sign(&serde_cbor::to_vec(&objection).unwrap_or_default()) {
+                    Ok(sig) => sig,
+                    Err(e) => {
+                        let _ = msg.reply.send(ApiResponse::Error {
+                            message: format!("Failed to sign objection: {}", e),
+                        });
+                        return;
+                    }
+                };
+
+                let signed = crate::ledger::types::SignedObjection {
+                    objection,
+                    signature,
+                };
+
+                // Validate (including duplicate check).
+                if let Err(e) = validate_objection(
+                    &signed,
+                    |_cid| true,
+                    |cid, obj| {
+                        self.objections.get(cid)
+                            .is_some_and(|entries|
+                                entries.iter().any(|o| o.objection.objector == *obj))
+                    },
+                ) {
+                    let _ = msg.reply.send(ApiResponse::Error {
+                        message: format!("Objection validation failed: {}", e),
+                    });
+                    return;
+                }
+
+                self.process_objection(signed);
+
+                let _ = msg.reply.send(ApiResponse::ObjectionSubmitted {
+                    claim_id: target_claim_id,
+                });
+                return;
+            }
+            ApiRequest::GetObjections { claim_id } => {
+                let claim_id_bytes = match hex::decode(&claim_id) {
+                    Ok(b) if b.len() == 32 => {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&b);
+                        arr
+                    }
+                    _ => {
+                        let _ = msg.reply.send(ApiResponse::Error {
+                            message: format!(
+                                "Invalid claim_id: expected 32-byte hex string"
+                            ),
+                        });
+                        return;
+                    }
+                };
+
+                let objections: Vec<crate::api::ObjectionInfo> = self
+                    .objections
+                    .get(&claim_id_bytes)
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .map(|o| crate::api::ObjectionInfo {
+                                target_claim_id: hex::encode(o.objection.target_claim_id),
+                                objector: o.objection.objector.to_string(),
+                                reason: o.objection.reason.clone(),
+                                timestamp: o.objection.timestamp.to_rfc3339(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                ApiResponse::Objections {
+                    claim_id,
+                    objections,
+                }
+            }
+            ApiRequest::GetAllObjections => {
+                let mut all: std::collections::HashMap<String, Vec<crate::api::ObjectionInfo>> =
+                    std::collections::HashMap::new();
+                for (cid, entries) in &self.objections {
+                    let info: Vec<crate::api::ObjectionInfo> = entries
+                        .iter()
+                        .map(|o| crate::api::ObjectionInfo {
+                            target_claim_id: hex::encode(o.objection.target_claim_id),
+                            objector: o.objection.objector.to_string(),
+                            reason: o.objection.reason.clone(),
+                            timestamp: o.objection.timestamp.to_rfc3339(),
+                        })
+                        .collect();
+                    all.insert(hex::encode(cid), info);
+                }
+                ApiResponse::AllObjections { objections: all }
             }
         };
 

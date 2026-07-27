@@ -3221,7 +3221,7 @@ impl LatticeNode {
             };
 
         let claim_id = signed.objection.target_claim_id;
-        let objector = signed.objection.objector;
+        let objector = signed.objection.objector.clone();
 
         // Validate the objection (Commit 2).
         if let Err(e) = validate_objection(
@@ -3236,7 +3236,7 @@ impl LatticeNode {
             warn!(
                 claim_id = ?claim_id,
                 objector = %objector,
-                error = %e,
+                error = ?e,
                 "Objection validation failed — rejected"
             );
             return;
@@ -3252,7 +3252,7 @@ impl LatticeNode {
         const OBJECTION_CAP: usize = 64;
 
         let claim_id = signed.objection.target_claim_id;
-        let objector = signed.objection.objector;
+        let objector = signed.objection.objector.clone();
 
         // Cap check: at 64 distinct objectors for this claim?
         // Runs AFTER duplicate check so a duplicate from an existing
@@ -6514,21 +6514,23 @@ impl LatticeNode {
                 };
 
                 // Build the objection payload.
+                let peer_id = PeerId::from(self.local_key.public());
                 let objection = crate::ledger::types::Objection {
-                    objector: PeerId::from(self.local_key.public()),
+                    objector: peer_id.to_base58(),
                     target_claim_id: claim_id_bytes,
                     reason,
                     timestamp: chrono::Utc::now(),
-                    witness_count: None,
-                    witness_ids: vec![],
                 };
 
                 // Sign with local identity key.
-                let signature = match self.local_key.sign(&serde_cbor::to_vec(&objection).unwrap_or_default()) {
+                let payload = serde_cbor::to_vec(&objection)
+                    .map_err(|e| format!("serialize: {}", e))
+                    .unwrap_or_default();
+                let signature = match self.local_key.sign(&payload) {
                     Ok(sig) => sig,
                     Err(e) => {
                         let _ = msg.reply.send(ApiResponse::Error {
-                            message: format!("Failed to sign objection: {}", e),
+                            message: format!("Failed to sign objection: {:?}", e),
                         });
                         return;
                     }
@@ -6536,6 +6538,7 @@ impl LatticeNode {
 
                 let signed = crate::ledger::types::SignedObjection {
                     objection,
+                    signer_public_key: self.local_key.public().encode_protobuf(),
                     signature,
                 };
 
@@ -6550,7 +6553,7 @@ impl LatticeNode {
                     },
                 ) {
                     let _ = msg.reply.send(ApiResponse::Error {
-                        message: format!("Objection validation failed: {}", e),
+                        message: format!("Objection validation failed: {:?}", e),
                     });
                     return;
                 }

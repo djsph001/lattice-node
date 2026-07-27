@@ -32,7 +32,8 @@ fn kill_and_recover_thickness() {
     let mut graph0 = ThicknessGraph::new();
     let state0 = PersistentEconomicState::from_state(
         &HashMap::new(), &HashMap::new(), &graph0, 0,
-        vec![StoredClaim { claim: claim.clone(), applied_at_epoch: None }],
+        &[StoredClaim { claim: claim.clone(), applied_at_epoch: None }],
+        HashMap::new(),
     );
     let snap0 = serde_cbor::to_vec(&state0).expect("snap0");
     drop(state0);
@@ -58,10 +59,11 @@ fn kill_and_recover_thickness() {
     let mut graph_empty = ThicknessGraph::new();
     let state_crash = PersistentEconomicState::from_state(
         &HashMap::new(), &HashMap::new(), &graph_empty, 0,
-        vec![StoredClaim {
-            claim: claim,
+        &[StoredClaim {
+            claim,
             applied_at_epoch: None, // crash happened BEFORE marker was persisted
         }],
+        HashMap::new(),
     );
     drop(graph_empty);
 

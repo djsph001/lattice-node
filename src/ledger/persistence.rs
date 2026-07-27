@@ -75,13 +75,19 @@ impl PersistentEconomicState {
         }
     }
 
-    /// Build from in-memory state.
+    /// Build from in-memory state for snapshot serialization.
+    /// Accepts an explicit objections map — from_state() is a
+    /// mechanical serialization bridge, not a policy decision.
+    /// Callers are responsible for passing the current objection
+    /// state; the default (empty) is correct only when no
+    /// objections have been accumulated.
     pub fn from_state(
         nonces: &HashMap<PeerId, u64>,
         balances: &HashMap<PeerId, DigitalUtilityUnit>,
         thickness: &ThicknessGraph,
         self_tx_nonce: u64,
         accepted_claims: &[StoredClaim],
+        objections: HashMap<[u8; 32], Vec<SignedObjection>>,
     ) -> Self {
         Self {
             seen_nonces: nonces.iter().map(|(k, v)| (k.to_base58(), *v)).collect(),
@@ -96,7 +102,7 @@ impl PersistentEconomicState {
                 .collect(),
             self_tx_nonce,
             accepted_claims: accepted_claims.to_vec(),
-            objections: HashMap::new(),
+            objections,
             genesis: None,
         }
     }
@@ -513,8 +519,13 @@ impl StateStore for WalStateStore {
             Ok(data) => {
                 let mut offset = 0;
                 let mut unified_replayed = 0u64;
-                let mut genesis_established = false;
-                let mut recovered_genesis: Option<crate::ledger::types::SignedGenesis> = None;
+                // The snapshot may carry a genesis record (set during
+                // enable_persistence and persisted via take_snapshot).
+                // Establish it before replay so the fresh post-rotation
+                // WAL doesn't fail the Transaction-before-Genesis gate.
+                let mut genesis_established = state.genesis.is_some();
+                let mut recovered_genesis: Option<crate::ledger::types::SignedGenesis> =
+                    state.genesis.clone();
                 while offset + 4 <= data.len() {
                     let len = u32::from_be_bytes([
                         data[offset], data[offset+1], data[offset+2], data[offset+3],
@@ -530,12 +541,26 @@ impl StateStore for WalStateStore {
                         match record {
                             crate::ledger::wal_record::WalRecord::Genesis(g) => {
                                 if genesis_established {
-                                    return Err(anyhow::anyhow!(
-                                        "Recovery error: duplicate Genesis in unified WAL"
-                                    ));
+                                    // Genesis already established from the snapshot
+                                    // or a prior WAL record.  A second Genesis is
+                                    // expected when take_snapshot seeds the fresh
+                                    // post-rotation WAL — it's the same record the
+                                    // snapshot carries.  If it matches, no-op; if
+                                    // it differs (genuine duplicate), error.
+                                    if recovered_genesis.as_ref() != Some(&g) {
+                                        return Err(anyhow::anyhow!(
+                                            "Recovery error: conflicting Genesis \
+                                             in unified WAL (established={:?}, \
+                                             wal={:?})",
+                                            recovered_genesis.as_ref().map(|sg| &sg.genesis.network_name),
+                                            g.genesis.network_name,
+                                        ));
+                                    }
+                                    // Same genesis — benign re-seed from rotation
+                                } else {
+                                    genesis_established = true;
+                                    recovered_genesis = Some(g);
                                 }
-                                genesis_established = true;
-                                recovered_genesis = Some(g);
                             }
                             crate::ledger::wal_record::WalRecord::Transaction(tx) => {
                                 if !genesis_established {
@@ -586,7 +611,14 @@ impl StateStore for WalStateStore {
                     offset += len;
                 }
                 info!(unified_replayed, "Replayed entries from unified WAL");
-                state.genesis = recovered_genesis;
+                // Only update genesis if the WAL contained one — don't
+                // clobber what the snapshot carried.  (This is belt-and-
+                // suspenders: genesis_established starts from the snapshot,
+                // so recovered_genesis already equals state.genesis unless
+                // a WAL Genesis record overwrote it.)
+                if let Some(g) = recovered_genesis {
+                    state.genesis = Some(g);
+                }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // No unified WAL yet — migration hasn't started or hasn't
@@ -634,6 +666,18 @@ impl StateStore for WalStateStore {
         // .old file.  The next persist will create a fresh WAL at the
         // original path.
         self.wal_file = None;
+
+        // Seed the fresh WAL with Genesis so every WAL file is
+        // self-describing.  Without this, a post-rotation WAL has no
+        // Genesis record and recovery fails the Transaction-before-
+        // Genesis invariant on restart unless the snapshot carries
+        // it — making snapshot and WAL jointly load-bearing.
+        // Writing Genesis here makes both paths independently viable.
+        if let Some(ref sg) = state.genesis {
+            self.persist_record(&crate::ledger::wal_record::WalRecord::Genesis(
+                sg.clone(),
+            ))?;
+        }
 
         Ok(())
     }
@@ -1032,6 +1076,26 @@ mod tests {
         let alice = kp.public().to_peer_id();
         let bob = PeerId::random();
 
+        // ── Genesis (required by the recovery invariant from b71c824:
+        //     Transaction/Claim before Genesis is rejected on replay) ──
+        let genesis = crate::ledger::types::Genesis {
+            network_name: "test-net".into(),
+            root: alice.to_string(),
+            timestamp: Utc::now(),
+        };
+        let genesis_bytes = serde_cbor::to_vec(&genesis).unwrap();
+        let genesis_sig = kp.sign(&genesis_bytes).unwrap();
+        let signed_genesis = crate::ledger::types::SignedGenesis {
+            genesis,
+            signer_public_key: kp.public().encode_protobuf(),
+            signature: genesis_sig,
+        };
+        store
+            .persist_record(&crate::ledger::wal_record::WalRecord::Genesis(
+                signed_genesis.clone(),
+            ))
+            .unwrap();
+
         // ── Phase 1: pre-snapshot transactions ──────────────
         let mint1 = Transaction::Mint {
             to: alice.to_string(), amount: DigitalUtilityUnit(5000),
@@ -1045,6 +1109,9 @@ mod tests {
         let mut snap = PersistentEconomicState::new();
         snap.seen_nonces.insert(alice.to_base58(), 1);
         snap.balances.insert(alice.to_base58(), 5000);
+        // Carry genesis on the snapshot — production path does this at
+        // node.rs:2114; the test simulates it explicitly.
+        snap.genesis = Some(signed_genesis.clone());
         store.take_snapshot(7, &snap).unwrap();
 
         // ── Phase 3: post-snapshot transactions ─────────────
@@ -1082,7 +1149,22 @@ mod tests {
         // Bob got 300
         assert_eq!(recovered.balances.get(&bob.to_base58()), Some(&300));
 
-        // Fix 5: consistency assertion must pass on uncorrupted data
+        // Genesis assertion: genesis survives WAL rotation because
+        // take_snapshot seeds the fresh WAL with a Genesis record
+        // (making every WAL file self-describing).  Both snapshot and
+        // WAL carry genesis independently.
+        assert!(
+            recovered.genesis.is_some(),
+            "genesis must survive WAL rotation"
+        );
+        assert_eq!(
+            recovered.genesis.unwrap().genesis.network_name,
+            "test-net",
+            "recovered genesis must match the one written to the snapshot"
+        );
+
+        // Fix 5: consistency assertion must pass — both paths
+        // (snapshot+WAL and WAL-alone) have Genesis now.
         assert!(
             store2.verify_consistency().is_ok(),
             "verify_consistency() failed on valid snapshot+WAL — \

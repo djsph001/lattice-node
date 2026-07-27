@@ -2099,13 +2099,19 @@ impl LatticeNode {
         // Save economic snapshot every 10 epochs (balances + thickness survive restart)
         if epoch % 10 == 0 {
             if let Some(ref mut store) = self.state_store {
-                let snapshot = PersistentEconomicState::from_state(
+                let mut snapshot = PersistentEconomicState::from_state(
                     &self.seen_nonces,
                     &self.ledger.balances,
                     &self.ledger.thickness_graph,
                     self.tx_nonce,
                     self.economic_engine.accepted_claims_snapshot(),
+                    HashMap::new(), // objections — Commit 4 threads real state
                 );
+                // from_state drops genesis — carry it forward so the
+                // snapshot can survive WAL rotation (the recovery invariant
+                // from b71c824 requires Genesis before Transaction/Claim,
+                // and rotation removes Genesis from the active WAL).
+                snapshot.genesis = self.genesis.clone();
                 if let Err(e) = store.take_snapshot(epoch, &snapshot) {
                     warn!(error = %e, "Failed to save economic snapshot");
                 }

@@ -6,6 +6,7 @@ use tracing::warn;
 
 use super::state::LedgerState;
 use super::types::{DigitalUtilityUnit, SignedTransaction, Transaction};
+use super::types::{Genesis, Objection, SignedGenesis, SignedObjection};
 
 /// Structured error from transaction validation.
 /// Callers can match on `GappedNonce` to trigger a fetch protocol.
@@ -757,6 +758,248 @@ mod tests {
             &signed, &mut state, &mut nonces, None, false,
         );
         assert!(result.is_err(), "self-authored genesis must be rejected when not allowed");
+    }
+}
+
+// ── Objection validation ────────────────────────────────────
+
+/// Maximum bytes for an objection reason.  Capped at validation
+/// to prevent unbounded-string resource amplification (every
+/// objection is gossiped, signed, and persisted forever).
+pub const MAX_OBJECTION_REASON_BYTES: usize = 1024;
+
+/// Why an objection was rejected.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ObjectionRejection {
+    BadSignature,
+    ObjectorMismatch { payload: String, key_derived: String },
+    UnknownTarget { claim_id: [u8; 32] },
+    ReasonTooLong { len: usize, max: usize },
+    ReasonEmpty,
+    TimestampOutOfRange,
+    Duplicate { claim_id: [u8; 32], objector: String },
+}
+
+/// Validate an objection.  Pure function — no I/O, no state mutation.
+pub fn validate_objection(
+    signed: &SignedObjection,
+    claim_exists: impl Fn(&[u8; 32]) -> bool,
+    already_objected: impl Fn(&[u8; 32], &str) -> bool,
+) -> Result<(), ObjectionRejection> {
+    // 1. Signature check
+    let obj_bytes = serde_cbor::to_vec(&signed.objection)
+        .map_err(|_| ObjectionRejection::BadSignature)?;
+    let Ok(pubkey) = identity::PublicKey::try_decode_protobuf(&signed.signer_public_key) else {
+        return Err(ObjectionRejection::BadSignature);
+    };
+    if !pubkey.verify(&obj_bytes, &signed.signature) {
+        return Err(ObjectionRejection::BadSignature);
+    }
+
+    // 2. Objector matches key
+    let key_peer_id = PeerId::from(pubkey);
+    let claimed_objector = &signed.objection.objector;
+    if key_peer_id.to_base58() != *claimed_objector {
+        return Err(ObjectionRejection::ObjectorMismatch {
+            payload: claimed_objector.clone(),
+            key_derived: key_peer_id.to_base58(),
+        });
+    }
+
+    // 3. Reason bounds
+    let reason = &signed.objection.reason;
+    if reason.is_empty() {
+        return Err(ObjectionRejection::ReasonEmpty);
+    }
+    if reason.len() > MAX_OBJECTION_REASON_BYTES {
+        return Err(ObjectionRejection::ReasonTooLong {
+            len: reason.len(),
+            max: MAX_OBJECTION_REASON_BYTES,
+        });
+    }
+
+    // 4. Timestamp check — same convention as genesis
+    let now = chrono::Utc::now();
+    let future_cutoff = now + chrono::Duration::seconds(300);
+    if signed.objection.timestamp > future_cutoff {
+        return Err(ObjectionRejection::TimestampOutOfRange);
+    }
+
+    // 5. Target claim exists
+    if !claim_exists(&signed.objection.target_claim_id) {
+        return Err(ObjectionRejection::UnknownTarget {
+            claim_id: signed.objection.target_claim_id,
+        });
+    }
+
+    // 6. Duplicate check — same (claim_id, objector) pair
+    if already_objected(&signed.objection.target_claim_id, &signed.objection.objector) {
+        return Err(ObjectionRejection::Duplicate {
+            claim_id: signed.objection.target_claim_id,
+            objector: signed.objection.objector.clone(),
+        });
+    }
+
+    Ok(())
+}
+
+// ── Objection validation tests ───────────────────────────────
+
+#[cfg(test)]
+mod objection_tests {
+    use super::*;
+    use chrono::Utc;
+    use libp2p::identity::Keypair;
+
+    fn sign_objection(obj: Objection, kp: &Keypair) -> SignedObjection {
+        let bytes = serde_cbor::to_vec(&obj).unwrap();
+        let sig = kp.sign(&bytes).unwrap();
+        SignedObjection {
+            objection: obj,
+            signer_public_key: kp.public().encode_protobuf(),
+            signature: sig,
+        }
+    }
+
+    fn make_claim_id() -> [u8; 32] {
+        [0xAB; 32]
+    }
+
+    fn make_objector_key() -> Keypair {
+        Keypair::generate_ed25519()
+    }
+
+    fn make_objection(kp: &Keypair, claim_id: [u8; 32]) -> SignedObjection {
+        let peer = PeerId::from(kp.public()).to_base58();
+        sign_objection(
+            Objection {
+                target_claim_id: claim_id,
+                objector: peer,
+                reason: "disagree".into(),
+                timestamp: Utc::now(),
+            },
+            kp,
+        )
+    }
+
+    #[test]
+    fn valid_objection_against_existing_claim_ok() {
+        let kp = make_objector_key();
+        let claim_id = make_claim_id();
+        let signed = make_objection(&kp, claim_id);
+        let result = validate_objection(
+            &signed,
+            |_| true,
+            |_, _| false,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn bad_signature_rejected() {
+        let kp1 = make_objector_key();
+        let kp2 = make_objector_key();
+        let claim_id = make_claim_id();
+        let mut signed = make_objection(&kp1, claim_id);
+        signed.signature = kp2.sign(&serde_cbor::to_vec(&signed.objection).unwrap()).unwrap();
+        let result = validate_objection(&signed, |_| true, |_, _| false);
+        assert_eq!(result, Err(ObjectionRejection::BadSignature));
+    }
+
+    #[test]
+    fn objector_mismatch_rejected() {
+        let kp = make_objector_key();
+        let claim_id = make_claim_id();
+        let wrong_peer = "12D3KooWImposter".to_string();
+        let mut signed = make_objection(&kp, claim_id);
+        signed.objection.objector = wrong_peer;
+        signed.signature = kp.sign(&serde_cbor::to_vec(&signed.objection).unwrap()).unwrap();
+        let result = validate_objection(&signed, |_| true, |_, _| false);
+        assert!(matches!(result, Err(ObjectionRejection::ObjectorMismatch { .. })));
+    }
+
+    #[test]
+    fn unknown_target_rejected() {
+        let kp = make_objector_key();
+        let claim_id = make_claim_id();
+        let signed = make_objection(&kp, claim_id);
+        let result = validate_objection(
+            &signed,
+            |_| false,
+            |_, _| false,
+        );
+        assert!(matches!(result, Err(ObjectionRejection::UnknownTarget { .. })));
+    }
+
+    #[test]
+    fn empty_reason_rejected() {
+        let kp = make_objector_key();
+        let mut signed = make_objection(&kp, make_claim_id());
+        signed.objection.reason = "".into();
+        signed.signature = kp.sign(&serde_cbor::to_vec(&signed.objection).unwrap()).unwrap();
+        let result = validate_objection(&signed, |_| true, |_, _| false);
+        assert_eq!(result, Err(ObjectionRejection::ReasonEmpty));
+    }
+
+    #[test]
+    fn reason_too_long_rejected() {
+        let kp = make_objector_key();
+        let mut signed = make_objection(&kp, make_claim_id());
+        signed.objection.reason = "x".repeat(MAX_OBJECTION_REASON_BYTES + 1);
+        signed.signature = kp.sign(&serde_cbor::to_vec(&signed.objection).unwrap()).unwrap();
+        let result = validate_objection(&signed, |_| true, |_, _| false);
+        assert!(matches!(result, Err(ObjectionRejection::ReasonTooLong { len: 1025, max: 1024 })));
+    }
+
+    #[test]
+    fn reason_exactly_1024_ok() {
+        let kp = make_objector_key();
+        let mut signed = make_objection(&kp, make_claim_id());
+        signed.objection.reason = "x".repeat(MAX_OBJECTION_REASON_BYTES);
+        signed.signature = kp.sign(&serde_cbor::to_vec(&signed.objection).unwrap()).unwrap();
+        let result = validate_objection(&signed, |_| true, |_, _| false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn future_timestamp_rejected() {
+        let kp = make_objector_key();
+        let mut signed = make_objection(&kp, make_claim_id());
+        signed.objection.timestamp = Utc::now() + chrono::Duration::seconds(600);
+        signed.signature = kp.sign(&serde_cbor::to_vec(&signed.objection).unwrap()).unwrap();
+        let result = validate_objection(&signed, |_| true, |_, _| false);
+        assert_eq!(result, Err(ObjectionRejection::TimestampOutOfRange));
+    }
+
+    #[test]
+    fn duplicate_same_claim_same_objector_rejected() {
+        let kp = make_objector_key();
+        let claim_id = make_claim_id();
+        let signed = make_objection(&kp, claim_id);
+        let result1 = validate_objection(&signed, |_| true, |_, _| false);
+        assert!(result1.is_ok());
+        let result2 = validate_objection(
+            &signed,
+            |_| true,
+            |cid, obj| *cid == claim_id && obj == signed.objection.objector,
+        );
+        assert!(matches!(result2, Err(ObjectionRejection::Duplicate { .. })));
+    }
+
+    #[test]
+    fn different_objector_same_claim_ok() {
+        let kp1 = make_objector_key();
+        let kp2 = make_objector_key();
+        let claim_id = make_claim_id();
+        let signed1 = make_objection(&kp1, claim_id);
+        let signed2 = make_objection(&kp2, claim_id);
+        let result1 = validate_objection(&signed1, |_| true, |_, _| false);
+        assert!(result1.is_ok());
+        let already = |cid: &[u8; 32], obj: &str| {
+            *cid == claim_id && obj == signed1.objection.objector
+        };
+        let result2 = validate_objection(&signed2, |_| true, already);
+        assert!(result2.is_ok());
     }
 }
 

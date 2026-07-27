@@ -542,11 +542,22 @@ impl StateStore for WalStateStore {
                             crate::ledger::wal_record::WalRecord::Genesis(g) => {
                                 if genesis_established {
                                     // Genesis already established from the snapshot
-                                    // or a prior WAL record.  A second Genesis is
-                                    // expected when take_snapshot seeds the fresh
-                                    // post-rotation WAL — it's the same record the
-                                    // snapshot carries.  If it matches, no-op; if
-                                    // it differs (genuine duplicate), error.
+                                    // or a prior WAL record.  A second Genesis at
+                                    // replay time is expected only when take_snapshot
+                                    // seeds the fresh post-rotation WAL — it's the
+                                    // same SignedGenesis record (full struct equality,
+                                    // including signature).  If it matches byte-for-
+                                    // byte, no-op; if it differs at all, error.
+                                    //
+                                    // This is recovery-only.  The live receive path
+                                    // (Commit 5 of the genesis arc) classifies
+                                    // re-delivery of the same Genesis from gossip
+                                    // differently: same-signer-same-content is
+                                    // TRACE-level benign because it's a network
+                                    // duplicate, not a write-path artifact.  Recovery
+                                    // sees a WAL record the write path deliberately
+                                    // placed; gossip sees a redundant delivery that
+                                    // may have crossed the network twice.
                                     if recovered_genesis.as_ref() != Some(&g) {
                                         return Err(anyhow::anyhow!(
                                             "Recovery error: conflicting Genesis \

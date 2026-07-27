@@ -34,8 +34,12 @@ cargo build --release --bin lattice-node
 ```
 
 **Identity:** Both nodes use stable keys in `/tmp/m-ap-id/` and `/tmp/lw-id/`.
-Peer IDs persist across restarts. Derive them from startup:
-`grep "Node identity" <log>`.
+Peer IDs persist across restarts.
+
+| Node | PeerId |
+|---|---|
+| morning-api | `12D3KooWPfrZgiinxkPdE61kKE5YwPRjqTaHGxEDMmUBvq6zLVxJ` |
+| local-witness | `12D3KooWDNNZmWvTzeQeLgHD6sTmEPH1vrwLEBuVEaEFpfct9sch` |
 
 **Build:** Build from HEAD on `main`. Verify with `build_commit` on the
 dashboard or `GetNodeInfo` via UDS — should match `git log --oneline -1`.

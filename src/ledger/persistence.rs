@@ -366,9 +366,11 @@ impl WalStateStore {
                 warn!("Truncated claim WAL entry — stopping replay");
                 break;
             }
-            if let Ok(claim) = serde_cbor::from_slice::<crate::claims::WitnessedClaim>(
+            if let Ok(mut claim) = serde_cbor::from_slice::<crate::claims::WitnessedClaim>(
                 &claim_wal_data[claim_offset..claim_offset + clen],
             ) {
+                // ensure claim_id for legacy entries
+                claim.ensure_claim_id();
                 let key = (
                     claim.claimant.to_base58(),
                     claim.claim_type as u8,
@@ -514,12 +516,14 @@ impl StateStore for WalStateStore {
                                 }
                                 Self::apply_tx_to_state(&mut state, &tx);
                             }
-                            crate::ledger::wal_record::WalRecord::Claim(claim) => {
+                            crate::ledger::wal_record::WalRecord::Claim(mut claim) => {
                                 if !genesis_established {
                                     return Err(anyhow::anyhow!(
                                         "Recovery error: Claim before Genesis in unified WAL"
                                     ));
                                 }
+                                // ensure claim_id for legacy entries
+                                claim.ensure_claim_id();
                                 let key = (
                                     claim.claimant.to_base58(),
                                     claim.claim_type as u8,

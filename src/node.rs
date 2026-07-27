@@ -435,6 +435,10 @@ pub struct LatticeNode {
     /// each metrics tick.  Capped at 256 entries; oldest evicted on
     /// overflow.
     pending_objection_gossip: Vec<crate::ledger::types::SignedObjection>,
+    /// In-memory objections map — mirrors the persistent state's
+    /// objections field.  Populated from recovery and updated on
+    /// each receive.  The source of truth for cap and dedup checks.
+    objections: HashMap<[u8; 32], Vec<crate::ledger::types::SignedObjection>>,
     /// Self-liquidation period for genesis thickness. None = permanent.
     genesis_amortize_over: Option<u64>,
     /// Automatically submit genesis on startup if the chain is empty.
@@ -783,6 +787,7 @@ impl LatticeNode {
             genesis_sent_to: HashSet::new(),
             pending_genesis_gossip: HashSet::new(),
             pending_objection_gossip: Vec::new(),
+            objections: HashMap::new(),
             genesis_amortize_over,
             auto_genesis,
             genesis_thickness,
@@ -2993,6 +2998,14 @@ impl LatticeNode {
             );
         }
 
+        // Hydrate objections from recovered state so the receive handler
+        // can perform cap and dedup checks against the live session's map.
+        if !state.objections.is_empty() {
+            let count = state.objections.values().map(|v| v.len()).sum::<usize>();
+            info!(count, "Recovered objections from economic snapshot");
+            self.objections = state.objections;
+        }
+
         // Recover tx_nonce from self_tx_nonce field (persisted directly
         // in the snapshot, not derived from seen_nonces[self]).
         // Using seen_nonces[self] was fragile: the identity may have been
@@ -3215,8 +3228,13 @@ impl LatticeNode {
         // Validate the objection (Commit 2).
         if let Err(e) = validate_objection(
             &signed,
-            |_cid| true,  // FIXME(commit-5): claim-existence deferred
-            |_cid, _obj| false,  // FIXME(commit-5): duplicate check deferred
+            |_cid| true,  // claim-existence deferred to retrieval
+            |cid, obj| {
+                // Duplicate check: already have this objector for this claim?
+                self.objections.get(cid)
+                    .is_some_and(|entries|
+                        entries.iter().any(|o| o.objection.objector == *obj))
+            },
         ) {
             warn!(
                 claim_id = ?claim_id,
@@ -3227,7 +3245,25 @@ impl LatticeNode {
             return;
         }
 
-        // validate → persist → insert
+        // Cap check: at 64 distinct objectors for this claim?
+        // Runs AFTER duplicate check so a duplicate from an existing
+        // objector doesn't count as a cap rejection.
+        if let Some(entries) = self.objections.get(&claim_id) {
+            if entries.len() >= OBJECTION_CAP
+                && !entries.iter().any(|o| o.objection.objector == *objector)
+            {
+                warn!(
+                    claim_id = ?claim_id,
+                    objector = %objector,
+                    current_count = entries.len(),
+                    cap = OBJECTION_CAP,
+                    "Objection rejected — claim at cap"
+                );
+                return;
+            }
+        }
+
+        // validate → persist → insert (3b0ef18 ordering)
         if let Some(ref mut store) = self.state_store {
             if let Err(e) = store.persist_record(
                 &crate::ledger::wal_record::WalRecord::Objection(signed.clone()),
@@ -3237,14 +3273,21 @@ impl LatticeNode {
             }
         }
 
-        // FIXME(commit-5): insert_objection into in-memory map.
-        // FIXME(commit-5): cap check (64 distinct objectors per claim).
-        // FIXME(commit-5): duplicate check (same objector = no-op).
+        // Insert into in-memory map — dedup by objector.
+        self.objections
+            .entry(claim_id)
+            .or_default()
+            .retain(|o| o.objection.objector != *objector);
+        self.objections
+            .entry(claim_id)
+            .or_default()
+            .push(signed.clone());
 
         info!(
             claim_id = ?claim_id,
             objector = %objector,
             reason = %signed.objection.reason,
+            count = self.objections[&claim_id].len(),
             "Objection accepted and persisted"
         );
 

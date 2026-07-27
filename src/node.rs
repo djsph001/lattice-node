@@ -2659,7 +2659,7 @@ impl LatticeNode {
         }
 
         // Assemble the WitnessedClaim
-        let assembled = crate::claims::WitnessedClaim {
+        let mut assembled = crate::claims::WitnessedClaim {
             claimant: self.local_peer_id,
             claim_type: crate::claims::ClaimType::ServiceAttestation,
             start_epoch: state.start_epoch,
@@ -2669,7 +2669,9 @@ impl LatticeNode {
             },
             witnesses: state.signatures.clone(),
             submitted_epoch: self.economic_engine.epoch_count(),
+            claim_id: [0u8; 32], // computed below
         };
+        assembled.claim_id = assembled.compute_claim_id();
 
         // Feed to accept_claim. established_peers counts all peers
         // in the mesh (including self) so accept_claim can enforce
@@ -7375,7 +7377,7 @@ mod witness_seam_tests {
         };
 
         // Assemble a WitnessedClaim from the response
-        let assembled = WitnessedClaim {
+        let mut assembled = WitnessedClaim {
             claimant,
             claim_type: ClaimType::ServiceAttestation,
             start_epoch: 0,
@@ -7387,9 +7389,11 @@ mod witness_seam_tests {
                 observed_heartbeats: 1,
                 signature: response.signature,
             }],
-            submitted_epoch: epoch,
+            submitted_epoch: 0,
+            claim_id: [0u8; 32],
         };
-
+        assembled.claim_id = assembled.compute_claim_id();
+        // Feed to accept_claim
         // Feed to accept_claim
         let nonce_map = claims::acceptance::ClaimNonceMap::new();
         let result = claims::accept_claim(&assembled, &nonce_map, 2);
@@ -7415,7 +7419,7 @@ mod witness_seam_tests {
             decline_reason: Some("Self-witness is not permitted".into()),
         };
 
-        let assembled = WitnessedClaim {
+        let mut assembled = WitnessedClaim {
             claimant,
             claim_type: ClaimType::ServiceAttestation,
             start_epoch: 0,
@@ -7427,9 +7431,11 @@ mod witness_seam_tests {
                 observed_heartbeats: 1,
                 signature: response.signature,
             }],
-            submitted_epoch: epoch,
+            submitted_epoch: 0,
+            claim_id: [0u8; 32],
         };
-
+        assembled.claim_id = assembled.compute_claim_id();
+        // Feed to accept_claim
         let nonce_map = claims::acceptance::ClaimNonceMap::new();
         let result = claims::accept_claim(&assembled, &nonce_map, 2);
         // accept_claim accepts any well-formed claim with ≥ 1 witness,
@@ -7814,8 +7820,8 @@ mod two_swarm_witness_harness {
         assert_eq!(response.claim_hash, claim_hash);
 
         // ── Assertion 2: Acceptance integration ─────────────
-        let assembled = WitnessedClaim {
-            claimant: a.local_peer_id,
+        let mut assembled = WitnessedClaim {
+            claimant,
             claim_type: ClaimType::ServiceAttestation,
             start_epoch: 0,
             end_epoch: 1,
@@ -7826,9 +7832,11 @@ mod two_swarm_witness_harness {
                 observed_heartbeats: 1,
                 signature: response.signature,
             }],
-            submitted_epoch: a.epoch,
+            submitted_epoch: 0,
+            claim_id: [0u8; 32],
         };
-
+        assembled.claim_id = assembled.compute_claim_id();
+        // Feed to accept_claim
         let nonce_map = claims::acceptance::ClaimNonceMap::new();
         let result = claims::accept_claim(&assembled, &nonce_map, 2);
         assert!(
@@ -8147,8 +8155,8 @@ mod two_swarm_witness_harness {
         assert!(response.decline_reason.is_none());
 
         // Assemble the WitnessedClaim (same as finalize_claim)
-        let assembled = WitnessedClaim {
-            claimant: a.local_peer_id,
+        let mut assembled = WitnessedClaim {
+            claimant,
             claim_type: ClaimType::ServiceAttestation,
             start_epoch: 0,
             end_epoch: 1,
@@ -8157,11 +8165,13 @@ mod two_swarm_witness_harness {
                 witness: response.witness_id,
                 signed_at_epoch: response.witnessed_at_epoch,
                 observed_heartbeats: 1,
-                signature: response.signature.clone(),
+                signature: response.signature,
             }],
-            submitted_epoch: a.epoch,
+            submitted_epoch: 0,
+            claim_id: [0u8; 32],
         };
-
+        assembled.claim_id = assembled.compute_claim_id();
+        // Feed to accept_claim
         // Feed to accept_claim — the seam that proves the orchestration
         // produces valid input to the acceptance layer.
         let nonce_map = claims::acceptance::ClaimNonceMap::new();

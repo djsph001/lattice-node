@@ -195,7 +195,7 @@ mod tests {
         end: u64,
         witnesses: Vec<WitnessSignature>,
     ) -> WitnessedClaim {
-        WitnessedClaim {
+        let mut claim = WitnessedClaim {
             claimant,
             claim_type: ClaimType::ServiceAttestation,
             start_epoch: start,
@@ -203,7 +203,10 @@ mod tests {
             evidence: ClaimEvidence::Service { claimed_count: 0 },
             witnesses,
             submitted_epoch: end + 1,
-        }
+            claim_id: [0u8; 32], // placeholder, computed below
+        };
+        claim.claim_id = claim.compute_claim_id();
+        claim
     }
 
     fn make_sig(witness: PeerId, obs: u64) -> WitnessSignature {
@@ -272,7 +275,7 @@ mod tests {
     fn test_malformed_future_claim_rejected() {
         let c = test_peer();
         let w = test_peer();
-        let claim = WitnessedClaim {
+        let mut claim = WitnessedClaim {
             claimant: c.clone(),
             claim_type: ClaimType::ServiceAttestation,
             start_epoch: 100,
@@ -280,7 +283,9 @@ mod tests {
             evidence: ClaimEvidence::Service { claimed_count: 0 },
             witnesses: vec![make_sig(w.clone(), 5)],
             submitted_epoch: 150, // before end_epoch → invalid
+            claim_id: [0u8; 32],
         };
+        claim.claim_id = claim.compute_claim_id();
         let result = accept_claim(&claim, &ClaimNonceMap::new(), 2);
         assert!(matches!(result, Err(ClaimRejection::Malformed(_))));
     }

@@ -60,6 +60,13 @@ impl ClaimType {
 /// into the same envelope via the ClaimType enum.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WitnessedClaim {
+    /// Content-derived identifier — blake3 over canonical CBOR of
+    /// (claimant || claim_type || start_epoch || end_epoch || evidence).
+    /// Deterministic, stable, every node computes the same ID for the
+    /// same claim. Allows referencing claims from objections, retrieval,
+    /// and deliberation layers.
+    #[serde(default)]
+    pub claim_id: [u8; 32],
     /// The peer asserting the claim.
     pub claimant: PeerId,
     /// What kind of claim this is.
@@ -74,6 +81,41 @@ pub struct WitnessedClaim {
     pub witnesses: Vec<WitnessSignature>,
     /// The epoch at which this claim was submitted (for decay timing).
     pub submitted_epoch: u64,
+}
+
+impl WitnessedClaim {
+    /// Compute the blake3 content-hash of the claim's identifying fields.
+    /// Called by the constructor and at recovery time for legacy entries
+    /// that lack a persisted claim_id.
+    pub fn compute_claim_id(&self) -> [u8; 32] {
+        // Hash the canonical tuple: claimant, claim_type, epoch window, evidence.
+        // Witness signatures and submitted_epoch are NOT included — they are
+        // attestation metadata, not the claim's identity.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.claimant.to_bytes());
+        let claim_type_tag: u8 = match self.claim_type {
+            ClaimType::ServiceAttestation => 0x01,
+        };
+        hasher.update(&[claim_type_tag]);
+        hasher.update(&self.start_epoch.to_le_bytes());
+        hasher.update(&self.end_epoch.to_le_bytes());
+        // Hash the evidence as canonical CBOR
+        hasher.update(
+            &serde_cbor::to_vec(&self.evidence)
+                .unwrap_or_default(),
+        );
+        let mut out = [0u8; 32];
+        hasher.finalize_xof().fill(&mut out);
+        out
+    }
+
+    /// Ensure claim_id is populated.  Called after deserialization
+    /// of legacy entries that lack the field.
+    pub fn ensure_claim_id(&mut self) {
+        if self.claim_id == [0u8; 32] {
+            self.claim_id = self.compute_claim_id();
+        }
+    }
 }
 
 /// Claim-type-specific payload.

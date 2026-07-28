@@ -5,6 +5,10 @@ edition = "2021"
 description = "Lattice mesh node — sovereign peer-to-peer application layer"
 authors = ["Dale Joseph <dale@emergenceinstitute.live>"]
 
+[[bin]]
+name = "objection-injector"
+path = "src/bin/objection-injector.rs"
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }

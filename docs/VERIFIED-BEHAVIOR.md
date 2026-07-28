@@ -112,6 +112,8 @@ doesn't rediscover them.
 | Item | Category | When |
 |---|---|---|
 | `wal.wal.old` naming (should be `wal.log.old`) | Cosmetic | ae89fbd |
+| `wal_bytes` endpoint read legacy `transactions.wal` | Fixed | cb5d4b1 |
+| `wal_entries` reports `size/120` heuristic — plausible but unrelated to actual entry count | Known-provisional | cb5d4b1 |
 | `GetAllObjections` unbounded — needs pagination | Scale | e7d9e1e |
 | No per-claim cap on total objections archive | Scale | 6ec9470 |
 | Widget down — Netlify blobs read failing | Infra | Jul 27 |

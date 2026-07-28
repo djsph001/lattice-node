@@ -694,7 +694,7 @@ impl StateStore for WalStateStore {
     }
 
     fn get_stats(&self) -> (u64, u64, u64) {
-        let size = std::fs::metadata(&self.wal_path)
+        let size = std::fs::metadata(&self.unified_wal_path)
             .map(|m| m.len())
             .unwrap_or(0);
         // Estimate entry count from WAL size (4-byte length prefix + CBOR overhead)

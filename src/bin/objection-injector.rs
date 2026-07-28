@@ -100,6 +100,13 @@ struct Cli {
     /// randomly generated.
     #[arg(long, value_name = "N")]
     identity_seed: Option<u64>,
+
+    /// Seconds to drive the swarm event loop after publishing all
+    /// objections, giving gossipsub time to forward queued messages.
+    /// publish() only inserts into the local outbound queue — without
+    /// this linger the process exits before messages are sent.
+    #[arg(long, default_value_t = 5, value_name = "SECS")]
+    linger_secs: u64,
 }
 
 // ── Key generation ─────────────────────────────────────────────
@@ -325,23 +332,28 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Let the gossipsub mesh settle briefly — process a few more events.
+    // ── Wait for mesh membership ────────────────────────────────
+    // publish() inserts into the local outbound queue only.
+    // The message will not be forwarded until the gossipsub mesh
+    // has at least one peer on this topic.  Wait for that here
+    // rather than relying on timing — same principle as the
+    // genesis re-gossip retry on InsufficientPeers (0fbba1e).
     {
-        let settle_deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < settle_deadline {
+        let topic_id = gossipsub::IdentTopic::new(LATTICE_OBJECTION_TOPIC);
+        let topic_hash = topic_id.hash();
+        let mesh_deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if swarm.behaviour().mesh_peers(&topic_hash).count() > 0 {
+                info!("Mesh peer joined — ready to publish");
+                break;
+            }
+            if Instant::now() >= mesh_deadline {
+                warn!("Timed out waiting for mesh peer — publishing anyway");
+                break;
+            }
             tokio::select! {
-                event = swarm.select_next_some() => {
-                    match event {
-                        SwarmEvent::Behaviour(gossipsub::Event::Subscribed { peer_id, topic }) => {
-                            debug!(%peer_id, %topic, "Mesh subscription confirmed");
-                        }
-                        SwarmEvent::Behaviour(gossipsub::Event::GossipsubNotSupported { peer_id }) => {
-                            warn!(%peer_id, "Peer does not support gossipsub");
-                        }
-                        _ => {}
-                    }
-                }
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                _ = swarm.select_next_some() => {},
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {},
             }
         }
     }
@@ -592,6 +604,22 @@ async fn main() -> Result<()> {
 
     if failed > 0 {
         warn!("{failed} objection(s) failed to publish");
+    }
+
+    // ── Linger: drive swarm to deliver queued messages ────────────
+    // publish() only inserts into the local outbound queue.
+    // Messages are not forwarded until the swarm event loop runs.
+    // Drive the loop for linger_secs so gossipsub has time to
+    // actually send pending messages before the process exits.
+    {
+        let linger_deadline = Instant::now() + Duration::from_secs(cli.linger_secs);
+        info!(seconds = cli.linger_secs, "Lingering after publish to deliver messages");
+        while Instant::now() < linger_deadline {
+            tokio::select! {
+                _ = swarm.select_next_some() => {},
+                _ = tokio::time::sleep_until(linger_deadline.into()) => break,
+            }
+        }
     }
 
     Ok(())

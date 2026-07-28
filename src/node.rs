@@ -6620,6 +6620,13 @@ impl LatticeNode {
                 }
                 ApiResponse::AllObjections { objections: all }
             }
+            ApiRequest::GetStateRoot => {
+                let root = self.ledger.state_root(&self.seen_nonces);
+                ApiResponse::StateRoot {
+                    state_root: hex::encode(root),
+                    epoch: self.economic_engine.epoch_count(),
+                }
+            }
         };
 
         let _ = msg.reply.send(response);

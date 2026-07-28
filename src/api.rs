@@ -59,6 +59,10 @@ pub enum ApiRequest {
     GetCertificate { proposal_id: String },
     GetStats,
     GetPeers,
+    /// Return the node's current state_root hash and epoch.
+    /// Computed on demand from in-memory state — reflects the
+    /// ledger at query time, which may be mid-epoch.
+    GetStateRoot,
     GetEpochState,
     GetEconomicState,
     GetNodeInfo,
@@ -133,6 +137,12 @@ pub enum ApiResponse {
     /// Dashboard peers list — heartbeat liveness, silence, queue depth.
     Peers {
         peers: Vec<PeerInfo>,
+    },
+    /// Current state_root hash and epoch. Two nodes at the same
+    /// epoch should produce identical roots if their state agrees.
+    StateRoot {
+        state_root: String,
+        epoch: u64,
     },
     /// Epoch state — last completed epoch's economic parameters.
     EpochState {

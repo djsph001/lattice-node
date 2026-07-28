@@ -197,20 +197,24 @@ ALL `(PeerId, u64)` nonces. Balances ARE included. The hash is
 computed at epoch boundaries AFTER all transactions for that epoch are
 applied.
 
-However, `state_root` is structurally incapable of serving as a
-convergence detector. The negative control (Jul 28, two-node ephemeral
-mesh, both nodes with `--mint 0`, balances=0 on both) demonstrated
-that roots DIVERGE even when economic state is identical. The cause:
-nonce tables are inherently asymmetric across peers — each node tracks
-its own nonces from local transactions, and peer nonces lag depending
-on gossip timing. The combined balance+nonce hash cannot produce
-matching roots for matching economic state.
+However, `state_root` cannot serve as a convergence detector — the
+combined balance+nonce hash produces divergent roots even when
+balances are identical. The negative control (two-node ephemeral,
+both `--mint 0`, balances=0 on both) showed mismatched roots due to
+nonce asymmetry. On the production mesh (800+ epochs), peer nonces
+remain frozen at 0 on both nodes despite hundreds of transactions.
+
+The nonce maps do not converge under the observed conditions,
+including precisely the failure conditions a detector would need to
+distinguish. A balance-only hash would work; the combined hash cannot
+produce matching roots for matching economic state under any observed
+scenario.
 
 Classification: **C** — `state_root` as currently constructed cannot
-serve as a supply-convergence detector. A balance-only hash would
-suffice; the combined hash cannot. The mechanism was built for block
-verification where the asymmetry is expected; it is not suitable for
-cross-node state comparison without modification.
+serve as a supply-convergence detector. A balance-only fingerprint is
+the mechanism that would work. The combined hash was built for block
+verification where asymmetry is expected; it is not suitable for
+cross-node state comparison.
 
 ### Redistribution Supply Divergence — Original
 

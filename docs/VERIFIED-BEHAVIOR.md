@@ -26,8 +26,11 @@ Protocol-Level Findings).
 > Divergence in economically relevant state between nodes must be
 > detectable within 10 epochs.
 
-The 10-epoch bound is provisional — testable without pretending the value
-is permanently settled. No detection mechanism currently exists.
+The 10-epoch bound is provisional. No detection mechanism currently
+exists. `state_root` was investigated (Mission A) and found structurally
+incapable — combined balance+nonce hash diverges even when balances match
+due to asymmetric nonce tables across peers. A balance-only hash would
+suffice; none exists.
 
 ---
 
@@ -192,22 +195,22 @@ The `state_root()` hash (`src/ledger/state.rs:236-255`) covers ALL
 `(PeerId, DigitalUtilityUnit)` balances sorted by PeerId, followed by
 ALL `(PeerId, u64)` nonces. Balances ARE included. The hash is
 computed at epoch boundaries AFTER all transactions for that epoch are
-applied — two honest nodes at the same epoch with identical accepted
-transactions produce identical roots.
+applied.
 
-However:
-- The combined balance+nonce hash means nonce divergence produces false
-  positives. Nodes with identical supply but different seen_nonces
-  produce different roots.
-- `state_root` is NOT exposed via any API endpoint. It travels only
-  inside `RatificationBlock` over gossipsub.
-- No active peer-comparison protocol exists. Fork detection is passive
-  (receiver vs sender on gossip arrival only).
-- Classification B — mechanism exists and covers balances, but is not
-  exposed for active cross-node comparison.
+However, `state_root` is structurally incapable of serving as a
+convergence detector. The negative control (Jul 28, two-node ephemeral
+mesh, both nodes with `--mint 0`, balances=0 on both) demonstrated
+that roots DIVERGE even when economic state is identical. The cause:
+nonce tables are inherently asymmetric across peers — each node tracks
+its own nonces from local transactions, and peer nonces lag depending
+on gossip timing. The combined balance+nonce hash cannot produce
+matching roots for matching economic state.
 
-The Experimenter was correctly NOT activated — there is no measurement
-surface to experiment against.
+Classification: **C** — `state_root` as currently constructed cannot
+serve as a supply-convergence detector. A balance-only hash would
+suffice; the combined hash cannot. The mechanism was built for block
+verification where the asymmetry is expected; it is not suitable for
+cross-node state comparison without modification.
 
 ### Redistribution Supply Divergence — Original
 

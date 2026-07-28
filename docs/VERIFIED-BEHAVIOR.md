@@ -1,12 +1,67 @@
 # Verified Protocol Behavior
 
-**Updated:** 2026-07-27
-**Authority:** Every entry sourced to an observation on real nodes or a
-specific test run. No claims without evidence.
+**Updated:** 2026-07-28
 
 Tiers distinguish between "seen working on a live mesh," "proven by unit
 test only," and "shipped, never exercised." Conflating them is how
 "verified" degrades into "we wrote a test."
+
+---
+
+## Protocol Invariants
+
+### Supply Conservation (PROPOSED)
+
+> A debit recorded on any node's ledger without a corresponding credit on
+> the recipient's ledger is a violation of supply conservation unless the
+> debit is reversed.
+
+This invariant was assumed but never stated in any design document. It is
+recorded here as PROPOSED — the governance layer decides whether to adopt
+it. Currently CONTRADICTED by evidence (see Not Verified — Confirmed
+Protocol-Level Findings).
+
+### Convergence (PROPOSED, provisional bound)
+
+> Divergence in economically relevant state between nodes must be
+> detectable within 10 epochs.
+
+The 10-epoch bound is provisional — testable without pretending the value
+is permanently settled. No detection mechanism currently exists.
+
+---
+
+## Architectural Principle: Local Authority
+
+> No local state, action, or assertion becomes authoritative merely because
+> it succeeded locally.
+
+This principle has been independently observed in four separate instances
+across the Lattice codebase and the Engineering Cell:
+
+1. **Local mint never propagated.** `Minting starting balance to local node
+   amount=5000` — applied locally, never entered the wire on a 2-node mesh.
+   Witness had no path to learn the root's balance.
+
+2. **Sender debited before recipient confirmation.** Redistribution applied
+   `validate_and_apply` locally, then `flush_outbound`. 4,980 DUU debited,
+   0 credited. The debit was authoritative locally; the credit never
+   materialized.
+
+3. **`publish()` returned Ok before delivery.** `gossipsub.publish()` returns
+   a `message_id` for local queue insertion. The injector's process exited
+   before gossipsub forwarded the message. `message_id` was read as delivery
+   confirmation; it wasn't.
+
+4. **Agent verification didn't confirm delivery.** Both the Observer
+   (balance-divergence diagnosis) and the Verifier (APPROVED verdict)
+   produced claims that exceeded the evidence they were based on. Each was
+   caught and corrected by a subsequent pass.
+
+In all four cases, a subsystem reported success locally. In all four cases,
+that success did not establish the corresponding distributed property. The
+reflex that caught them — checking whether the verification mechanism itself
+ran — is the operational form of this principle.
 
 ---
 

@@ -39,31 +39,20 @@ ports 4105/4110.
 Full sequence: submit via UDS → sign locally → validate → dedup → cap →
 persist → gossip → recover on restart.
 
-**What was observed (Jul 27, e7d9e1e):**
-- `SubmitObjection { target_claim_id, reason }` → `ObjectionSubmitted`
-- `GetAllObjections` → returns correct objector/reason/timestamp
-- Same submission repeated → `Error: Duplicate { claim_id, objector }`
-- Kill-9 + restart → objection recovered and queryable
-- Build: `ae89fbd` (hash lag, no code changes between ae89fbd and e7d9e1e
-  in the persistence path)
+**What was observed (Jul 27-28):**
+- `SubmitObjection { target_claim_id, reason }` → `ObjectionSubmitted` (Jul 27)
+- `GetAllObjections` → returns correct objector/reason/timestamp (Jul 27)
+- Same submission repeated → `Error: Duplicate { claim_id, objector }` (Jul 27)
+- Kill-9 + restart → objection recovered and queryable (Jul 27)
+- **Receive via gossipsub** → first real exercise (Jul 28, EXP-CAP-002).
+  65+ objections published, deserialized, validated, and correctly
+  dispositioned. Transport delivery required injector fix (8b329b7).
+- **Cap enforcement** → 64 distinct accepted, 65th rejected with limit
+  named, duplicate after cap is no-op not cap rejection (Jul 28, EXP-CAP-002).
 
 ---
 
 ## Verified by Test Only (Never Exercised on a Live Mesh)
-
-### Objection Cap Enforcement
-
-Three unit tests in `persistence.rs` (b4aa212):
-
-- `cap_accepts_64th_distinct_objector` — 64 distinct objectors, 64th accepted
-- `cap_rejects_65th_distinct_objector` — 65 distinct objectors, 65th rejected
-- `cap_duplicate_after_full_is_noop_not_rejection` — duplicate from existing
-  objector after cap reached is a no-op, not a cap rejection
-
-The cap logic (inside `process_objection`) operates on the in-memory
-`HashMap` the same way regardless of source — receive via gossip or submit
-via UDS. The map operations are identical. But the receive boundary was never
-exercised with 64 distinct objectors on a running mesh.
 
 ### Objection Validation
 
@@ -89,12 +78,11 @@ restored (214eb73).
 
 This is the bucket that matters when someone asks "what's safe to rely on."
 
-- **Objection cap at 64 on a live receive boundary.** Unit tests cover the
-  map operations; no test exercises the gossip handler receiving objection
-  #65 from a real peer.
 - **Objection propagation.** The `publish_objection` call executes after
   `process_objection`, but no test verified that a second node receives
-  an objection submitted via UDS on the first.
+  an objection submitted via UDS on the first. (Verified Jul 28: cross-node
+  propagation not tested, but gossip receive path verified via injector in
+  EXP-CAP-002.)
 - **GetAllObjections at scale.** Unbounded; returns everything. Not tested
   with >64 entries or across claims.
 - **Observer-mode genesis Sybil surface.** An observer node can publish

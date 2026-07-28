@@ -407,6 +407,44 @@ pub struct WitnessRequest {
     pub requested_at_epoch: u64,
 }
 
+// ── Economic Comparison RPC ───────────────────────────────
+// Protocol: /lattice/econ-compare/v1
+
+/// Request a scoped balance fingerprint comparison between peers.
+///
+/// The requester names a set of peers it wants to compare balances for.
+/// The responder computes a fingerprint over ONLY the subset it knows,
+/// making scope asymmetry visible via the included_peers field.
+///
+/// Protocol rules:
+///   - "Unknown is not zero" — a missing peer is scope asymmetry, never zero
+///   - Fingerprint hashes over INCLUDED set only, no nonces
+///   - Epoch is advisory — different epochs mean "inconclusive," not "divergence"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComparisonRequest {
+    /// PeerIds (base58 strings) whose balances the requester wants to compare.
+    pub requested_peers: Vec<String>,
+    /// Epoch count of the requester — advisory only.
+    pub requester_epoch: u64,
+}
+
+/// Response to a ComparisonRequest.
+///
+/// The responder echoes the requested_peers list and reports which subset
+/// it actually knows. The balance_fingerprint is a blake3 hash over the
+/// (PeerId, balance) pairs for the INCLUDED peers only, sorted by PeerId.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComparisonResponse {
+    /// Echo of the request's requested_peers.
+    pub requested_peers: Vec<String>,
+    /// Subset of requested_peers the responder actually knows.
+    pub included_peers: Vec<String>,
+    /// Blake3 hex-encoded fingerprint over (PeerId, balance) for included_peers.
+    pub balance_fingerprint: String,
+    /// Epoch count of the responder — advisory only.
+    pub responder_epoch: u64,
+}
+
 /// Response to a witness request — acceptance or decline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WitnessResponse {

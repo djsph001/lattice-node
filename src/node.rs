@@ -26,6 +26,7 @@ use crate::message::codec::rpc::{BalanceCodec, BalanceProtocol, LatticeCodec, La
 use crate::message::codec::rpc::{TransactionCodec, TransactionProtocol, VerifyProtocol};
 use crate::message::codec::rpc::{ChainSyncCodec, ChainSyncProtocol};
 use crate::message::codec::rpc::{WitnessCodec, WitnessProtocol};
+use crate::message::codec::rpc::{CompareCodec, CompareProtocol};
 use crate::message::types::{
     BalanceRequest, BalanceResponse, Heartbeat, LatticeMessage, StatusRequest, StatusResponse,
 };
@@ -34,6 +35,7 @@ use crate::message::types::{ChainRangeRequest, ChainRangeResponse};
 use crate::message::types::WireBlock;
 use crate::message::types::{VerifyRequest, VerifyResponse};
 use crate::message::types::{WitnessRequest, WitnessResponse};
+use crate::message::types::{ComparisonRequest, ComparisonResponse};
 use crate::message::types::{RatificationBlock, ERA_ONE_BLOCK_MARKER, ERA_TWO_BLOCK_MARKER};
 use crate::network::protocol::{
     LatticeBehaviour, LatticeBehaviourEvent, LATTICE_HEARTBEAT_TOPIC, LATTICE_KAD_PROTOCOL,
@@ -681,6 +683,12 @@ impl LatticeNode {
                     request_response::Config::default(),
                 );
 
+                // Economic comparison RPC channel — scoped balance fingerprint comparison.
+                let compare_rpc = request_response::Behaviour::new(
+                    [(CompareProtocol, request_response::ProtocolSupport::Full)],
+                    request_response::Config::default(),
+                );
+
                 Ok(LatticeBehaviour::new(
                     mdns,
                     gossipsub,
@@ -695,6 +703,7 @@ impl LatticeNode {
                     tx_rpc,
                     chain_sync_rpc,
                     witness_rpc,
+                    compare_rpc,
                 ))
             })?
             .with_swarm_config(|c| {
@@ -2440,6 +2449,82 @@ impl LatticeNode {
         self.swarm.behaviour_mut().witness_rpc.send_request(&peer, request)
     }
 
+    // ── Economic Comparison RPC ────────────────────────────────
+
+    /// Compute a blake3 balance fingerprint over a specific subset of peers.
+    ///
+    /// Only peers present in the `included` set are hashed. Each entry is
+    /// `peer_id.to_bytes() || balance.0.to_le_bytes()`, sorted by PeerId for
+    /// determinism. No nonces, no timestamps — pure balance fingerprint.
+    ///
+    /// Returns hex-encoded hash of the included entries.
+    fn compute_balance_fingerprint(&self, included: &HashSet<PeerId>) -> String {
+        let mut sorted_balances: Vec<(&PeerId, &DigitalUtilityUnit)> = self
+            .ledger
+            .balances
+            .iter()
+            .filter(|(peer, _)| included.contains(peer))
+            .collect();
+        sorted_balances.sort_by_key(|(peer, _)| *peer);
+
+        let mut hasher = blake3::Hasher::new();
+        for (peer, balance) in &sorted_balances {
+            hasher.update(peer.to_bytes().as_slice());
+            hasher.update(&balance.0.to_le_bytes());
+        }
+        hex::encode(hasher.finalize().as_bytes())
+    }
+
+    /// Handle an incoming comparison request — compute the fingerprint
+    /// over the subset of requested peers this node actually knows.
+    ///
+    /// Protocol rules:
+    ///   - "Unknown is not zero" — a missing peer is scope asymmetry
+    ///   - Hash only the INCLUDED set, no nonces
+    ///   - Epoch is advisory — reported, not synchronized
+    fn handle_comparison_request(
+        &self,
+        request: &ComparisonRequest,
+        epoch: u64,
+    ) -> ComparisonResponse {
+        let mut included_peers: Vec<String> = Vec::new();
+        let mut known_peers: HashSet<PeerId> = HashSet::new();
+
+        for peer_str in &request.requested_peers {
+            if let Ok(pid) = peer_str.parse::<PeerId>() {
+                if self.ledger.balances.contains_key(&pid) {
+                    included_peers.push(peer_str.clone());
+                    known_peers.insert(pid);
+                }
+            }
+        }
+
+        let balance_fingerprint = self.compute_balance_fingerprint(&known_peers);
+
+        ComparisonResponse {
+            requested_peers: request.requested_peers.clone(),
+            included_peers,
+            balance_fingerprint,
+            responder_epoch: epoch,
+        }
+    }
+
+    /// Initiate a balance fingerprint comparison with a specific peer.
+    ///
+    /// The caller provides the set of peer IDs (base58 strings) to compare.
+    /// Returns the outbound request ID for matching the response.
+    pub fn send_comparison_request(
+        &mut self,
+        peer: &PeerId,
+        requested_peers: Vec<String>,
+    ) -> libp2p::request_response::OutboundRequestId {
+        let request = ComparisonRequest {
+            requested_peers,
+            requester_epoch: self.economic_engine.epoch_count(),
+        };
+        self.swarm.behaviour_mut().compare_rpc.send_request(peer, request)
+    }
+
     // ── Witness claim orchestration ────────────────────────────
 
     /// Initiate a service attestation claim: identify witnesses,
@@ -3852,6 +3937,46 @@ impl LatticeNode {
                 request_response::Event::OutboundFailure { peer, error, .. },
             )) => {
                 warn!(peer = %peer, error = ?error, "[witness] Request failed");
+            }
+
+            // ── Economic Comparison RPC ────────────────────────
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::CompareRpc(
+                request_response::Event::Message { peer, message },
+            )) => {
+                match message {
+                    request_response::Message::Request {
+                        request_id: _, request, channel,
+                    } => {
+                        // Responder side: compute balance fingerprint for the
+                        // subset of requested peers this node actually knows.
+                        let epoch = self.economic_engine.epoch_count();
+                        let response = self.handle_comparison_request(&request, epoch);
+                        let _ = self.swarm.behaviour_mut().compare_rpc
+                            .send_response(channel, response);
+                        info!(
+                            peer = %peer,
+                            requested = request.requested_peers.len(),
+                            included = request.requested_peers.len(), // reported by handler
+                            "[econ-compare] Comparison request handled"
+                        );
+                    }
+                    request_response::Message::Response { response, .. } => {
+                        // Requester side: log the comparison result.
+                        info!(
+                            peer = %peer,
+                            requested = %response.requested_peers.len(),
+                            included = %response.included_peers.len(),
+                            fingerprint = %response.balance_fingerprint,
+                            their_epoch = response.responder_epoch,
+                            "[econ-compare] Comparison response received"
+                        );
+                    }
+                }
+            }
+            SwarmEvent::Behaviour(LatticeBehaviourEvent::CompareRpc(
+                request_response::Event::OutboundFailure { peer, error, .. },
+            )) => {
+                warn!(peer = %peer, error = ?error, "[econ-compare] Request failed");
             }
 
             // ── Kademlia events ──────────────────────────────
@@ -7907,10 +8032,16 @@ mod two_swarm_witness_harness {
                         request_response::Config::default(),
                     );
 
+                    let compare_rpc = request_response::Behaviour::new(
+                        [(CompareProtocol, request_response::ProtocolSupport::Full)],
+                        request_response::Config::default(),
+                    );
+
                     Ok(LatticeBehaviour::new(
                         mdns, gossipsub, rpc, balance_rpc, verify_rpc,
                         kademlia, relay_client, relay_server, identify,
                         agent_rpc, tx_rpc, chain_sync_rpc, witness_rpc,
+                        compare_rpc,
                     ))
                 })
                 .expect("behaviour")

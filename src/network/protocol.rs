@@ -5,13 +5,14 @@ use libp2p::{gossipsub, identify, kad, mdns, relay, request_response, swarm::Net
 use libp2p::swarm::behaviour::toggle::Toggle;
 
 use crate::message::codec::rpc::{ChainSyncCodec, BalanceCodec, LatticeCodec};
-use crate::message::codec::rpc::{TransactionCodec, VerifyCodec, WitnessCodec};
+use crate::message::codec::rpc::{TransactionCodec, VerifyCodec, WitnessCodec, CompareCodec};
 use crate::message::types::{BalanceRequest, BalanceResponse, StatusRequest, StatusResponse};
 use crate::message::types::{TransactionRequest, TransactionResponse};
 use crate::message::types::WireBlock;
 use crate::message::types::{ChainRangeRequest, ChainRangeResponse};
 use crate::message::types::{VerifyRequest, VerifyResponse};
 use crate::message::types::{WitnessRequest, WitnessResponse};
+use crate::message::types::{ComparisonRequest, ComparisonResponse};
 use crate::agent::codec::{AgentStateCodec, AGENT_STATE_PROTOCOL};
 use crate::agent::state::{AgentStateQuery, AgentStateReply};
 
@@ -87,6 +88,8 @@ pub struct LatticeBehaviour {
     pub chain_sync_rpc: request_response::Behaviour<ChainSyncCodec>,
     /// Witness RPC for claim signing
     pub witness_rpc: request_response::Behaviour<WitnessCodec>,
+    /// Economic comparison RPC for scoped balance fingerprint comparison.
+    pub compare_rpc: request_response::Behaviour<CompareCodec>,
 }
 
 impl LatticeBehaviour {
@@ -104,6 +107,7 @@ impl LatticeBehaviour {
         tx_rpc: request_response::Behaviour<TransactionCodec>,
         chain_sync_rpc: request_response::Behaviour<ChainSyncCodec>,
         witness_rpc: request_response::Behaviour<WitnessCodec>,
+        compare_rpc: request_response::Behaviour<CompareCodec>,
     ) -> Self {
         Self {
             mdns,
@@ -119,6 +123,7 @@ impl LatticeBehaviour {
             tx_rpc,
             chain_sync_rpc,
             witness_rpc,
+            compare_rpc,
         }
     }
 }
@@ -148,6 +153,8 @@ pub enum LatticeBehaviourEvent {
     ChainSyncRpc(request_response::Event<ChainRangeRequest, ChainRangeResponse>),
     /// Witness RPC events — incoming witness requests and responses.
     WitnessRpc(request_response::Event<WitnessRequest, WitnessResponse>),
+    /// Economic comparison RPC events.
+    CompareRpc(request_response::Event<ComparisonRequest, ComparisonResponse>),
 }
 
 impl From<mdns::Event> for LatticeBehaviourEvent {
@@ -249,5 +256,15 @@ impl From<request_response::Event<WitnessRequest, WitnessResponse>>
 {
     fn from(event: request_response::Event<WitnessRequest, WitnessResponse>) -> Self {
         LatticeBehaviourEvent::WitnessRpc(event)
+    }
+}
+
+impl From<request_response::Event<ComparisonRequest, ComparisonResponse>>
+    for LatticeBehaviourEvent
+{
+    fn from(
+        event: request_response::Event<ComparisonRequest, ComparisonResponse>,
+    ) -> Self {
+        LatticeBehaviourEvent::CompareRpc(event)
     }
 }

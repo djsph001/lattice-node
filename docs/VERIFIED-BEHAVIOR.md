@@ -179,24 +179,35 @@ loss or wire-level corruption across 549 epochs.
 ### Supply Conservation
 
 **Status:** CONTRADICTED — mesh-wide accounting divergence  
-**Verified by:** Verifier Mission 1 (Jul 27), Observers passes 1-24
+**Verified by:** Verifier Mission 1 (Jul 27) + Mission A (Jul 28)
 
 In the tested redistribution sequence, morning-api's ledger decreased by
 4,980 DUU while local-witness credited 0 DUU. All 118 transfers were
 received (transfer path confirmed) and all 118 were correctly rejected
-by the witness's validation. The sender debited before recipient
-confirmation. Total supply by morning-api's accounting: 5,000. By
-witness's accounting: 0.
+by the witness's validation.
 
-The relevant conservation invariant was not previously specified and is
-now recorded as violated under the tested conditions.
+**Root cause decomposition:**
 
-**Candidate invariant (proposed, pending governance):**
+The `state_root()` hash (`src/ledger/state.rs:236-255`) covers ALL
+`(PeerId, DigitalUtilityUnit)` balances sorted by PeerId, followed by
+ALL `(PeerId, u64)` nonces. Balances ARE included. The hash is
+computed at epoch boundaries AFTER all transactions for that epoch are
+applied — two honest nodes at the same epoch with identical accepted
+transactions produce identical roots.
 
-> Supply Conservation Invariant: For every valid ledger state, the sum of
-> all spendable balances across the mesh must equal the network's recognized
-> total supply, subject only to explicitly defined issuance, destruction, or
-> escrow states.
+However:
+- The combined balance+nonce hash means nonce divergence produces false
+  positives. Nodes with identical supply but different seen_nonces
+  produce different roots.
+- `state_root` is NOT exposed via any API endpoint. It travels only
+  inside `RatificationBlock` over gossipsub.
+- No active peer-comparison protocol exists. Fork detection is passive
+  (receiver vs sender on gossip arrival only).
+- Classification B — mechanism exists and covers balances, but is not
+  exposed for active cross-node comparison.
+
+The Experimenter was correctly NOT activated — there is no measurement
+surface to experiment against.
 
 ### Redistribution Supply Divergence — Original
 
@@ -226,9 +237,9 @@ They prevent the codebase from conflating explanation with evidence.
    — `validate_and_apply` runs before `flush_outbound`. The debit is
    unconditional.
 
-3. **No reconciliation mechanism.** The state_root and thickness_root work
-   from Era Two exists but nothing currently uses it to detect or correct
-   cross-node divergence.
+3. **No reconciliation mechanism.** The `state_root` machinery exists but
+   is not exposed for active cross-node comparison. See Misson A finding
+   below.
 
 ---
 

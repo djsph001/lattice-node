@@ -91,10 +91,18 @@ pub fn pair_weight(n: u64) -> f64 {
 ///   - Updating the claim nonce map
 ///   - Adding a ThicknessEdge via the graph
 ///   - Broadcasting the acceptance to the mesh
+///
+/// `witness_keys` is an optional map of PeerId → Ed25519 PublicKey for
+/// cryptographic verification of witness signatures. When `Some(keys)`:
+///   - each witness signature is verified against the reconstructed payload
+///   - missing keys or invalid signatures → `ClaimRejection::InvalidSignature`
+/// When `None`: verification is SKIPPED (backward compat for tests
+/// that don't have key material). Production callers MUST pass `Some`.
 pub fn accept_claim(
     claim: &WitnessedClaim,
     last_claimed: &ClaimNonceMap,
     established_peers: usize,
+    witness_keys: Option<&std::collections::HashMap<PeerId, libp2p::identity::PublicKey>>,
 ) -> Result<f64, ClaimRejection> {
     // ── Basic structural checks ───────────────────────────────
     if claim.start_epoch > claim.end_epoch {
@@ -148,13 +156,28 @@ pub fn accept_claim(
         }
     }
 
-    // ── Witness self-check: each witness attests its own data ──
-    for sig in &claim.witnesses {
-        if sig.observed_heartbeats == 0 && claim.claim_type == ClaimType::ServiceAttestation {
-            // The witness claims it observed zero heartbeats from the
-            // claimant during the window — this is not necessarily
-            // invalid (the claimant might genuinely have been silent),
-            // but such a claim would earn zero thickness.
+    // ── Cryptographic witness signature verification (D7.4) ────
+    match witness_keys {
+        Some(keys) => {
+            for sig in &claim.witnesses {
+                let pk = keys.get(&sig.witness).ok_or_else(|| {
+                    ClaimRejection::InvalidSignature(sig.witness)
+                })?;
+                if !super::verify_witness_signature(
+                    &claim.claim_id,
+                    &sig.witness,
+                    sig.signed_at_epoch,
+                    sig.observed_heartbeats,
+                    &sig.signature,
+                    pk,
+                ) {
+                    return Err(ClaimRejection::InvalidSignature(sig.witness));
+                }
+            }
+        }
+        None => {
+            // Backward compat: no key material available.
+            // Production callers MUST pass Some(keys).
         }
     }
 
@@ -228,7 +251,7 @@ mod tests {
         map.insert(key.clone(), 100);
 
         let claim2 = make_claim(c.clone(), 50, 150, vec![make_sig(w.clone(), 10)]);
-        let result = accept_claim(&claim2, &map, 2);
+        let result = accept_claim(&claim2, &map, 2, None);
         assert!(matches!(result, Err(ClaimRejection::Overlap { .. })));
     }
 
@@ -238,11 +261,11 @@ mod tests {
         let w = test_peer();
         let claim = make_claim(c.clone(), 1, 10, vec![make_sig(w.clone(), 5)]);
         // 3 established peers, MIN_WITNESSES=1, no clamp needed
-        let result = accept_claim(&claim, &ClaimNonceMap::new(), 3);
+        let result = accept_claim(&claim, &ClaimNonceMap::new(), 3, None);
         assert!(result.is_ok());
 
         // But with only 2 established peers, effective MIN=1 still works
-        let result2 = accept_claim(&claim, &ClaimNonceMap::new(), 2);
+        let result2 = accept_claim(&claim, &ClaimNonceMap::new(), 2, None);
         assert!(result2.is_ok());
     }
 
@@ -250,7 +273,7 @@ mod tests {
     fn test_claimant_cannot_be_witness() {
         let c = test_peer();
         let claim = make_claim(c.clone(), 1, 10, vec![make_sig(c.clone(), 5)]);
-        let result = accept_claim(&claim, &ClaimNonceMap::new(), 2);
+        let result = accept_claim(&claim, &ClaimNonceMap::new(), 2, None);
         assert!(matches!(result, Err(ClaimRejection::ClaimantEqualsWitness(_))));
     }
 
@@ -259,7 +282,7 @@ mod tests {
         let c = test_peer();
         let w = test_peer();
         let claim = make_claim(c.clone(), 1, 10, vec![make_sig(w.clone(), 5)]);
-        let result = accept_claim(&claim, &ClaimNonceMap::new(), 1);
+        let result = accept_claim(&claim, &ClaimNonceMap::new(), 1, None);
         assert!(matches!(result, Err(ClaimRejection::Internal(_))));
     }
 
@@ -286,7 +309,7 @@ mod tests {
             claim_id: [0u8; 32],
         };
         claim.claim_id = claim.compute_claim_id();
-        let result = accept_claim(&claim, &ClaimNonceMap::new(), 2);
+        let result = accept_claim(&claim, &ClaimNonceMap::new(), 2, None);
         assert!(matches!(result, Err(ClaimRejection::Malformed(_))));
     }
 
@@ -295,5 +318,181 @@ mod tests {
         assert!(!is_established(0));
         assert!(is_established(1));
         assert!(is_established(100));
+    }
+
+    #[test]
+    fn establishment_gate() {
+        let c = test_peer();
+        let claim = make_claim(c.clone(), 1, 10, vec![make_sig(test_peer(), 5)]);
+        let result = accept_claim(&claim, &ClaimNonceMap::new(), 2, None);
+        assert!(result.is_ok(), "valid claim with established peer must be accepted");
+    }
+
+    #[test]
+    fn zero_established_peers_rejected() {
+        let c = test_peer();
+        let claim = make_claim(c.clone(), 1, 10, vec![make_sig(test_peer(), 5)]);
+        let result = accept_claim(&claim, &ClaimNonceMap::new(), 0, None);
+        match result {
+            Err(ClaimRejection::Internal(_)) => {} // expected
+            other => panic!("expected Internal rejection for zero established peers, got {:?}", other),
+        }
+    }
+}
+
+// ── Property 1: Classification Correctness ─────────────────
+// Self-test: temporarily make accept_claim always return Ok(1.0)
+// by adding `return Ok(1.0);` as the first line of the function body.
+// These tests must go RED when the gate is broken.
+
+#[cfg(test)]
+mod property1_tests {
+    use super::*;
+    use crate::claims::{ClaimType, ClaimEvidence, WitnessSignature};
+    use libp2p::PeerId;
+
+    fn peer() -> PeerId { PeerId::random() }
+
+    fn wsig(w: PeerId, obs: u64) -> WitnessSignature {
+        WitnessSignature { witness: w, observed_heartbeats: obs, signed_at_epoch: 0, signature: vec![] }
+    }
+
+    fn svc_claim(claimant: PeerId, witnesses: Vec<WitnessSignature>, start: u64, end: u64) -> WitnessedClaim {
+        let mut c = WitnessedClaim {
+            claimant, claim_type: ClaimType::ServiceAttestation,
+            start_epoch: start, end_epoch: end,
+            evidence: ClaimEvidence::Service { claimed_count: 0 },
+            witnesses, submitted_epoch: end + 1, claim_id: [0u8; 32],
+        };
+        c.claim_id = c.compute_claim_id();
+        c
+    }
+
+    #[test]
+    fn self_witness_rejected() {
+        let p = peer();
+        let c = svc_claim(p, vec![wsig(p, 10)], 1, 10);
+        match accept_claim(&c, &ClaimNonceMap::new(), 2, None) {
+            Err(ClaimRejection::ClaimantEqualsWitness(_)) => {} // good
+            other => panic!("expected ClaimantEqualsWitness, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn valid_claim_accepted() {
+        let claimant = peer();
+        let witness = peer();
+        let c = svc_claim(claimant, vec![wsig(witness, 10)], 1, 10);
+        match accept_claim(&c, &ClaimNonceMap::new(), 2, None) {
+            Ok(t) => assert!(t > 0.0),
+            Err(e) => panic!("expected Ok, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn forged_signature_rejected() {
+        use libp2p::identity;
+        let claimant = peer();
+        let wkp = identity::Keypair::generate_ed25519();
+        let wpeer = PeerId::from(wkp.public());
+        let mut c = svc_claim(claimant, vec![], 1, 10);
+        // Sign the payload with the real key
+        let ch = c.compute_claim_id();
+        let epoch: u64 = 0; let obs: u64 = 10;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(crate::claims::WITNESS_DOMAIN);
+        payload.extend_from_slice(&ch);
+        payload.extend_from_slice(&wpeer.to_bytes());
+        payload.extend_from_slice(&epoch.to_le_bytes());
+        payload.extend_from_slice(&obs.to_le_bytes());
+        c.witnesses.push(WitnessSignature { witness: wpeer, observed_heartbeats: obs, signed_at_epoch: 0, signature: wkp.sign(&payload).expect("sign") });
+        c.claim_id = c.compute_claim_id();
+
+        // Valid: right key
+        let mut keys: HashMap<PeerId, identity::PublicKey> = HashMap::new();
+        keys.insert(wpeer, wkp.public());
+        match accept_claim(&c, &ClaimNonceMap::new(), 2, Some(&keys)) {
+            Ok(t) => assert!(t > 0.0, "valid signature must be accepted"),
+            Err(e) => panic!("expected Ok for valid sig, got {:?}", e),
+        }
+
+        // Forged: wrong key
+        let wrong_kp = identity::Keypair::generate_ed25519();
+        let mut forged_keys: HashMap<PeerId, identity::PublicKey> = HashMap::new();
+        forged_keys.insert(wpeer, wrong_kp.public());
+        match accept_claim(&c, &ClaimNonceMap::new(), 2, Some(&forged_keys)) {
+            Err(ClaimRejection::InvalidSignature(_)) => {} // expected
+            other => panic!("expected InvalidSignature for forged key, got {:?}", other),
+        }
+
+        // Missing key
+        let empty_keys: HashMap<PeerId, identity::PublicKey> = HashMap::new();
+        match accept_claim(&c, &ClaimNonceMap::new(), 2, Some(&empty_keys)) {
+            Err(ClaimRejection::InvalidSignature(_)) => {} // expected
+            other => panic!("expected InvalidSignature for missing key, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mutated_field_rejected() {
+        use libp2p::identity;
+        let claimant = peer();
+        let wkp = identity::Keypair::generate_ed25519();
+        let wpeer = PeerId::from(wkp.public());
+        let mut c = svc_claim(claimant, vec![], 1, 10);
+        let ch = c.compute_claim_id();
+        let epoch: u64 = 0; let obs: u64 = 10;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(crate::claims::WITNESS_DOMAIN);
+        payload.extend_from_slice(&ch);
+        payload.extend_from_slice(&wpeer.to_bytes());
+        payload.extend_from_slice(&epoch.to_le_bytes());
+        payload.extend_from_slice(&obs.to_le_bytes());
+        let real_sig = wkp.sign(&payload).expect("sign");
+        c.witnesses.push(WitnessSignature {
+            witness: wpeer,
+            observed_heartbeats: obs + 5,  // MUTATED: claim says 15 but witness signed 10
+            signed_at_epoch: 0,
+            signature: real_sig,
+        });
+        c.claim_id = c.compute_claim_id();
+
+        let mut keys: HashMap<PeerId, identity::PublicKey> = HashMap::new();
+        keys.insert(wpeer, wkp.public());
+        match accept_claim(&c, &ClaimNonceMap::new(), 2, Some(&keys)) {
+            Err(ClaimRejection::InvalidSignature(_)) => {} // mutation detected
+            other => panic!("expected InvalidSignature for mutated field, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn happy_path_accepted() {
+        use libp2p::identity;
+        let claimant = peer();
+        let wkp = identity::Keypair::generate_ed25519();
+        let wpeer = PeerId::from(wkp.public());
+        let mut c = svc_claim(claimant, vec![], 1, 10);
+        let ch = c.compute_claim_id();
+        let epoch: u64 = 0; let obs: u64 = 10;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(crate::claims::WITNESS_DOMAIN);
+        payload.extend_from_slice(&ch);
+        payload.extend_from_slice(&wpeer.to_bytes());
+        payload.extend_from_slice(&epoch.to_le_bytes());
+        payload.extend_from_slice(&obs.to_le_bytes());
+        c.witnesses.push(WitnessSignature {
+            witness: wpeer,
+            observed_heartbeats: obs,  // matches what was signed
+            signed_at_epoch: 0,
+            signature: wkp.sign(&payload).expect("sign"),
+        });
+        c.claim_id = c.compute_claim_id();
+
+        let mut keys: HashMap<PeerId, identity::PublicKey> = HashMap::new();
+        keys.insert(wpeer, wkp.public());
+        match accept_claim(&c, &ClaimNonceMap::new(), 2, Some(&keys)) {
+            Ok(t) => assert!(t > 0.0, "happy path must earn thickness: {t}"),
+            Err(e) => panic!("happy path must be accepted, got {:?}", e),
+        }
     }
 }

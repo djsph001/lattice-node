@@ -457,10 +457,13 @@ pub struct WitnessResponse {
     pub claim_hash: [u8; 32],
     /// When the witness responded (epoch).
     pub witnessed_at_epoch: u64,
-    /// Ed25519 signature over (claim_hash || witness_id || witnessed_at_epoch).
+    /// Ed25519 signature over (claim_hash || witness_id || witnessed_at_epoch || observed_heartbeats).
     /// Empty = witness declined.
     pub signature: Vec<u8>,
     /// Human-readable reason for declining (empty on acceptance).
     pub decline_reason: Option<String>,
+    /// Heartbeat count the witness observed for the claimant.
+    /// Signed by the witness — cannot be fabricated by the claimant.
+    pub observed_heartbeats: u64,
 }
 

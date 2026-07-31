@@ -22,7 +22,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use crate::agent::ModelSize;
 
-use node::LatticeNode;
+
 
 /// Lattice mesh node — sovereign peer-to-peer application layer
 #[derive(Parser, Debug)]
@@ -376,7 +376,7 @@ async fn main() -> Result<()> {
     };
     // ── End lockfile guard ──────────────────────────────────
 
-    let mut node = LatticeNode::new(
+    let mut node = node::LatticeNode::new(
         cli.port,
         cli.name,
         cli.heartbeat_interval,

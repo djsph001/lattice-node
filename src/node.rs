@@ -2373,6 +2373,7 @@ impl LatticeNode {
                 witness_id: witness_peer_id,
                 claim_hash: request.claim_hash,
                 witnessed_at_epoch: epoch,
+                observed_heartbeats: 0,
                 signature: Vec::new(),
                 decline_reason: Some("Self-witness is not permitted".into()),
             };
@@ -2391,6 +2392,7 @@ impl LatticeNode {
                 witness_id: witness_peer_id,
                 claim_hash: request.claim_hash,
                 witnessed_at_epoch: epoch,
+                observed_heartbeats: 0,
                 signature: Vec::new(),
                 decline_reason: Some(
                     "Claimant is not established (no heartbeats observed)".into()
@@ -2398,12 +2400,19 @@ impl LatticeNode {
             };
         }
 
-        // Gate 3: domain-separated signing
+        // (A) Origin: compute observed_heartbeats from our own peer_table
+        let observed_heartbeats = peer_table
+            .get(&request.claimant_id)
+            .map(|info| info.heartbeats_received)
+            .unwrap_or(0);
+
+        // (B) Binding: include observed_heartbeats in the signing payload
         let payload = [
             crate::claims::WITNESS_DOMAIN as &[u8],
             &request.claim_hash[..],
             &witness_peer_id.to_bytes()[..],
             &epoch.to_le_bytes()[..],
+            &observed_heartbeats.to_le_bytes()[..],
         ].concat();
 
         match local_key.sign(&payload) {
@@ -2412,6 +2421,7 @@ impl LatticeNode {
                     claim_id = %request.claim_id,
                     witness = %witness_peer_id,
                     sig_len = sig.len(),
+                    observed_heartbeats,
                     "Witness signature issued (domain-separated)"
                 );
                 WitnessResponse {
@@ -2421,6 +2431,7 @@ impl LatticeNode {
                     witnessed_at_epoch: epoch,
                     signature: sig,
                     decline_reason: None,
+                    observed_heartbeats,
                 }
             }
             Err(e) => {
@@ -2430,6 +2441,7 @@ impl LatticeNode {
                     witness_id: witness_peer_id,
                     claim_hash: request.claim_hash,
                     witnessed_at_epoch: epoch,
+                    observed_heartbeats: 0,
                     signature: Vec::new(),
                     decline_reason: Some(format!("Signing failed: {e}")),
                 }
@@ -2797,6 +2809,7 @@ impl LatticeNode {
             &assembled,
             &self.last_claimed,
             established,
+            None,
         ) {
             Ok(thickness) => {
                 // Update high-water mark

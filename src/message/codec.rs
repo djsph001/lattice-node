@@ -578,6 +578,7 @@ mod tests {
             claim_hash: [0xCD; 32],
             witnessed_at_epoch: 100,
             signature: sig.clone(),
+            observed_heartbeats: 1,
             decline_reason: None,
         };
 
@@ -598,6 +599,7 @@ mod tests {
             claim_hash: [0xEF; 32],
             witnessed_at_epoch: 0,
             signature: Vec::new(), // empty = declined
+            observed_heartbeats: 0,
             decline_reason: Some("Self-witness is not permitted".into()),
         };
 
@@ -619,6 +621,7 @@ mod tests {
             claim_hash: [0xAA; 32],
             witnessed_at_epoch: 50,
             signature: sig,
+            observed_heartbeats: 1,
             decline_reason: None,
         };
 
@@ -659,8 +662,7 @@ mod tests {
         let valid = crate::claims::verify_witness_signature(
             &claim_hash,
             &witness_id,
-            epoch,
-            &signature,
+            epoch, 0, &signature,
             &pubkey,
         );
         assert!(valid, "signature must verify against canonical payload");
@@ -668,27 +670,27 @@ mod tests {
         // Wrong claim hash fails
         let wrong_hash = [0xFF; 32];
         let valid_wrong = crate::claims::verify_witness_signature(
-            &wrong_hash, &witness_id, epoch, &signature, &pubkey,
+            &wrong_hash, &witness_id, epoch, 0, &signature, &pubkey,
         );
         assert!(!valid_wrong, "wrong claim_hash must fail verification");
 
         // Wrong epoch fails
         let valid_bad_epoch = crate::claims::verify_witness_signature(
-            &claim_hash, &witness_id, 99, &signature, &pubkey,
+            &claim_hash, &witness_id, 99, 0, &signature, &pubkey,
         );
         assert!(!valid_bad_epoch, "wrong epoch must fail verification");
 
         // Wrong witness fails
         let other_id = PeerId::random();
         let valid_bad_witness = crate::claims::verify_witness_signature(
-            &claim_hash, &other_id, epoch, &signature, &pubkey,
+            &claim_hash, &other_id, epoch, 0, &signature, &pubkey,
         );
         assert!(!valid_bad_witness, "wrong witness_id must fail verification");
 
         // Different key fails
         let other_kp = Keypair::generate_ed25519();
         let valid_bad_key = crate::claims::verify_witness_signature(
-            &claim_hash, &witness_id, epoch, &signature, &other_kp.public(),
+            &claim_hash, &witness_id, epoch, 0, &signature, &other_kp.public(),
         );
         assert!(!valid_bad_key, "wrong public key must fail verification");
     }

@@ -182,13 +182,14 @@ pub const DECAY_PER_EPOCH: f64 = 0.999_991_977_5;
 pub const WITNESS_DOMAIN: &[u8; 18] = b"lattice/witness/v1";
 
 /// Verify a witness Ed25519 signature over the canonical payload:
-///   WITNESS_DOMAIN || claim_hash || witness_peer_id_bytes || witnessed_at_epoch_bytes
+///   WITNESS_DOMAIN || claim_hash || witness_peer_id_bytes || witnessed_at_epoch_bytes || observed_heartbeats_bytes
 ///
 /// Returns true if the signature is valid for the given public key.
 pub fn verify_witness_signature(
     claim_hash: &[u8; 32],
     witness_peer_id: &PeerId,
     witnessed_at_epoch: u64,
+    observed_heartbeats: u64,
     signature: &[u8],
     signer_public_key: &libp2p::identity::PublicKey,
 ) -> bool {
@@ -197,6 +198,7 @@ pub fn verify_witness_signature(
         &claim_hash[..],
         &witness_peer_id.to_bytes()[..],
         &witnessed_at_epoch.to_le_bytes()[..],
+        &observed_heartbeats.to_le_bytes()[..],
     ]
     .concat();
     signer_public_key.verify(&payload, signature)

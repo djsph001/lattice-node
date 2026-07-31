@@ -138,9 +138,14 @@ pub struct WitnessSignature {
     /// The witness's own count of heartbeats received FROM the claimant
     /// during the claimed window. This is the authoritative value.
     pub observed_heartbeats: u64,
-    /// Ed25519 signature over the canonical message:
-    ///   claimant || claim_type || start_epoch || end_epoch ||
-    ///   evidence || witness || observed_heartbeats || signed_at_epoch
+    /// Protobuf-encoded Ed25519 public key of the witness. `accept_claim`
+    /// decodes this, confirms it derives `witness` (a claimant can't
+    /// relabel someone else's signature as its own witness), and verifies
+    /// `signature` against it — verification is self-contained and can't
+    /// be skipped by a caller that forgets to pass key material.
+    pub signer_public_key: Vec<u8>,
+    /// Ed25519 signature over the canonical message; see
+    /// `verify_witness_signature`.
     pub signature: Vec<u8>,
 }
 
@@ -180,6 +185,31 @@ pub const DECAY_PER_EPOCH: f64 = 0.999_991_977_5;
 /// Both signer and verifier must use the same constant to reconstruct
 /// the canonical payload. Defined once, imported by both sides.
 pub const WITNESS_DOMAIN: &[u8; 18] = b"lattice/witness/v1";
+
+/// Compute the canonical claim hash for a service attestation:
+///   blake3(claimant || start_epoch || end_epoch || "service_attestation")
+///
+/// This is the hash a claimant sends in `WitnessRequest.claim_hash` and
+/// the hash a witness signs over (see `handle_witness_request` in
+/// node.rs). It is deliberately NOT `WitnessedClaim::compute_claim_id()`
+/// — that hash includes claim_type and CBOR-encoded evidence and is
+/// computed differently (finalize_xof vs finalize), so it will never
+/// match what a witness actually signed. Both the requester and
+/// `accept_claim` must call this same function, or verification either
+/// always fails (false rejection) or, worse, is quietly disabled to
+/// work around the mismatch.
+pub fn compute_service_attestation_hash(
+    claimant: &PeerId,
+    start_epoch: u64,
+    end_epoch: u64,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(claimant.to_bytes().as_ref());
+    hasher.update(&start_epoch.to_le_bytes());
+    hasher.update(&end_epoch.to_le_bytes());
+    hasher.update(b"service_attestation");
+    hasher.finalize().into()
+}
 
 /// Verify a witness Ed25519 signature over the canonical payload:
 ///   WITNESS_DOMAIN || claim_hash || witness_peer_id_bytes || witnessed_at_epoch_bytes || observed_heartbeats_bytes

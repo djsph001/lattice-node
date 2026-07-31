@@ -465,5 +465,9 @@ pub struct WitnessResponse {
     /// Heartbeat count the witness observed for the claimant.
     /// Signed by the witness — cannot be fabricated by the claimant.
     pub observed_heartbeats: u64,
+    /// Protobuf-encoded Ed25519 public key of the witness, so
+    /// `accept_claim` can verify `signature` without needing an
+    /// external peer-key registry.
+    pub signer_public_key: Vec<u8>,
 }
 

@@ -2374,6 +2374,7 @@ impl LatticeNode {
                 claim_hash: request.claim_hash,
                 witnessed_at_epoch: epoch,
                 observed_heartbeats: 0,
+                signer_public_key: Vec::new(),
                 signature: Vec::new(),
                 decline_reason: Some("Self-witness is not permitted".into()),
             };
@@ -2393,6 +2394,7 @@ impl LatticeNode {
                 claim_hash: request.claim_hash,
                 witnessed_at_epoch: epoch,
                 observed_heartbeats: 0,
+                signer_public_key: Vec::new(),
                 signature: Vec::new(),
                 decline_reason: Some(
                     "Claimant is not established (no heartbeats observed)".into()
@@ -2432,6 +2434,7 @@ impl LatticeNode {
                     signature: sig,
                     decline_reason: None,
                     observed_heartbeats,
+                    signer_public_key: local_key.public().encode_protobuf(),
                 }
             }
             Err(e) => {
@@ -2442,6 +2445,7 @@ impl LatticeNode {
                     claim_hash: request.claim_hash,
                     witnessed_at_epoch: epoch,
                     observed_heartbeats: 0,
+                    signer_public_key: Vec::new(),
                     signature: Vec::new(),
                     decline_reason: Some(format!("Signing failed: {e}")),
                 }
@@ -2602,7 +2606,7 @@ impl LatticeNode {
             current_epoch,
             &self.local_peer_id.to_base58()[..8]
         );
-        let claim_hash = self.compute_claim_hash(
+        let claim_hash = crate::claims::compute_service_attestation_hash(
             &self.local_peer_id,
             start_epoch,
             end_epoch,
@@ -2677,21 +2681,6 @@ impl LatticeNode {
         Some((start, end))
     }
 
-    /// Compute the canonical claim hash for a service attestation.
-    fn compute_claim_hash(
-        &self,
-        claimant: &PeerId,
-        start_epoch: u64,
-        end_epoch: u64,
-    ) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(claimant.to_bytes().as_ref());
-        hasher.update(&start_epoch.to_le_bytes());
-        hasher.update(&end_epoch.to_le_bytes());
-        hasher.update(b"service_attestation");
-        hasher.finalize().into()
-    }
-
     /// Route a witness response to the appropriate claim in the
     /// registry. Returns true if the response was claimed (routed
     /// to an active collection), false if it should fall through
@@ -2730,7 +2719,8 @@ impl LatticeNode {
                 state.signatures.push(crate::claims::WitnessSignature {
                     witness: response.witness_id,
                     signed_at_epoch: response.witnessed_at_epoch,
-                    observed_heartbeats: 1,
+                    observed_heartbeats: response.observed_heartbeats,
+                    signer_public_key: response.signer_public_key.clone(),
                     signature: response.signature.clone(),
                 });
             }
@@ -2809,7 +2799,6 @@ impl LatticeNode {
             &assembled,
             &self.last_claimed,
             established,
-            None,
         ) {
             Ok(thickness) => {
                 // Update high-water mark
@@ -7813,14 +7802,27 @@ mod ratification_block_tests {
 mod witness_seam_tests {
     use crate::claims::{self, WitnessSignature, ClaimType, ClaimEvidence, WitnessedClaim};
     use crate::message::types::WitnessResponse;
+    use libp2p::identity;
     use libp2p::PeerId;
 
     #[test]
     fn witness_response_to_acceptance() {
         let claimant = PeerId::random();
-        let witness = PeerId::random();
-        let claim_hash = [0xCA; 32];
-        let epoch = 42;
+        let kp = identity::Keypair::generate_ed25519();
+        let witness = PeerId::from(kp.public());
+        let epoch = 42u64;
+        let observed_heartbeats = 7u64;
+
+        let claim_hash = claims::compute_service_attestation_hash(&claimant, 0, 1);
+        let payload = [
+            claims::WITNESS_DOMAIN as &[u8],
+            &claim_hash[..],
+            &witness.to_bytes()[..],
+            &epoch.to_le_bytes()[..],
+            &observed_heartbeats.to_le_bytes()[..],
+        ]
+        .concat();
+        let signature = kp.sign(&payload).expect("sign failed");
 
         // Simulate what the handler produces
         let response = WitnessResponse {
@@ -7828,7 +7830,9 @@ mod witness_seam_tests {
             witness_id: witness,
             claim_hash,
             witnessed_at_epoch: epoch,
-            signature: vec![0xCD; 64],  // simulated signature
+            observed_heartbeats,
+            signer_public_key: kp.public().encode_protobuf(),
+            signature,
             decline_reason: None,
         };
 
@@ -7842,14 +7846,14 @@ mod witness_seam_tests {
             witnesses: vec![WitnessSignature {
                 witness: response.witness_id,
                 signed_at_epoch: response.witnessed_at_epoch,
-                observed_heartbeats: 1,
+                observed_heartbeats: response.observed_heartbeats,
+                signer_public_key: response.signer_public_key,
                 signature: response.signature,
             }],
             submitted_epoch: 2,  // must be > end_epoch (cannot claim the future)
             claim_id: [0u8; 32],
         };
         assembled.claim_id = assembled.compute_claim_id();
-        // Feed to accept_claim
         // Feed to accept_claim
         let nonce_map = claims::acceptance::ClaimNonceMap::new();
         let result = claims::accept_claim(&assembled, &nonce_map, 2);
@@ -7859,9 +7863,10 @@ mod witness_seam_tests {
 
     #[test]
     fn witness_response_with_decline_rejected_by_acceptance() {
-        // A response with empty signature should still assemble
-        // into a WitnessedClaim, but accept_claim will process it
-        // (it checks witness count, not signature validity).
+        // A declined response (empty signature, no public key) that
+        // somehow ends up assembled into a WitnessedClaim must be
+        // rejected by accept_claim's cryptographic verification — it
+        // must never be silently credited on witness count alone.
         let claimant = PeerId::random();
         let witness = PeerId::random();
         let epoch = 42;
@@ -7871,6 +7876,8 @@ mod witness_seam_tests {
             witness_id: witness,
             claim_hash: [0xBE; 32],
             witnessed_at_epoch: epoch,
+            observed_heartbeats: 0,
+            signer_public_key: Vec::new(),
             signature: vec![],  // declined
             decline_reason: Some("Self-witness is not permitted".into()),
         };
@@ -7884,7 +7891,8 @@ mod witness_seam_tests {
             witnesses: vec![WitnessSignature {
                 witness: response.witness_id,
                 signed_at_epoch: response.witnessed_at_epoch,
-                observed_heartbeats: 1,
+                observed_heartbeats: response.observed_heartbeats,
+                signer_public_key: response.signer_public_key,
                 signature: response.signature,
             }],
             submitted_epoch: 2,  // must be > end_epoch (cannot claim the future)
@@ -7894,12 +7902,11 @@ mod witness_seam_tests {
         // Feed to accept_claim
         let nonce_map = claims::acceptance::ClaimNonceMap::new();
         let result = claims::accept_claim(&assembled, &nonce_map, 2);
-        // accept_claim accepts any well-formed claim with ≥ 1 witness,
-        // regardless of whether the signature is empty.
-        // The empty signature is handled at the verification layer,
-        // not the acceptance layer.
-        assert!(result.is_ok(),
-            "declined response still produces a valid WitnessedClaim: {:?}", result);
+        assert!(
+            matches!(result, Err(claims::ClaimRejection::InvalidSignature(_))),
+            "declined (unsigned) response must be rejected, not credited: {:?}",
+            result
+        );
     }
 }
 
@@ -8216,8 +8223,11 @@ mod two_swarm_witness_harness {
         // Seed B's peer_table: A must have heartbeats_received > 0
         seed_peer_table(&mut b.peer_table, a.local_peer_id, b.epoch);
 
-        // Build the witness request
-        let claim_hash = [0xAB; 32];
+        // Build the witness request. claim_hash must match what
+        // accept_claim recomputes from (claimant, start_epoch, end_epoch)
+        // in Assertion 2 below (window 0..1), since it's re-derived
+        // rather than trusted from the wire.
+        let claim_hash = claims::compute_service_attestation_hash(&a.local_peer_id, 0, 1);
         let request = WitnessRequest {
             claim_id: "harness-test-1".into(),
             claim_type: 0, // ServiceAttestation
@@ -8272,6 +8282,7 @@ mod two_swarm_witness_harness {
             &response.claim_hash,
             &response.witness_id,
             response.witnessed_at_epoch,
+            response.observed_heartbeats,
             &response.signature,
             &b.local_key.public(),
         );
@@ -8280,6 +8291,11 @@ mod two_swarm_witness_harness {
         // 1d: Response echoes the request fields
         assert_eq!(response.claim_id, "harness-test-1");
         assert_eq!(response.claim_hash, claim_hash);
+
+        // 1e: observed_heartbeats came from B's own peer table, not
+        // from the claimant.
+        assert!(response.observed_heartbeats > 0,
+            "witness must report its own observed heartbeat count");
 
         // ── Assertion 2: Acceptance integration ─────────────
         let claimant = PeerId::from(a.local_key.public());
@@ -8292,7 +8308,8 @@ mod two_swarm_witness_harness {
             witnesses: vec![WitnessSignature {
                 witness: response.witness_id,
                 signed_at_epoch: response.witnessed_at_epoch,
-                observed_heartbeats: 1,
+                observed_heartbeats: response.observed_heartbeats,
+                signer_public_key: response.signer_public_key,
                 signature: response.signature,
             }],
             submitted_epoch: 2,  // must be > end_epoch (cannot claim the future)
@@ -8575,9 +8592,10 @@ mod two_swarm_witness_harness {
         // Seed B's peer_table: A must be established
         seed_peer_table(&mut b.peer_table, a.local_peer_id, b.epoch);
 
-        // A dispatches witness requests — same as handle_witness_claim_service
-        let claim_hash = blake3::hash(b"orchestration-test-claim");
-        let claim_hash: [u8; 32] = claim_hash.into();
+        // A dispatches witness requests — same as handle_witness_claim_service.
+        // claim_hash must match what accept_claim recomputes for window
+        // 0..1 below, since it's re-derived rather than trusted from the wire.
+        let claim_hash = claims::compute_service_attestation_hash(&a.local_peer_id, 0, 1);
         let request = WitnessRequest {
             claim_id: "orch-test-1".into(),
             claim_type: 0,
@@ -8628,14 +8646,14 @@ mod two_swarm_witness_harness {
             witnesses: vec![WitnessSignature {
                 witness: response.witness_id,
                 signed_at_epoch: response.witnessed_at_epoch,
-                observed_heartbeats: 1,
+                observed_heartbeats: response.observed_heartbeats,
+                signer_public_key: response.signer_public_key,
                 signature: response.signature,
             }],
             submitted_epoch: 2,  // must be > end_epoch (cannot claim the future)
             claim_id: [0u8; 32],
         };
         assembled.claim_id = assembled.compute_claim_id();
-        // Feed to accept_claim
         // Feed to accept_claim — the seam that proves the orchestration
         // produces valid input to the acceptance layer.
         let nonce_map = claims::acceptance::ClaimNonceMap::new();
@@ -8863,6 +8881,7 @@ mod two_swarm_witness_harness {
                 witness: PeerId::random(),
                 signed_at_epoch: 5,
                 observed_heartbeats: 1,
+                signer_public_key: vec![],
                 signature: vec![0xAB; 64],
             };
             let state = super::WitnessClaimState {

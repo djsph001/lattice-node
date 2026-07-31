@@ -579,6 +579,7 @@ mod tests {
             witnessed_at_epoch: 100,
             signature: sig.clone(),
             observed_heartbeats: 1,
+            signer_public_key: vec![0x01, 0x02],
             decline_reason: None,
         };
 
@@ -600,6 +601,7 @@ mod tests {
             witnessed_at_epoch: 0,
             signature: Vec::new(), // empty = declined
             observed_heartbeats: 0,
+            signer_public_key: Vec::new(),
             decline_reason: Some("Self-witness is not permitted".into()),
         };
 
@@ -622,6 +624,7 @@ mod tests {
             witnessed_at_epoch: 50,
             signature: sig,
             observed_heartbeats: 1,
+            signer_public_key: vec![0x01, 0x02],
             decline_reason: None,
         };
 
@@ -647,6 +650,7 @@ mod tests {
         let witness_id = PeerId::from(pubkey.clone());
         let claim_hash = [0xCA; 32];
         let epoch = 42u64;
+        let observed_heartbeats = 17u64;
 
         // Reconstruct what the handler signs
         let payload = [
@@ -654,6 +658,7 @@ mod tests {
             &claim_hash[..],
             &witness_id.to_bytes()[..],
             &epoch.to_le_bytes()[..],
+            &observed_heartbeats.to_le_bytes()[..],
         ].concat();
 
         let signature = kp.sign(&payload).expect("sign failed");
@@ -662,7 +667,7 @@ mod tests {
         let valid = crate::claims::verify_witness_signature(
             &claim_hash,
             &witness_id,
-            epoch, 0, &signature,
+            epoch, observed_heartbeats, &signature,
             &pubkey,
         );
         assert!(valid, "signature must verify against canonical payload");
@@ -670,29 +675,36 @@ mod tests {
         // Wrong claim hash fails
         let wrong_hash = [0xFF; 32];
         let valid_wrong = crate::claims::verify_witness_signature(
-            &wrong_hash, &witness_id, epoch, 0, &signature, &pubkey,
+            &wrong_hash, &witness_id, epoch, observed_heartbeats, &signature, &pubkey,
         );
         assert!(!valid_wrong, "wrong claim_hash must fail verification");
 
         // Wrong epoch fails
         let valid_bad_epoch = crate::claims::verify_witness_signature(
-            &claim_hash, &witness_id, 99, 0, &signature, &pubkey,
+            &claim_hash, &witness_id, 99, observed_heartbeats, &signature, &pubkey,
         );
         assert!(!valid_bad_epoch, "wrong epoch must fail verification");
 
         // Wrong witness fails
         let other_id = PeerId::random();
         let valid_bad_witness = crate::claims::verify_witness_signature(
-            &claim_hash, &other_id, epoch, 0, &signature, &pubkey,
+            &claim_hash, &other_id, epoch, observed_heartbeats, &signature, &pubkey,
         );
         assert!(!valid_bad_witness, "wrong witness_id must fail verification");
 
         // Different key fails
         let other_kp = Keypair::generate_ed25519();
         let valid_bad_key = crate::claims::verify_witness_signature(
-            &claim_hash, &witness_id, epoch, 0, &signature, &other_kp.public(),
+            &claim_hash, &witness_id, epoch, observed_heartbeats, &signature, &other_kp.public(),
         );
         assert!(!valid_bad_key, "wrong public key must fail verification");
+
+        // D7.4: tampered observed_heartbeats fails even though
+        // claim_hash, witness_id, epoch, and signature bytes are untouched.
+        let valid_tampered = crate::claims::verify_witness_signature(
+            &claim_hash, &witness_id, epoch, observed_heartbeats + 1, &signature, &pubkey,
+        );
+        assert!(!valid_tampered, "tampered observed_heartbeats must fail verification");
     }
 
     #[test]
@@ -704,6 +716,8 @@ mod tests {
             witness_id: PeerId::random(),
             claim_hash: [0xBE; 32],
             witnessed_at_epoch: 0,
+            observed_heartbeats: 0,
+            signer_public_key: Vec::new(),
             signature: vec![],
             decline_reason: Some("Self-witness is not permitted".into()),
         };
@@ -719,6 +733,8 @@ mod tests {
             witness_id: PeerId::random(),
             claim_hash: [0xDE; 32],
             witnessed_at_epoch: 0,
+            observed_heartbeats: 0,
+            signer_public_key: Vec::new(),
             signature: vec![],
             decline_reason: Some("Claimant is not established (no heartbeats observed)".into()),
         };
